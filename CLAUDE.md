@@ -179,6 +179,23 @@ reach the log file, and holds the `WorkerGuard` for the whole of `main`.
 - `progress()` / `ratio()` / `eta()` all guard their denominators — a zero-size
   task is ordinary, not an error.
 
+### Formatting (`format.rs`)
+
+- Sizes are **binary** (1 KiB = 1024 B) because that is what DSM reports.
+  `B`/`KiB` print as whole numbers, `MiB` and up get one decimal. The unit is
+  picked *after* rounding, so nothing ever renders as `1024 KiB`.
+- **Zero and unknown are different sentinels.** `speed(0)` is `DASH` (`—`) — the
+  task is idle, not unknown; an ETA that cannot be computed is `INFINITY` (`∞`).
+  Do not collapse them into `0`.
+- `percent` takes a **fraction** (`0.0..=1.0`), matching `Task::progress()`, not
+  an already-multiplied percentage.
+- **Never size or pad a column with `str::len` or `chars().count()`.** Use
+  `format::display_width` and `format::truncate_ellipsis`, which measure
+  terminal cells via `unicode-width`; the fixture's CJK and emoji titles are
+  there to keep that honest. `truncate_ellipsis` never exceeds the requested
+  width and may stop one cell short rather than clip a double-width character
+  in half.
+
 ### The task-list fixture
 
 `tests/fixtures/task_list.json` is a full `list` envelope covering every known

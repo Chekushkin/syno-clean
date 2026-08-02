@@ -365,12 +365,22 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 **Files:**
 - Create: `src/format.rs`
 
-- [ ] implement `bytes(u64) -> String` (B/KiB/MiB/GiB/TiB, one decimal above KiB)
-- [ ] implement `speed(u64) -> String` (`—` when zero), `duration(Option<u64>) -> String` (`2h 14m`, `∞` when unknown/stalled)
-- [ ] implement `percent(f64)`, `ratio(f64)`, and `truncate_ellipsis(&str, width)` using **`unicode-width` display width, not character count** — CJK and emoji occupy two terminal cells
-- [ ] write tests for each: boundary values (0, 1023, 1024), rounding, the zero/unknown sentinels
-- [ ] write tests for `truncate_ellipsis` with ASCII, a **CJK title** (asserting the result's display width fits), an emoji, and a width smaller than the ellipsis itself
-- [ ] run `cargo test` — must pass before task 7
+- [x] implement `bytes(u64) -> String` (B/KiB/MiB/GiB/TiB, one decimal above KiB)
+- [x] implement `speed(u64) -> String` (`—` when zero), `duration(Option<u64>) -> String` (`2h 14m`, `∞` when unknown/stalled)
+- [x] implement `percent(f64)`, `ratio(f64)`, and `truncate_ellipsis(&str, width)` using **`unicode-width` display width, not character count** — CJK and emoji occupy two terminal cells
+- [x] write tests for each: boundary values (0, 1023, 1024), rounding, the zero/unknown sentinels
+- [x] write tests for `truncate_ellipsis` with ASCII, a **CJK title** (asserting the result's display width fits), an emoji, and a width smaller than the ellipsis itself
+- [x] run `cargo test` — must pass before task 7 — 136 tests pass
+
+⚠️ **Decisions taken during Task 6** (plan text above kept verbatim; actuals recorded here):
+- "one decimal above KiB" is read **literally**: `B` and `KiB` render as whole numbers (`1023 B`, `640 KiB`) and `MiB`/`GiB`/`TiB` get one decimal (`5.8 GiB`). A tenth of a KiB is 102 bytes — noise — and the integer form keeps the Size column narrower.
+- The unit is chosen **after** rounding to the precision that will actually be printed, so a value that would format as `1024 KiB` or `1024.0 MiB` is promoted to the next unit instead. Without that, the largest number displayable in a unit is one the unit is not supposed to reach.
+- `percent` takes a **fraction in `0.0..=1.0`**, not an already-multiplied percentage, because that is what `Task::progress()` returns. Out-of-range and non-finite inputs clamp to `0.0%`/`100.0%` rather than surfacing a `NaN` in the table.
+- `duration` renders **at most two units** (`45s`, `1m 5s`, `2h 14m`, `1d 1h`). Seconds of precision on a four-hour download is false detail and costs column width. `None` (the stalled/unknown case from `Task::eta`) is `∞`; `Some(0)` is a *known* `0s` and deliberately reads differently.
+- **Zero and unknown are different sentinels**: `speed(0)` is `—` (the task exists, it is idle), an unknown ETA is `∞`. Rendering both as `0` would tell the user a paused task is about to finish.
+- ➕ Added `display_width(&str)` and the public `DASH` / `INFINITY` / `ELLIPSIS` consts. The table widget in Task 9 has to pad columns to a cell count, and `str::len` / `chars().count()` are both wrong for the CJK and emoji titles in the fixture; one definition of "how wide is this" avoids the mistake being re-made per column.
+- `truncate_ellipsis` never exceeds the requested width but may come up **one cell short** when the cut lands on a double-width character — half an emoji cannot be printed. Truncation is per `char`, not per grapheme cluster: correct segmentation would mean another dependency, and the failure mode is one odd-looking character at a cut in a title that was being elided anyway.
+- Tests run against the **real fixture titles** as well as hand-picked strings: every title is truncated at every width from 0 to 48 with the fit invariant asserted, plus targeted CJK and emoji cases proving a char-count truncation would have overflowed.
 
 ### Task 7: Sort, filter, and search view layer
 
