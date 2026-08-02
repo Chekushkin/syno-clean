@@ -858,4 +858,98 @@ mod tests {
             })
         );
     }
+
+    // ---- the delete executor's two no-call paths ---------------------------
+    //
+    // Both run the *whole* three-phase executor against `uncalled_client()`,
+    // whose host does not resolve. That is what makes them meaningful: if any
+    // phase issued a request the call would fail and the item would be reported
+    // as `failed`, so `failed: 0` is a positive assertion that **nothing was
+    // sent** — not merely that nothing broke.
+
+    const FIXTURE: &str = include_str!("../tests/fixtures/task_list.json");
+
+    fn fixture_tasks() -> Vec<Task> {
+        crate::api::client::parse_envelope::<crate::model::TaskList>(
+            FIXTURE,
+            "SYNO.DownloadStation.Task",
+        )
+        .expect("the fixture must parse")
+        .tasks
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_delete_issues_no_call_at_all_and_claims_no_successes() {
+        let plan = DeletePlan::snapshot(fixture_tasks().iter());
+        let total = plan.len();
+        assert!(total > 1);
+
+        let (tx, mut rx) = channel();
+        let ops = OpContext::new(uncalled_client(), tx, RefreshHandle::new());
+        run_delete(ops, plan, DeleteOptions::dry_run()).await;
+
+        let mut done = None;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                // Every item, including the ones that would really have been
+                // deleted, reports what it *would* do — never that it did it.
+                AppEvent::OpProgress { op, detail, .. } => {
+                    assert_eq!(op, OpKind::Delete);
+                    assert!(
+                        detail.contains("dry run") || detail.contains("skipped"),
+                        "{detail}"
+                    );
+                }
+                AppEvent::OpDone { .. } => done = Some(event),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(
+            done,
+            Some(AppEvent::OpDone {
+                op: OpKind::Delete,
+                succeeded: 0,
+                skipped: total,
+                failed: 0,
+            }),
+            "a dry run must report every item as skipped and nothing as done"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_item_reaches_the_nas_not_even_for_its_task_delete() {
+        // The fixture's no-common-root task: `delete.rs` refuses to guess its
+        // on-disk name, and the executor must therefore leave the DSM task
+        // alone too — removing it would orphan exactly the data whose location
+        // is in doubt. This is a **real** run, not a dry one.
+        let refused: Vec<Task> = fixture_tasks()
+            .into_iter()
+            .filter(|task| task.id == "dbid_013")
+            .collect();
+        assert_eq!(refused.len(), 1);
+        let plan = DeletePlan::snapshot(refused.iter());
+        assert!(plan.items[0].is_refused());
+
+        let (tx, mut rx) = channel();
+        let ops = OpContext::new(uncalled_client(), tx, RefreshHandle::new());
+        run_delete(ops, plan, DeleteOptions::default()).await;
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(matches!(
+            events.first(),
+            Some(AppEvent::OpProgress { detail, .. }) if detail.contains("skipped")
+        ));
+        assert_eq!(
+            events.last(),
+            Some(&AppEvent::OpDone {
+                op: OpKind::Delete,
+                succeeded: 0,
+                skipped: 1,
+                failed: 0,
+            })
+        );
+    }
 }

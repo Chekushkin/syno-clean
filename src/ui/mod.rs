@@ -447,6 +447,43 @@ mod tests {
         frame_lines(app, width, height).join("\n")
     }
 
+    /// The frame as text with the **continuation cell of every double-width
+    /// glyph dropped**.
+    ///
+    /// ratatui stores a wide symbol in one buffer cell and leaves the next one
+    /// holding a space it never emits to the terminal. [`frame_lines`] keeps
+    /// that space — which is exactly what makes its "every row is one character
+    /// per cell" check work — but it means a CJK title read back out of it has
+    /// a space after every glyph, and no `contains` against the original string
+    /// can match. Use this when asserting that *text* reached the screen.
+    fn frame_text_narrow(app: &App, width: u16, height: u16) -> String {
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, height)).expect("TestBackend cannot fail");
+        terminal
+            .draw(|frame| render(frame, app))
+            .expect("TestBackend cannot fail");
+
+        let buffer = terminal.backend().buffer();
+        let area = *buffer.area();
+        (0..area.height)
+            .map(|y| {
+                let mut line = String::new();
+                let mut skip = 0usize;
+                for x in 0..area.width {
+                    if skip > 0 {
+                        skip -= 1;
+                        continue;
+                    }
+                    let symbol = buffer[(x, y)].symbol();
+                    skip = crate::format::display_width(symbol).saturating_sub(1);
+                    line.push_str(symbol);
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// The frame as one whitespace-normalized string.
     ///
     /// For asserting on prose that a paragraph may have **wrapped**: a sentence
@@ -532,6 +569,49 @@ mod tests {
             .clone();
         let text = frame_text(&app, 140, 7);
         assert!(text.contains(&last), "{last} is off screen:\n{text}");
+    }
+
+    #[test]
+    fn a_list_far_longer_than_the_screen_scrolls_and_still_fits() {
+        // The 500+ task case. The fixture's fourteen tasks never exercise a
+        // scrolled window, and the cheapest way a long list breaks is a cursor
+        // at the far end scrolling the table off its own frame.
+        let mut tasks = Vec::new();
+        for round in 0..45 {
+            for task in fixture_tasks() {
+                tasks.push(Task {
+                    id: format!("{}_{round}", task.id),
+                    ..task
+                });
+            }
+        }
+        let total = tasks.len();
+        assert!(total >= 500, "{total}");
+
+        let mut app = App::new(tasks);
+        app.set_page_size(40);
+        app.cursor_to_last();
+        assert_eq!(app.cursor, total - 1);
+
+        // The window holding the cursor is the last full page, not a partial
+        // one scrolled past the end.
+        let offset = table::scroll_offset(app.cursor, total, 40);
+        assert_eq!(offset, total - 40);
+
+        for (width, height) in [(80_u16, 24_u16), (160, 50)] {
+            for line in frame_lines(&app, width, height) {
+                assert_eq!(line.chars().count(), width as usize);
+            }
+        }
+        // The row the cursor is on is on screen, which is what `End` has to
+        // mean over a list twenty screens long.
+        let last = app
+            .cursor_task()
+            .expect("a row under the cursor")
+            .title
+            .clone();
+        let text = frame_text_narrow(&app, 160, 50);
+        assert!(text.contains(&last), "the last row is off screen: {last}");
     }
 
     #[test]
