@@ -16,8 +16,9 @@
 //! re-export — see `CLAUDE.md`; adding it as a direct dependency would put two
 //! incompatible crossterms in the tree.
 //!
-//! The modals land in `ui::dialog` (Task 14); the task table is [`table`].
+//! The modals live in [`dialog`]; the task table is [`table`].
 
+pub mod dialog;
 pub mod table;
 
 use std::io::{self, Stdout, stdout};
@@ -44,7 +45,7 @@ pub type Backend = CrosstermBackend<Stdout>;
 
 /// Footer hints in [`crate::app::Mode::Normal`]. The full list is the `?`
 /// overlay (Task 17); this is the reminder that it exists.
-const NORMAL_HINTS: &str = "q quit · r refresh · ? help";
+const NORMAL_HINTS: &str = "d delete · r refresh · q quit · ? help";
 
 /// Footer hints while the search box has focus.
 const SEARCH_HINTS: &str = "Enter apply · Esc cancel";
@@ -185,6 +186,10 @@ pub fn install_panic_hook() {
 /// is the task table, or a message when there is nothing to put in it — the
 /// table draws its own header row, so an empty table would be a header over
 /// blank space with no explanation.
+///
+/// A modal is drawn **last, over everything**, so the table it describes is
+/// still visible around it but nothing can be mistaken for the dialog's own
+/// content.
 pub fn render(frame: &mut Frame, app: &App) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
@@ -200,6 +205,22 @@ pub fn render(frame: &mut Frame, app: &App) {
         table::render(frame, app, body);
     }
     frame.render_widget(footer_bar(app), footer);
+
+    // `pending_delete` and `Mode::Confirm` are set together, but the render
+    // path asks for both rather than assuming: a mode with no plan behind it
+    // must draw no dialog, not an empty one promising to delete nothing.
+    if app.mode == Mode::Confirm
+        && let Some(plan) = app.pending_delete()
+    {
+        let summary = dialog::build_confirmation(plan, app.delete_options);
+        dialog::render_confirm(
+            frame,
+            frame.area(),
+            &summary,
+            app.confirm_scroll(),
+            app.confirm_focus(),
+        );
+    }
 }
 
 /// The title bar: what this is on the left, how much of it is on screen on the
@@ -373,6 +394,19 @@ mod tests {
 
     fn frame_text(app: &App, width: u16, height: u16) -> String {
         frame_lines(app, width, height).join("\n")
+    }
+
+    /// The frame as one whitespace-normalized string.
+    ///
+    /// For asserting on prose that a paragraph may have **wrapped**: a sentence
+    /// broken across two rows still reads as one run of words here, so the test
+    /// checks the wording without pinning the modal's width.
+    fn frame_words(app: &App, width: u16, height: u16) -> String {
+        frame_lines(app, width, height)
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     #[test]
@@ -634,6 +668,122 @@ mod tests {
         for (width, height) in [(1_u16, 1_u16), (1, 3), (3, 1), (2, 2)] {
             let lines = frame_lines(&App::new(fixture_tasks()), width, height);
             assert_eq!(lines.len(), height as usize);
+        }
+    }
+
+    // ---- the delete confirmation modal -------------------------------------
+
+    /// An app with the confirmation modal open over the named fixture tasks.
+    fn confirming(ids: &[&str]) -> App {
+        let mut app = App::new(fixture_tasks());
+        for id in ids {
+            app.selected.insert((*id).to_string());
+        }
+        app.begin_delete();
+        assert_eq!(app.mode, Mode::Confirm, "the dialog must have opened");
+        app
+    }
+
+    #[test]
+    fn the_confirmation_modal_lists_what_will_go_and_what_it_frees() {
+        let app = confirming(&["dbid_001"]);
+        let text = frame_text(&app, 120, 24);
+
+        assert!(text.contains("Delete 1 task"), "{text}");
+        assert!(text.contains("Ubuntu.24.04.3.LTS.Desktop.amd64"), "{text}");
+        assert!(
+            text.contains("/downloads/Ubuntu.24.04.3.LTS.Desktop.amd64"),
+            "the resolved path must be on screen:\n{text}"
+        );
+        assert!(text.contains("to free"), "{text}");
+        assert!(text.contains(dialog::CANCEL_LABEL), "{text}");
+        assert!(text.contains(dialog::DELETE_LABEL), "{text}");
+    }
+
+    #[test]
+    fn the_modal_shows_a_refused_task_as_skipped_with_its_reason() {
+        // Never silently dropped: the user has to be able to see that this one
+        // was left alone, and why.
+        let app = confirming(&["dbid_001", "dbid_013"]);
+        let text = frame_text(&app, 120, 30);
+
+        assert!(text.contains(dialog::SKIP_MARKER), "{text}");
+        assert!(text.contains("Mixed.Root.Release"), "{text}");
+        assert!(text.contains("no single top-level"), "{text}");
+        assert!(text.contains("1 skipped"), "{text}");
+    }
+
+    #[test]
+    fn the_modal_says_when_only_the_task_goes_and_the_files_stay() {
+        let mut app = confirming(&["dbid_001"]);
+        app.delete_options = crate::delete::DeleteOptions {
+            delete_files: false,
+            dry_run: false,
+        };
+        // The sentence itself is asserted in `dialog`'s own tests; here it only
+        // has to reach the screen, and a border sits between its wrapped rows.
+        let text = frame_words(&app, 120, 24);
+        assert!(text.contains("task only"), "{text}");
+        assert!(text.contains("left on disk"), "{text}");
+        assert!(!text.contains("to free"), "nothing is freed:\n{text}");
+    }
+
+    #[test]
+    fn a_dry_run_modal_is_labelled_as_one() {
+        let mut app = confirming(&["dbid_001"]);
+        app.delete_options = crate::delete::DeleteOptions::dry_run();
+        let text = frame_words(&app, 120, 24);
+        assert!(text.contains(dialog::DRY_RUN_MARKER), "{text}");
+        assert!(text.contains("nothing is deleted"), "{text}");
+    }
+
+    #[test]
+    fn no_modal_is_drawn_outside_confirm_mode() {
+        let mut app = confirming(&["dbid_001"]);
+        assert!(frame_text(&app, 120, 24).contains(dialog::CANCEL_LABEL));
+
+        app.cancel_delete();
+        let text = frame_text(&app, 120, 24);
+        assert!(!text.contains(dialog::CANCEL_LABEL), "{text}");
+        // ...and the table is back, unobscured (its Name column truncates).
+        assert!(text.contains("Ubuntu.24.04"), "{text}");
+    }
+
+    #[test]
+    fn a_confirm_mode_with_no_plan_behind_it_draws_no_dialog() {
+        // Belt and braces: the two are set together, but a mode alone must not
+        // produce an empty modal.
+        let mut app = App::new(fixture_tasks());
+        app.mode = Mode::Confirm;
+        assert!(!frame_text(&app, 120, 24).contains(dialog::CANCEL_LABEL));
+    }
+
+    #[test]
+    fn the_modal_scrolls_a_plan_taller_than_it_is() {
+        let mut app = App::new(fixture_tasks());
+        app.toggle_select_all_visible();
+        app.begin_delete();
+
+        let top = frame_text(&app, 120, 16);
+        assert!(top.contains("scroll"), "a hint that there is more:\n{top}");
+
+        for _ in 0..8 {
+            app.scroll_confirm(1);
+        }
+        let scrolled = frame_text(&app, 120, 16);
+        assert_ne!(top, scrolled, "the body did not move");
+        // The chrome stays put while the body moves.
+        assert!(scrolled.contains(dialog::CANCEL_LABEL), "{scrolled}");
+        assert!(scrolled.contains("to free"), "{scrolled}");
+    }
+
+    #[test]
+    fn the_modal_never_overflows_the_terminal() {
+        for (width, height) in [(1_u16, 1_u16), (10, 4), (40, 8), (120, 24), (200, 60)] {
+            let app = confirming(&["dbid_001", "dbid_013"]);
+            for line in frame_lines(&app, width, height) {
+                assert_eq!(line.chars().count(), width as usize, "{width}x{height}");
+            }
         }
     }
 
