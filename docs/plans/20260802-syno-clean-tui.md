@@ -246,13 +246,17 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 - Create: `CLAUDE.md`
 - Create: `src/main.rs`
 
-- [ ] install rustup + stable toolchain (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y`), confirm `cargo --version`
-- [ ] run `cargo init --name syno-clean` **first** (it initializes git and writes its own `.gitignore`), then append `*.log` and `.DS_Store`; set the `edition` in `Cargo.toml` explicitly rather than relying on the cargo default
-- [ ] add dependencies: `ratatui` (with its `crossterm` feature — **do not add crossterm as a separate dependency**; use `ratatui::crossterm` everywhere to avoid version-skew type errors), `tokio` (`rt-multi-thread`,`macros`,`sync`,`time`), `reqwest` (`json`,`rustls-tls`, `default-features = false`), `serde` (`derive`), `serde_json`, `toml`, `clap` (`derive`), `thiserror`, `anyhow`, `etcetera`, `unicode-width`, `rpassword`, `tracing`, `tracing-subscriber`, `tracing-appender`, `futures`
-- [ ] pin `rust-toolchain.toml` to the **explicit installed version** (e.g. `channel = "1.xx.y"`, not `"stable"`, so CI is reproducible), components `rustfmt` + `clippy`
-- [ ] create a `CLAUDE.md` stub recording the conventions this plan establishes (module layout, config precedence, delete ordering, path-safety invariants) — filled in as they land, not written from scratch at the end
-- [ ] verify `cargo build` and `cargo clippy --all-targets -- -D warnings` are clean
-- [ ] no tests this task (scaffolding only)
+- [x] install rustup + stable toolchain (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y`), confirm `cargo --version` — installed 1.97.1 (cargo 1.97.1)
+- [x] run `cargo init --name syno-clean` **first** (it initializes git and writes its own `.gitignore`), then append `*.log` and `.DS_Store`; set the `edition` in `Cargo.toml` explicitly rather than relying on the cargo default — edition `2024`, existing git history and `docs/` preserved
+- [x] add dependencies: `ratatui` (with its `crossterm` feature — **do not add crossterm as a separate dependency**; use `ratatui::crossterm` everywhere to avoid version-skew type errors), `tokio` (`rt-multi-thread`,`macros`,`sync`,`time`), `reqwest` (`json`,`rustls-tls`, `default-features = false`), `serde` (`derive`), `serde_json`, `toml`, `clap` (`derive`), `thiserror`, `anyhow`, `etcetera`, `unicode-width`, `rpassword`, `tracing`, `tracing-subscriber`, `tracing-appender`, `futures`
+- [x] pin `rust-toolchain.toml` to the **explicit installed version** (e.g. `channel = "1.xx.y"`, not `"stable"`, so CI is reproducible), components `rustfmt` + `clippy` — `channel = "1.97.1"`
+- [x] create a `CLAUDE.md` stub recording the conventions this plan establishes (module layout, config precedence, delete ordering, path-safety invariants) — filled in as they land, not written from scratch at the end
+- [x] verify `cargo build` and `cargo clippy --all-targets -- -D warnings` are clean
+- [x] no tests this task (scaffolding only)
+
+⚠️ **Dependency notes discovered during Task 1** (plan text above kept verbatim; actuals recorded here):
+- `reqwest` 0.13 renamed the `rustls-tls` feature to **`rustls`**. Resolved deps are `default-features = false, features = ["json", "rustls", "query", "form"]` — `query` and `form` are now separate features in 0.13 and are needed for the `build_*_params` request style (Tasks 4/5/15).
+- `ratatui` resolved to **0.30.2**, which pulls crossterm 0.29 through `ratatui-crossterm`; `ratatui::crossterm` re-export confirmed present. Crossterm's **`event-stream` feature is NOT enabled** by that path, so `crossterm::event::EventStream` is unavailable without adding crossterm directly (which this plan forbids). **Task 11 must build the async input source another way** — e.g. a `spawn_blocking` reader on `event::read()` feeding the same mpsc channel as the poller. Noted in `CLAUDE.md`.
 
 ### Task 2: Error type and DSM error-code mapping
 
