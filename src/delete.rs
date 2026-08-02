@@ -792,11 +792,11 @@ pub fn requires_pause(status: &TaskStatus) -> bool {
 /// the transfer counters, from whichever read is freshest.
 ///
 /// A separate type because the executor must assemble it from the freshest
-/// evidence for each half rather than from one read: `event::PauseRead` supplies
-/// the status from before its own pause and the counters from the last read of
-/// all, and [`DeleteItem::payload_state`] (the confirmation snapshot) fills in
-/// whatever the pause phase never observed. Passing the fields around loose is
-/// how the stale one gets used by accident.
+/// evidence for each half rather than from one read: `event::PauseRead` folds
+/// each half across every read of the task, ratcheting both toward "the payload
+/// must exist", and [`DeleteItem::payload_state`] (the confirmation snapshot)
+/// fills in whatever the pause phase never observed. Passing the fields around
+/// loose is how the stale one gets used by accident.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PayloadState {
     pub status: TaskStatus,
@@ -861,10 +861,23 @@ impl PayloadState {
 /// would fail items whose absence is ordinary. Anything this refuses is still
 /// removable with `--no-delete-files`.
 pub fn payload_should_exist(state: &PayloadState) -> bool {
+    status_implies_payload(&state.status) || state.fully_downloaded()
+}
+
+/// The status arm of [`payload_should_exist`], on its own.
+///
+/// Named separately because `event::PauseRead` ratchets the status it hands the
+/// file phase along exactly this ordering: a read taken while the pause settles
+/// replaces the one before it only when its status is one of these. That is what
+/// keeps a status *upgrade* (the task finished mid-pause) while rejecting the
+/// *downgrade* this program inflicts on itself (`Paused`, which is not here).
+/// Asking [`payload_should_exist`] instead would let the counters answer a
+/// question about the status.
+pub fn status_implies_payload(status: &TaskStatus) -> bool {
     matches!(
-        state.status,
+        status,
         TaskStatus::Finished | TaskStatus::Seeding | TaskStatus::Extracting
-    ) || state.fully_downloaded()
+    )
 }
 
 /// Whether removing **only the DSM task** leaves this task's data on the volume.
