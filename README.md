@@ -360,9 +360,12 @@ resolved path:
   demonstrably existed, so nothing being there says the resolved location is wrong far
   more often than it says the files are gone. The item fails and the task stays,
   because deleting it would leave that payload with nothing pointing at it. (A path
-  this same run already deleted is exempt — the absence is explained.) The status this
-  is judged from is the **live** one read by the pause phase, not the one frozen when
-  the dialog opened, which can be minutes old by the twentieth item of a batch;
+  this same run already deleted is exempt — the absence is explained.) This is judged
+  from what the pause phase read, not from what was frozen when the dialog opened,
+  which can be minutes old by the twentieth item of a batch — the status from just
+  *before* the pause was issued (so the program's own pause cannot mask a seeding task)
+  and the transfer counters from the last read of all (so a task that completes while
+  the pause takes effect is not judged as half-written);
 - **not found**, for a path named from the **title** rather than the file list → the
   item fails whatever the status: a guess that found nothing is at least as likely to
   have missed as to have been tidied up;
@@ -370,7 +373,9 @@ resolved path:
   a *directory* and a single-file one wrote a *file*; if `isdir` disagrees with what
   the task resolved to, the path is some other object and `recursive=true` would remove
   it. (A title-named path expects neither kind, so both are accepted and the kind found
-  is logged.)
+  is logged: there was no file list to say. A file list that *is* there and describes no
+  shape — the same flat name listed twice — is the opposite case, and the item fails
+  rather than having a malformed answer authorize the delete.)
 - **found**, of the expected kind → proceed;
 - **an error** (a permission problem, say) → that is not absence: the item fails and
   the task is left alone rather than being deleted while its files stay behind.
