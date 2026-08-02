@@ -276,6 +276,15 @@ call, so what the user read on screen is exactly what gets deleted.
   that reorders or removes rows never silently reassigns what is selected.
   `App::cursor` is a position in the *visible* list; the reconciliation that
   keeps it on the same task lives in Task 11's `apply_tasks`.
+- **`a` (`toggle_select_all_visible`) touches only the visible rows**, in both
+  directions — a filtered-out task is never armed for deletion by a key press
+  the user aimed at what was on screen, and never quietly *un*armed either.
+  `Esc` (`clear_selection`) is the opposite and clears everything, hidden rows
+  included; it is the "I do not know what is armed" key.
+- The selection footer counts and sums **`App::selected_tasks()`** — the
+  selected IDs that still name a real task — not `selected.len()`. Between a
+  task vanishing on the NAS and Task 11's refresh pruning the set, the raw
+  length would over-report while the size sum did not.
 - `App::handle_key` ignores anything that is not `KeyEventKind::Press` —
   Windows and the kitty protocol report releases too, and acting on both halves
   runs every binding twice. `Ctrl-C` is handled before the mode dispatch so it
