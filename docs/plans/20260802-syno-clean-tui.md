@@ -705,24 +705,39 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 **Files:**
 - Create: `.github/workflows/ci.yml`
 
-- [ ] add a workflow on push and pull_request running on `ubuntu-latest` and `macos-latest`
-- [ ] steps: checkout, install the toolchain from `rust-toolchain.toml` with rustfmt+clippy, cache cargo registry and target
-- [ ] run `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`
-- [ ] verify the workflow passes locally by running the same three commands
-- [ ] no unit tests this task (CI config)
+- [x] add a workflow on push and pull_request running on `ubuntu-latest` and `macos-latest` — `push` is filtered to `branches: ["**"]` so a `v*` tag push runs the release workflow, not this one
+- [x] steps: checkout (`actions/checkout@v4`), install the toolchain from `rust-toolchain.toml` with rustfmt+clippy (`actions-rust-lang/setup-rust-toolchain@v1`, **no `toolchain` input** so the pinned channel is read from the file), cache cargo registry and target (`Swatinem/rust-cache@v2`, keyed per OS)
+- [x] run `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all` — as three separate named steps, so a failure names itself in the job summary
+- [x] verify the workflow passes locally by running the same three commands — all three clean, 479 tests pass
+- [x] no unit tests this task (CI config)
+
+⚠️ **Decisions taken during Task 19** (plan text above kept verbatim; actuals recorded here):
+- **The toolchain action is `actions-rust-lang/setup-rust-toolchain@v1`, not `dtolnay/rust-toolchain`.** The latter requires an explicit `toolchain:` input, which would duplicate `1.97.1` in two files and let CI silently drift from the pin the moment one of them is bumped. This action reads `rust-toolchain.toml` when no toolchain is given, so the pin has exactly one home. `components: rustfmt, clippy` is still declared explicitly rather than relying on the file's `components` list — the two agree, and the workflow says out loud what it needs.
+- **Caching is a separate `Swatinem/rust-cache@v2` step** (`cache: false` on the toolchain action) rather than the action's built-in cache, which is the same thing wrapped. One visible step per concern, and the release workflow reuses the identical pair.
+- `permissions: contents: read` at the workflow level — CI reads the repository and nothing else.
+- ➕ `RUST_BACKTRACE: 1` and `CARGO_TERM_COLOR: always`, and `fail-fast: false` on the matrix so a macOS failure does not hide a Linux one.
 
 ### Task 20: Release automation
 
 **Files:**
 - Create: `.github/workflows/release.yml`
 
-- [ ] add a workflow triggered on `v*` tags
-- [ ] cross-build a release matrix: `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`
-- [ ] **set up the aarch64 Linux cross toolchain** — either use `cross`, or install `gcc-aarch64-linux-gnu` and add the linker to `.cargo/config.toml`; the build fails without it
-- [ ] strip binaries, package each as `syno-clean-<version>-<target>.tar.gz`, generate SHA256 checksums
-- [ ] create the GitHub release and attach all artifacts plus the matching CHANGELOG section
-- [ ] validate the workflow syntax (`actionlint`) before tagging
-- [ ] no unit tests this task (CI config)
+- [x] add a workflow triggered on `v*` tags — plus a first step that fails the build when the tag does not match the `Cargo.toml` version
+- [x] cross-build a release matrix: `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` — the two Darwin targets from `macos-latest`, the two Linux targets from `ubuntu-latest`
+- [x] **set up the aarch64 Linux cross toolchain** — `gcc-aarch64-linux-gnu`, `g++-aarch64-linux-gnu`, `binutils-aarch64-linux-gnu` and `cmake`, with the linker set through `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER` (see the note below on why not `.cargo/config.toml`, and why `CC`/`CXX`/`AR` are needed too)
+- [x] strip binaries, package each as `syno-clean-<version>-<target>.tar.gz`, generate SHA256 checksums — per-target strip tool (`strip -x` on macOS, `aarch64-linux-gnu-strip` for the cross build); the tarball carries the binary plus `README.md`, `LICENSE` and `CHANGELOG.md`; `shasum -a 256` (present on both runners, unlike `sha256sum`) per artifact, merged into one `SHA256SUMS` in the release job
+- [x] create the GitHub release and attach all artifacts plus the matching CHANGELOG section — `softprops/action-gh-release@v2` with `fail_on_unmatched_files: true`; the notes are the `## [<version>]` section extracted by `awk`, with the checksums appended
+- [x] validate the workflow syntax (`actionlint`) before tagging — `actionlint` 1.7.x (installed via Homebrew) reports no issues on either workflow, with `shellcheck` present so the `run:` blocks were linted too. **No tag was created and nothing was pushed.**
+- [x] no unit tests this task (CI config)
+
+⚠️ **Decisions taken during Task 20** (plan text above kept verbatim; actuals recorded here):
+- **The linker is set with `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER` in the workflow, not in a repo-level `.cargo/config.toml`.** The two are equivalent to cargo, but the task's Files list names only `release.yml`, and a checked-in `.cargo/config.toml` would point every developer's local aarch64 build at a toolchain they probably do not have installed. The cross setup stays in the one place that actually cross-compiles.
+- ➕ **`CC`/`CXX`/`AR` for the target, and `cmake`, are installed alongside the linker.** `reqwest`'s `rustls` feature resolves to `rustls` 0.23 with the **`aws-lc-rs`** provider (confirmed with `cargo tree -i aws-lc-sys` — `ring` is in the lockfile but not in the built graph), and `aws-lc-sys` compiles C through the `cmake` crate. A linker alone gets a C compilation failure long before the link step, so the plan's "install `gcc-aarch64-linux-gnu`" is necessary but not sufficient. `cross` was the alternative; it was passed over because it needs Docker and a tool install per run to solve a problem four `apt` packages and four env vars solve directly.
+- **Two jobs, split by privilege**: the matrix `build` job runs with the workflow-level `contents: read` and only uploads artifacts; the single `release` job that publishes is the only thing granted `contents: write`. A compromised build step therefore cannot create or overwrite a release.
+- **Version comes from the tag** (`${GITHUB_REF_NAME#v}`), and the build fails immediately if it disagrees with `Cargo.toml`. Artifact names embed a version, so the alternative is a release whose file names and manifest quietly disagree.
+- `--locked` on the release build: a release binary must come from the committed `Cargo.lock`, not from whatever resolved that morning.
+- Release notes fall back to a one-line placeholder when the CHANGELOG has no section for the tag, rather than publishing an empty body. The extractor stops at the next `## [` heading *or* at the link-reference block that closes the file.
+- ➕ Artifacts are uploaded with `if-no-files-found: error` and a 7-day retention: they are an intermediate hop to the release, not the deliverable.
 
 ### Task 21: Verify acceptance criteria
 
