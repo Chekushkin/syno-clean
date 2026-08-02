@@ -681,13 +681,24 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 - Create: `.github/pull_request_template.md`
 - Modify: `Cargo.toml`
 
-- [ ] add the MIT `LICENSE` and complete `Cargo.toml` metadata (description, license, repository, keywords, categories, readme)
-- [ ] write `README.md`: what it does, a screenshot placeholder, install (from source + release binary), DSM requirements (DSM 7, Download Station and File Station installed), config reference with the **actual XDG paths**, env var table, keybinding table, and a prominent warning that `d` deletes files irreversibly
-- [ ] document the delete safety model in the README — refuses ambiguous paths, existence-checks before deleting, `--dry-run` and `--no-delete-files` escape hatches
-- [ ] write `CONTRIBUTING.md`: toolchain setup, `cargo fmt`/`clippy`/`test` expectations, the deliberately narrow testing philosophy, and how to test offline with `--fixture` versus against a real NAS
-- [ ] write `CHANGELOG.md` seeded with an Unreleased → 0.1.0 entry (Keep a Changelog format)
-- [ ] add issue and PR templates
-- [ ] no unit tests this task (documentation)
+- [x] add the MIT `LICENSE` and complete `Cargo.toml` metadata (description, license, repository, keywords, categories, readme) — plus `authors`, `homepage`, `documentation`, `exclude` and `publish = false`
+- [x] write `README.md`: what it does, a screenshot placeholder, install (from source + release binary), DSM requirements (DSM 7, Download Station and File Station installed), config reference with the **actual XDG paths**, env var table, keybinding table, and a prominent warning that `d` deletes files irreversibly
+- [x] document the delete safety model in the README — refuses ambiguous paths, existence-checks before deleting, `--dry-run` and `--no-delete-files` escape hatches
+- [x] write `CONTRIBUTING.md`: toolchain setup, `cargo fmt`/`clippy`/`test` expectations, the deliberately narrow testing philosophy, and how to test offline with `--fixture` versus against a real NAS
+- [x] write `CHANGELOG.md` seeded with an Unreleased → 0.1.0 entry (Keep a Changelog format)
+- [x] add issue and PR templates
+- [x] no unit tests this task (documentation) — ➕ one code change was unavoidable, see below; it is a `main.rs` I/O path, which is the one part of the crate that is verified by running rather than by tests
+
+⚠️ **Decisions taken during Task 18** (plan text above kept verbatim; actuals recorded here):
+- ➕ **`--logout` was documented, parsed and validated but never *dispatched*.** `cli.logout` reached `ResolvedConfig::logout` and `auth::logout` existed, but no caller ever invoked it: `--logout` silently entered the TUI. A README that describes what the code actually does could neither document the flag nor omit a flag that appears in `--help`, so `main::logout` was added (≈20 lines) rather than writing around the gap. It resolves **no password** — with nothing cached there is no session to end — and drops the local entry whether or not DSM accepted the call, surfacing the DSM error afterwards. Verified by running: `--logout` with no cached session prints one line and exits 0 without a network call.
+- **The repository URL is a placeholder**, `https://github.com/emacarov/syno-clean`, used in `Cargo.toml`, the README install snippets, `CONTRIBUTING.md` and the CHANGELOG compare links. The repository does not exist yet (Post-Completion owns creating it). Confirm the real org/username before publishing and update those five files together.
+- **`publish = false`** in `Cargo.toml`. The plan excludes crates.io from v1, and complete metadata without the guard is exactly the state in which an accidental `cargo publish` succeeds. `cargo package --list` still works, so the metadata is verifiable; flip the flag when a crates.io release is actually wanted.
+- ➕ `exclude = ["docs/plans/", "/.github/"]` so a package built from this tree carries the source and the docs a user reads, not the planning file.
+- **The README documents the implementation, not this plan's prose**, where the two diverged: `Enter` presses the *focused* button in the confirmation (Cancel by default) with `y` as the one-key confirm; the `Downloading` filter is the grouped "in progress" set; search matches live and `Enter` commits; `--dry-run` suppresses pause and resume too. The keybinding tables are transcribed from `dialog::HELP_SECTIONS`, which Task 17 made data and pinned with a test, and the README says so — so the overlay stays the single source of truth rather than acquiring a second copy that can drift.
+- **The hidden flags (`--fixture`, `--dump-api-info`, `--dump-tasks-json`) are documented in `CONTRIBUTING.md`, not the README.** They are `hide = true` in `--help` for a reason; a contributor needs them and a user does not.
+- **The screenshot is a placeholder and nothing was fabricated** — an HTML comment plus a visible "Screenshot pending" note, so Task 22 has an obvious anchor. No asciinema link was invented.
+- ➕ The README warns that a share with the **DSM Recycle Bin enabled may reclaim no space**, which Post-Completion flags as needing verification. Documenting the hazard now costs nothing and is the one way the tool can silently fail at its entire purpose.
+- ➕ The bug-report template asks whether a delete misbehaved as its own checkbox, and the PR template asks whether the change touches the delete path — those are the reports and the reviews that matter most here.
 
 ### Task 19: CI workflow
 

@@ -2,6 +2,18 @@
 name = "syno-clean"
 version = "0.1.0"
 edition = "2024"
+authors = ["Eduard Macarov <eduard.macarov@trovata.io>"]
+description = "Terminal UI for reviewing Synology Download Station tasks and deleting both the task and the files it left on the volume"
+license = "MIT"
+repository = "https://github.com/emacarov/syno-clean"
+homepage = "https://github.com/emacarov/syno-clean"
+documentation = "https://github.com/emacarov/syno-clean#readme"
+readme = "README.md"
+keywords = ["synology", "download-station", "tui", "ratatui", "nas"]
+categories = ["command-line-utilities"]
+# Not published to crates.io for v1 — release binaries only.
+publish = false
+exclude = ["docs/plans/", "/.github/"]
 
 [dependencies]
 anyhow = "1.0.104"
