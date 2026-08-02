@@ -79,6 +79,20 @@ impl ConfirmFocus {
     }
 }
 
+/// A pause or resume the user asked for, waiting for the event loop to run it.
+///
+/// Carries **task IDs**, resolved from the selection (or the cursor row) at the
+/// moment the key was pressed — the same reason the selection set itself holds
+/// IDs: a refresh that reorders the table between the key press and the call
+/// must not move the operation onto a different torrent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskOpRequest {
+    /// [`OpKind::Pause`] or [`OpKind::Resume`]; a delete goes through the
+    /// confirmation dialog instead.
+    pub op: OpKind,
+    pub ids: Vec<String>,
+}
+
 /// The whole of the application state.
 #[derive(Debug, Clone)]
 pub struct App {
@@ -128,6 +142,12 @@ pub struct App {
     /// tall. Clamped against the line count here and against the *height* at
     /// render time, the same split the table uses.
     confirm_scroll: usize,
+    /// A pause or resume the user asked for, waiting to be picked up.
+    ///
+    /// The same request/take shape as `r` and the confirmed delete: `p` and `u`
+    /// record an intent and [`App::take_requested_op`] hands it to the event
+    /// loop, so no key press touches the network.
+    requested_op: Option<TaskOpRequest>,
     /// A plan the user confirmed, waiting to be picked up.
     ///
     /// **The dialog performs no I/O.** Confirming records the intent here and
@@ -159,6 +179,7 @@ impl Default for App {
             pending_delete: None,
             confirm_focus: ConfirmFocus::default(),
             confirm_scroll: 0,
+            requested_op: None,
             confirmed_delete: None,
             quit: false,
         }
@@ -524,11 +545,83 @@ impl App {
 
     /// Snapshot whatever `d` would act on right now.
     fn delete_target(&self) -> DeletePlan {
+        DeletePlan::snapshot(self.target_tasks())
+    }
+
+    /// The tasks an operation acts on: **the selection when there is one, the
+    /// row under the cursor otherwise, and nothing at all when the table is
+    /// empty.**
+    ///
+    /// One definition shared by `d`, `p` and `u`, deliberately: three keys that
+    /// disagreed about what "the current target" means is how a user who armed
+    /// a selection ends up pausing the row their cursor happened to be resting
+    /// on. A selected task that a filter is currently hiding **is** included —
+    /// the selection is what is armed, not what is on screen.
+    fn target_tasks(&self) -> Vec<&Task> {
         if self.selected_count() > 0 {
-            DeletePlan::snapshot(self.selected_tasks())
+            self.selected_tasks().collect()
         } else {
-            DeletePlan::snapshot(self.cursor_task())
+            self.cursor_task().into_iter().collect()
         }
+    }
+
+    /// The IDs [`App::target_tasks`] resolves to.
+    pub fn op_target_ids(&self) -> Vec<String> {
+        self.target_tasks()
+            .into_iter()
+            .map(|task| task.id.clone())
+            .collect()
+    }
+
+    // ---- pause and resume ---------------------------------------------------
+    //
+    // Unlike `d` these need no confirmation: both are reversible by the other
+    // key, and a modal in front of a reversible operation only teaches the user
+    // to dismiss modals. They still perform **no I/O here** — the request is
+    // parked for the event loop exactly as a confirmed delete is.
+
+    /// Pause the current target (`p`).
+    pub fn pause_target(&mut self) {
+        self.request_task_op(OpKind::Pause);
+    }
+
+    /// Resume the current target (`u`).
+    pub fn resume_target(&mut self) {
+        self.request_task_op(OpKind::Resume);
+    }
+
+    /// Record a pause/resume for the event loop to run.
+    ///
+    /// An empty target — an empty table, or a filter that hides everything — is
+    /// a **no-op with a message**, never an empty batch: a round trip that can
+    /// only report "nothing to do" is not worth making.
+    fn request_task_op(&mut self, op: OpKind) {
+        let ids = self.op_target_ids();
+        if ids.is_empty() {
+            self.set_status(format!("nothing to {}", op.label()));
+            return;
+        }
+
+        tracing::info!(
+            op = op.label(),
+            tasks = ids.len(),
+            "requesting an operation"
+        );
+        let plural = if ids.len() == 1 { "task" } else { "tasks" };
+        self.set_status(format!(
+            "{} requested for {} {plural}",
+            op.label(),
+            ids.len()
+        ));
+        self.requested_op = Some(TaskOpRequest { op, ids });
+    }
+
+    /// Take the pause/resume the user asked for, if there is one.
+    ///
+    /// The counterpart of [`App::take_confirmed_delete`], drained by the event
+    /// loop on every pass.
+    pub fn take_requested_op(&mut self) -> Option<TaskOpRequest> {
+        self.requested_op.take()
     }
 
     /// The plan the modal is displaying, if it is open.
@@ -741,6 +834,9 @@ impl App {
             KeyCode::Char('S') => self.toggle_sort_dir(),
             KeyCode::Char('f') => self.cycle_filter(),
             KeyCode::Char('d') => self.begin_delete(),
+            // Both are reversible by the other key, so neither is confirmed.
+            KeyCode::Char('p') => self.pause_target(),
+            KeyCode::Char('u') => self.resume_target(),
             KeyCode::Char('/') => self.begin_search(),
             // `Esc` is mode-specific: here it is the panic button for a
             // selection, in `Mode::Search` it cancels the edit.
@@ -2338,6 +2434,161 @@ mod tests {
         app.handle_key(press(KeyCode::Char('d')));
         app.handle_key(press(KeyCode::Char('y')));
         assert!(app.take_confirmed_delete().is_some());
+    }
+
+    // ---- pause and resume --------------------------------------------------
+    //
+    // The one thing that can go wrong here without anyone noticing is *which*
+    // tasks the key aimed at, so that is what these test.
+
+    /// The request `p` / `u` parked, if any.
+    fn requested(app: &mut App) -> Option<TaskOpRequest> {
+        app.take_requested_op()
+    }
+
+    #[test]
+    fn p_with_nothing_selected_acts_on_the_row_under_the_cursor() {
+        let mut app = app_with(4);
+        app.cursor = 2;
+
+        app.handle_key(press(KeyCode::Char('p')));
+
+        let request = requested(&mut app).expect("a pause was requested");
+        assert_eq!(request.op, OpKind::Pause);
+        assert_eq!(request.ids, ["id_002"]);
+        assert!(
+            app.selected.is_empty(),
+            "the cursor fallback must not arm anything"
+        );
+    }
+
+    #[test]
+    fn u_requests_a_resume_for_the_same_target() {
+        let mut app = app_with(4);
+        app.cursor = 3;
+
+        app.handle_key(press(KeyCode::Char('u')));
+
+        let request = requested(&mut app).expect("a resume was requested");
+        assert_eq!(request.op, OpKind::Resume);
+        assert_eq!(request.ids, ["id_003"]);
+    }
+
+    #[test]
+    fn p_with_a_selection_acts_on_the_selection_and_ignores_the_cursor() {
+        let mut app = app_with(4);
+        app.selected.insert("id_000".to_string());
+        app.selected.insert("id_003".to_string());
+        app.cursor = 1;
+
+        app.handle_key(press(KeyCode::Char('p')));
+
+        let request = requested(&mut app).expect("a pause was requested");
+        assert_eq!(request.ids, ["id_000", "id_003"]);
+        assert!(
+            !request.ids.contains(&"id_001".to_string()),
+            "the cursor row must not be added to a selection"
+        );
+    }
+
+    #[test]
+    fn p_on_an_empty_table_requests_nothing_at_all() {
+        // An empty batch would be a round trip that can only report "nothing to
+        // do".
+        let mut app = App::default();
+        app.handle_key(press(KeyCode::Char('p')));
+        assert!(requested(&mut app).is_none());
+        assert_eq!(app.status_message.as_deref(), Some("nothing to pause"));
+
+        app.handle_key(press(KeyCode::Char('u')));
+        assert!(requested(&mut app).is_none());
+        assert_eq!(app.status_message.as_deref(), Some("nothing to resume"));
+    }
+
+    #[test]
+    fn p_with_every_row_hidden_requests_nothing() {
+        // A filter that hides everything leaves no cursor row to fall back to.
+        let mut app = App::new(fixture_tasks());
+        app.view.search = "no-such-task".to_string();
+        app.handle_key(press(KeyCode::Char('p')));
+        assert!(requested(&mut app).is_none());
+    }
+
+    #[test]
+    fn a_selected_task_a_filter_is_hiding_is_still_paused() {
+        // The selection is what is armed, not what is on screen — the same rule
+        // `d` follows, and the reason both keys share `target_tasks`.
+        let mut app = App::new(fixture_tasks());
+        app.selected.insert("dbid_004".to_string()); // paused
+        app.view.filter = StatusFilter::Seeding;
+        assert!(
+            !app.visible()
+                .iter()
+                .any(|&index| app.tasks[index].id == "dbid_004")
+        );
+
+        app.handle_key(press(KeyCode::Char('u')));
+        assert_eq!(
+            requested(&mut app).expect("a resume").ids,
+            ["dbid_004".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_stale_selection_falls_back_to_the_cursor_row() {
+        let mut app = app_with(2);
+        app.selected.insert("ghost".to_string());
+        app.cursor = 1;
+
+        app.handle_key(press(KeyCode::Char('p')));
+        assert_eq!(requested(&mut app).expect("a pause").ids, ["id_001"]);
+    }
+
+    #[test]
+    fn the_request_is_handed_over_exactly_once() {
+        let mut app = app_with(2);
+        app.handle_key(press(KeyCode::Char('p')));
+        assert!(requested(&mut app).is_some());
+        assert!(
+            requested(&mut app).is_none(),
+            "taking the request must clear it"
+        );
+    }
+
+    #[test]
+    fn pausing_changes_nothing_about_the_tasks_or_the_selection_locally() {
+        // `p` performs no I/O and predicts no outcome: the table only changes
+        // when the refresh that follows the batch says so.
+        let mut app = app_with(3);
+        app.selected.insert("id_001".to_string());
+        app.handle_key(press(KeyCode::Char('p')));
+
+        assert_eq!(app.tasks.len(), 3);
+        assert_eq!(selected_ids(&app), ["id_001"]);
+        assert_eq!(
+            app.tasks[1].status,
+            TaskStatus::Paused,
+            "no status is guessed at locally"
+        );
+    }
+
+    #[test]
+    fn p_and_u_are_normal_mode_keys_only() {
+        // In the search box they are letters; in the confirmation modal they
+        // are not bound at all.
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('/')));
+        app.handle_key(press(KeyCode::Char('p')));
+        app.handle_key(press(KeyCode::Char('u')));
+        assert_eq!(app.view.search, "pu");
+        assert!(requested(&mut app).is_none());
+
+        let mut app = app_with(2);
+        app.handle_key(press(KeyCode::Char('d')));
+        app.handle_key(press(KeyCode::Char('p')));
+        app.handle_key(press(KeyCode::Char('u')));
+        assert_eq!(app.mode, Mode::Confirm);
+        assert!(requested(&mut app).is_none());
     }
 
     // ---- fixture mode ------------------------------------------------------

@@ -45,7 +45,7 @@ pub type Backend = CrosstermBackend<Stdout>;
 
 /// Footer hints in [`crate::app::Mode::Normal`]. The full list is the `?`
 /// overlay (Task 17); this is the reminder that it exists.
-const NORMAL_HINTS: &str = "d delete · r refresh · q quit · ? help";
+const NORMAL_HINTS: &str = "d delete · p/u pause/resume · r refresh · q quit · ? help";
 
 /// Footer hints while the search box has focus.
 const SEARCH_HINTS: &str = "Enter apply · Esc cancel";
@@ -411,7 +411,9 @@ mod tests {
 
     #[test]
     fn an_empty_app_renders_a_title_bar_an_empty_state_and_a_footer() {
-        let lines = frame_lines(&App::default(), 60, 8);
+        // Wide enough for the whole hint line: the footer is clipped rather
+        // than wrapped, and this asserts on its text.
+        let lines = frame_lines(&App::default(), 90, 8);
         assert_eq!(lines.len(), 8);
 
         assert!(lines[0].contains(env!("CARGO_PKG_NAME")), "{:?}", lines[0]);

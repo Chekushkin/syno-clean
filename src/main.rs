@@ -205,6 +205,26 @@ async fn run_tui(
                 ),
             }
         }
+
+        // `p` / `u`, the same handshake: one batch call off the loop, reporting
+        // through the same channel and refreshing the table when it finishes.
+        if let Some(request) = app.take_requested_op() {
+            match ops {
+                Some(ops) => {
+                    event::spawn_task_op(
+                        ops.clone(),
+                        request.op,
+                        request.ids,
+                        app.delete_options.dry_run,
+                    );
+                }
+                None => tracing::warn!(
+                    op = request.op.label(),
+                    tasks = request.ids.len(),
+                    "an operation was requested in offline fixture mode; there is nothing to run it against"
+                ),
+            }
+        }
     }
 
     tracing::info!("exiting");

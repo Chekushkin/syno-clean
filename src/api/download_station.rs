@@ -170,6 +170,23 @@ pub async fn pause_tasks(client: &SynoClient, ids: &[String]) -> Result<Vec<Task
     Ok(results)
 }
 
+/// Resume tasks. Returns the per-task results; see [`check_task_results`].
+///
+/// The exact mirror of [`pause_tasks`] — same id encoding, same per-task result
+/// array, same trap of a `success: true` envelope hiding a task that did not
+/// move.
+pub async fn resume_tasks(client: &SynoClient, ids: &[String]) -> Result<Vec<TaskOpResult>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let params = build_ds_id_params(ids);
+    let results: Vec<TaskOpResult> = client
+        .call(DS_TASK_API, "resume", DS_TASK_SUPPORTED, &params)
+        .await?;
+    tracing::info!(count = ids.len(), "resumed Download Station tasks");
+    Ok(results)
+}
+
 /// Remove tasks from Download Station.
 ///
 /// **This does not touch the files** — that is the entire reason this program
