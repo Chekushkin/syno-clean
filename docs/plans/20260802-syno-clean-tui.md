@@ -438,13 +438,25 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 - Modify: `src/app.rs`
 - Modify: `src/cli.rs`
 
-- [ ] add a hidden `--fixture <path>` flag that loads a captured list response straight into `App` with no networking — **Tasks 9, 10 and 12 are otherwise unverifiable, since the poller does not exist until Task 11**; it also makes the 500+ task perf check in Task 21 trivial
-- [ ] render the task table with the columns from Technical Details, using `format.rs` helpers and per-status colour
-- [ ] add a header row indicating the active sort column and direction
-- [ ] implement column widths where Name absorbs slack and truncates (responsive column *dropping* is deferred past v1 — not required)
-- [ ] implement cursor movement (`↑`/`↓`/`k`/`j`/PgUp/PgDn/Home/End/`g`/`G`) with scroll offset clamped to the visible list
-- [ ] write tests for cursor movement clamping (empty list, single row, past-the-end, past-the-start)
-- [ ] run `cargo test` — must pass before task 10
+- [x] add a hidden `--fixture <path>` flag that loads a captured list response straight into `App` with no networking — **Tasks 9, 10 and 12 are otherwise unverifiable, since the poller does not exist until Task 11**; it also makes the 500+ task perf check in Task 21 trivial — `app::parse_fixture` / `App::from_fixture`, reusing `parse_envelope::<TaskList>`
+- [x] render the task table with the columns from Technical Details, using `format.rs` helpers and per-status colour
+- [x] add a header row indicating the active sort column and direction
+- [x] implement column widths where Name absorbs slack and truncates (responsive column *dropping* is deferred past v1 — not required)
+- [x] implement cursor movement (`↑`/`↓`/`k`/`j`/PgUp/PgDn/Home/End/`g`/`G`) with scroll offset clamped to the visible list
+- [x] write tests for cursor movement clamping (empty list, single row, past-the-end, past-the-start)
+- [x] run `cargo test` — must pass before task 10 — 224 tests pass
+
+⚠️ **Decisions taken during Task 9** (plan text above kept verbatim; actuals recorded here):
+- **`--fixture` short-circuits `main` before the config merge**, so it needs no config file, no `--host` and no password. Requiring credentials to look at a captured JSON file would defeat the flag's whole purpose (verified: `--fixture` on a machine with no config gets as far as the TTY check, while a bare invocation still exits on "no NAS host configured"). It is hidden like the dump flags but is **not** one of them — `Cli::is_dump()` stays false, since it enters the TUI rather than printing and exiting.
+- ➕ `src/main.rs` is modified too (the plan lists only `cli`/`app`/`ui` files): the flag has to be dispatched from the startup path, and the event loop is where the page height is fed back to `App`.
+- **The table is laid out by hand rather than with ratatui's `Table` widget.** The Name column must truncate at *display width* and every other cell must be padded to an exact cell count, or the first CJK title shears every column to its right; a widget that measures differently cannot be made to agree. Each row is one pre-composed `Line`, so the layout, truncation and padding all go through `format.rs`.
+- **The scroll offset is derived, not stored**: `table::scroll_offset(cursor, rows, height)` is pure, so there is no second piece of state to fall out of step with a cursor that Task 11's refresh moved. The window is the smallest one containing the cursor and never scrolls past a full last page.
+- ➕ `App` gained a private `page_size` (default 20) with `set_page_size`, pushed in by the event loop from `TerminalGuard::page_size()` after every draw, so `PageUp`/`PageDown` move a real screenful without `App` knowing anything about a terminal. `App::default()` is hand-written because a derived `0` would make the key silently dead.
+- **Cursor movement clamps and never wraps.** Wrapping from the bottom of a long list to the top is how the wrong row gets deleted. `clamp_cursor()` is public because Tasks 11 and 12 both need it after the visible set shrinks.
+- ➕ `App::cursor_task()` added here (rather than in Task 14) so "the row under the cursor" has one definition.
+- Long DSM statuses are shortened in the Status column (`hash_checking` → `checking`, `filehosting_waiting` → `hosting`) so the column fits in 11 cells; an **unknown status is rendered verbatim** and coloured magenta, never renamed.
+- The bordered body placeholder from Task 8 is gone: the table is full-bleed (the border cost two columns of an already-wide table) and the empty state is a centred message. Task 17 owns the polished wording.
+- ➕ 45 tests added despite the terminal being "verified by running": column widths, the scroll-offset function, cell contents against the fixture, padding/truncation at every column, the sort marker, and three `TestBackend` frame tests. None needs a TTY.
 
 ### Task 10: Multi-select with spacebar
 

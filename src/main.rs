@@ -6,6 +6,8 @@
 //! logging, config resolution, the two hidden `--dump-*` modes — and the event
 //! loop, which owns the terminal for as long as the TUI is running.
 
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use ratatui::crossterm::event::{self, Event};
@@ -27,6 +29,13 @@ async fn main() -> Result<()> {
     // for the whole of `main` — dropping it early discards buffered lines.
     let log_file = cli.log_file.clone().unwrap_or_else(|| paths.log_file());
     let _log_guard = config::init_logging(&log_file)?;
+
+    // Offline fixture mode short-circuits everything below: it makes no
+    // network call, so requiring a host, a username and a password to look at
+    // a captured response would defeat the point of the flag.
+    if let Some(fixture) = cli.fixture.clone() {
+        return run_fixture(&fixture).await;
+    }
 
     let config_path = cli.config.clone().unwrap_or_else(|| paths.config_file());
     let file_config = Config::load(&config_path)?;
@@ -59,6 +68,26 @@ async fn main() -> Result<()> {
     run_tui(&mut app).await
 }
 
+/// The hidden `--fixture` mode: the TUI over a captured `list` response.
+///
+/// Until the poller lands in Task 11 this is the only way to see the table at
+/// all, and afterwards it stays the way the UI is exercised without a NAS — the
+/// table, multi-select, sorting, filtering and search are all verifiable from a
+/// checked-in JSON file.
+async fn run_fixture(path: &Path) -> Result<()> {
+    tracing::info!(fixture = %path.display(), "offline fixture mode");
+
+    let mut app = App::from_fixture(path)
+        .with_context(|| format!("could not load the fixture {}", path.display()))?;
+    app.set_status(format!(
+        "offline · {} · {} tasks",
+        path.display(),
+        app.tasks.len()
+    ));
+
+    run_tui(&mut app).await
+}
+
 /// The main event loop: draw, wait for one event, hand it to [`App`], repeat.
 ///
 /// The panic hook is installed **before** the guard, so a panic during setup is
@@ -79,6 +108,9 @@ async fn run_tui(app: &mut App) -> Result<()> {
 
     while !app.should_quit() {
         terminal.draw(app)?;
+        // A page jump is a screenful of the table, so the app is told how tall
+        // that is after every draw — including after a resize.
+        app.set_page_size(terminal.page_size()?);
         app.handle_event(next_terminal_event().await?);
     }
 

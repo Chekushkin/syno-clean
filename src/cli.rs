@@ -72,6 +72,17 @@ pub struct Cli {
     /// `syno-clean --dump-tasks-json > tests/fixtures/task_list.json`.
     #[arg(long = "dump-tasks-json", hide = true)]
     pub dump_tasks_json: bool,
+
+    /// Run the TUI against a captured `list` response instead of a NAS.
+    ///
+    /// Hidden. The file is a full DSM response envelope — exactly what
+    /// `--dump-tasks-json` prints and what `tests/fixtures/task_list.json`
+    /// holds. No network call is made and **no configuration is required**:
+    /// the point is to exercise the table, selection and the sort/filter keys
+    /// with no NAS in reach, so demanding a host and a password would defeat
+    /// it.
+    #[arg(long = "fixture", value_name = "PATH", hide = true)]
+    pub fixture: Option<PathBuf>,
 }
 
 impl Cli {
@@ -116,6 +127,8 @@ mod tests {
             "--logout",
             "--dump-api-info",
             "--dump-tasks-json",
+            "--fixture",
+            "/tmp/tasks.json",
         ])
         .expect("valid arguments");
 
@@ -138,6 +151,30 @@ mod tests {
         assert!(cli.dump_api_info);
         assert!(cli.dump_tasks_json);
         assert!(cli.is_dump());
+        assert_eq!(
+            cli.fixture.as_deref(),
+            Some(std::path::Path::new("/tmp/tasks.json"))
+        );
+    }
+
+    #[test]
+    fn the_fixture_flag_is_hidden_and_takes_a_path() {
+        let cli = Cli::try_parse_from(["syno-clean", "--fixture", "tests/fixtures/task_list.json"])
+            .expect("valid");
+        assert_eq!(
+            cli.fixture.as_deref(),
+            Some(std::path::Path::new("tests/fixtures/task_list.json"))
+        );
+        // Offline mode is not one of the dump modes: it enters the TUI.
+        assert!(!cli.is_dump());
+        assert!(
+            !Cli::command()
+                .render_long_help()
+                .to_string()
+                .contains("--fixture")
+        );
+        // It requires a value rather than defaulting to some path.
+        assert!(Cli::try_parse_from(["syno-clean", "--fixture"]).is_err());
     }
 
     #[test]
@@ -175,5 +212,6 @@ mod tests {
         assert!(!cli.dry_run);
         assert!(!cli.logout);
         assert!(!cli.is_dump());
+        assert!(cli.fixture.is_none());
     }
 }
