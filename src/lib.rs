@@ -7,9 +7,11 @@
 //! trip `dead_code` while the rest of the program is still being built.
 
 pub mod api;
+pub mod app;
 pub mod cli;
 pub mod config;
 pub mod error;
 pub mod format;
 pub mod model;
+pub mod ui;
 pub mod view;

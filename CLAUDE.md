@@ -266,6 +266,34 @@ call, so what the user read on screen is exactly what gets deleted.
   than cloning or reordering the source data.
 - **Cursor and selection are keyed by task ID, not row index**, so a refresh
   that reorders or removes rows never silently reassigns what is selected.
+  `App::cursor` is a position in the *visible* list; the reconciliation that
+  keeps it on the same task lives in Task 11's `apply_tasks`.
+- `App::handle_key` ignores anything that is not `KeyEventKind::Press` —
+  Windows and the kitty protocol report releases too, and acting on both halves
+  runs every binding twice. `Ctrl-C` is handled before the mode dispatch so it
+  works from inside a modal.
+
+### Terminal lifecycle (`ui`)
+
+- `ui::TerminalGuard::new()` is the **only** place raw mode and the alternate
+  screen are entered, and its `Drop` the only place they are left. It owns the
+  `Terminal`, so a drawable terminal cannot outlive the restoration, and every
+  exit path — clean quit, `?` out of the loop, unwinding panic — restores.
+  Errors in `Drop` go to the log; there is nowhere else to put them.
+- `ui::install_panic_hook()` **chains** to the previous hook rather than
+  replacing it (the backtrace must still print) and is `Once`-guarded so a
+  double install cannot nest. Install it *before* constructing the guard.
+- Non-TTY stdout is a clean failure, not a corrupted terminal:
+  `TerminalGuard::new()` returns the `enable_raw_mode` error and `main` prints
+  an actionable message and exits non-zero.
+- `ui::render(&mut Frame, &App)` is pure and takes `&App`. That is what makes
+  the frame testable with `ratatui::backend::TestBackend`, which renders into
+  an in-memory `Buffer` with **no TTY** — the right tool for layout regressions
+  even though the terminal lifecycle itself stays "verified by running".
+- The input source is a `spawn_blocking(event::read)` awaited one at a time,
+  because crossterm's `event-stream` feature is unavailable through ratatui's
+  re-export. Exactly one read is ever in flight, so nothing lingers on the
+  blocking pool at shutdown.
 
 ## Testing philosophy
 
