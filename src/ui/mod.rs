@@ -264,8 +264,19 @@ fn render_title_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 /// The test for which one to draw is [`App::tasks`] being empty, *not*
 /// [`View::is_narrowed`]: with zero tasks and a filter set, both are true and
 /// only the first is the user's actual problem.
+///
+/// There is a **third** state in front of both: before the first poll has come
+/// back — and permanently, if every poll fails — there is no list to describe.
+/// Saying "nothing is queued on the NAS" there is an assertion the program
+/// cannot make, and directly underneath the red banner that says the NAS is
+/// unreachable it contradicts itself. [`App::loaded`] is what distinguishes it.
 fn empty_state(app: &App) -> Paragraph<'static> {
-    let (headline, hint) = if app.tasks.is_empty() {
+    let (headline, hint) = if !app.loaded {
+        (
+            "Waiting for the task list".to_string(),
+            "nothing has come back from the NAS yet · r refresh · ? help · q quit".to_string(),
+        )
+    } else if app.tasks.is_empty() {
         (
             "No Download Station tasks".to_string(),
             "nothing is queued on the NAS · r refresh · ? help · q quit".to_string(),
@@ -298,6 +309,21 @@ fn empty_state(app: &App) -> Paragraph<'static> {
 /// Only the parts that narrow — the sort orders rows, it never removes them —
 /// so the sentence names something the user can actually undo.
 fn narrowing_summary(view: &View) -> String {
+    let parts = narrowing_parts(view);
+    if parts.is_empty() {
+        // Unreachable in practice — with nothing narrowing, every task is
+        // visible — but the sentence must still parse if it ever is reached.
+        return "the current view".to_string();
+    }
+    parts.join(" and ")
+}
+
+/// The phrases naming whatever is currently removing rows, in a fixed order.
+///
+/// One definition for both readers — [`narrowing_summary`] joins them with
+/// "and" for the empty state, [`view_summary`] appends them to the sort for the
+/// footer — so the two can never describe the same view differently.
+fn narrowing_parts(view: &View) -> Vec<String> {
     let mut parts = Vec::new();
     if view.filter != StatusFilter::All {
         parts.push(format!("filter {}", view.filter.label()));
@@ -305,12 +331,7 @@ fn narrowing_summary(view: &View) -> String {
     if !view.search.is_empty() {
         parts.push(format!("search \"{}\"", view.search));
     }
-    if parts.is_empty() {
-        // Unreachable in practice — with nothing narrowing, every task is
-        // visible — but the sentence must still parse if it ever is reached.
-        return "the current view".to_string();
-    }
-    parts.join(" and ")
+    parts
 }
 
 /// How many tasks are selected and how much space deleting them would free.
@@ -343,12 +364,7 @@ fn view_summary(view: &View) -> String {
         view.sort_key.label(),
         view.sort_dir.arrow()
     )];
-    if view.filter != StatusFilter::All {
-        parts.push(format!("filter {}", view.filter.label()));
-    }
-    if !view.search.is_empty() {
-        parts.push(format!("search \"{}\"", view.search));
-    }
+    parts.extend(narrowing_parts(view));
     parts.join(" · ")
 }
 
@@ -497,11 +513,21 @@ mod tests {
             .join(" ")
     }
 
+    /// An app the poller has answered, with nothing queued on the NAS.
+    ///
+    /// Distinct from `App::default()`, which is the state *before* the first
+    /// poll comes back — see [`empty_state`].
+    fn loaded_empty() -> App {
+        let mut app = App::default();
+        app.loaded = true;
+        app
+    }
+
     #[test]
     fn an_empty_app_renders_a_title_bar_an_empty_state_and_a_footer() {
         // Wide enough for the whole hint line: the footer is clipped rather
         // than wrapped, and this asserts on its text.
-        let lines = frame_lines(&App::default(), 90, 8);
+        let lines = frame_lines(&loaded_empty(), 90, 8);
         assert_eq!(lines.len(), 8);
 
         assert!(lines[0].contains(env!("CARGO_PKG_NAME")), "{:?}", lines[0]);
@@ -649,7 +675,7 @@ mod tests {
         assert!(narrowed.contains("f filter"), "{narrowed}");
 
         // ...whereas a plain empty list does not claim a filter is to blame.
-        let empty = frame_words(&App::default(), 90, 8);
+        let empty = frame_words(&loaded_empty(), 90, 8);
         assert!(empty.contains("No Download Station tasks"), "{empty}");
         assert!(!empty.contains("No tasks match"), "{empty}");
         assert!(empty.contains("r refresh"), "{empty}");
@@ -660,7 +686,7 @@ mod tests {
         // Both are true with an empty list and a filter set, and only one of
         // them is the user's actual problem: pressing `f` will not conjure a
         // download that does not exist.
-        let mut app = App::default();
+        let mut app = loaded_empty();
         app.view.filter = StatusFilter::Seeding;
         app.view.search = "anything".to_string();
         assert!(app.view.is_narrowed());
@@ -668,6 +694,29 @@ mod tests {
         let text = frame_words(&app, 90, 8);
         assert!(text.contains("No Download Station tasks"), "{text}");
         assert!(!text.contains("hidden"), "{text}");
+    }
+
+    #[test]
+    fn a_list_that_has_never_arrived_does_not_claim_the_nas_is_idle() {
+        // Startup, and — the case that matters — a NAS that every poll has
+        // failed to reach. "nothing is queued on the NAS" is an assertion the
+        // program cannot make there, and directly under the red banner saying
+        // the NAS is unreachable it contradicts itself.
+        let mut app = App::default();
+        assert!(!app.loaded);
+        let text = frame_words(&app, 90, 8);
+        assert!(text.contains("Waiting for the task list"), "{text}");
+        assert!(!text.contains("nothing is queued"), "{text}");
+
+        app.set_error("refresh failed: connection refused");
+        let text = frame_words(&app, 90, 8);
+        assert!(!text.contains("nothing is queued"), "{text}");
+
+        // One successful poll — even an empty one — settles the question.
+        app.apply_tasks(Vec::new());
+        assert!(app.loaded);
+        let text = frame_words(&app, 90, 8);
+        assert!(text.contains("No Download Station tasks"), "{text}");
     }
 
     #[test]

@@ -130,9 +130,13 @@ impl ConfirmSummary {
 
 /// Turn a snapshot into everything the modal needs to say.
 ///
-/// The plan's items are listed in **snapshot order** — the order the user had
-/// them selected in — rather than grouped, so a row on screen maps to a row in
-/// the dialog. Refused items keep their place in that order and are flagged
+/// The plan's items are listed in **snapshot order** rather than grouped, and
+/// snapshot order is the **on-screen order** the plan was built from (see
+/// `App::target_tasks`) — so the nth row of the dialog is the nth armed row of
+/// the table, under any sort. That correspondence is the entire job of this
+/// screen: a user checking that the right torrents are armed reads down the
+/// list, and an order that did not match the table would make the check
+/// worthless. Refused items keep their place in that order and are flagged
 /// rather than hidden.
 ///
 /// `options` is a parameter rather than a field of the plan because it is
@@ -602,7 +606,15 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 keys: "↑ ↓ k j",
-                action: "scroll the list",
+                action: "scroll a line",
+            },
+            HelpEntry {
+                keys: "PgUp PgDn",
+                action: "scroll a page",
+            },
+            HelpEntry {
+                keys: "Home End",
+                action: "first / last line",
             },
         ],
     },
@@ -663,15 +675,24 @@ fn column_rows(sections: &[HelpSection], spaced: bool) -> usize {
     }
 }
 
-/// Cells a column of `sections` needs: the widest key, the gap, and the widest
-/// action — measured at **display width**, since the key column holds arrows.
-fn column_width(sections: &[HelpSection]) -> u16 {
-    let keys = sections
+/// Cells the key column of `sections` occupies — the widest key in it.
+///
+/// One definition for both readers: [`column_width`] sizes the overlay from it
+/// and [`column_lines`] pads to it, and two copies that disagreed would print
+/// the actions out of alignment with the width that was reserved for them.
+fn key_width(sections: &[HelpSection]) -> usize {
+    sections
         .iter()
         .flat_map(|section| section.entries)
         .map(|entry| display_width(entry.keys))
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// Cells a column of `sections` needs: the widest key, the gap, and the widest
+/// action — measured at **display width**, since the key column holds arrows.
+fn column_width(sections: &[HelpSection]) -> u16 {
+    let keys = key_width(sections);
     let body = sections
         .iter()
         .flat_map(|section| {
@@ -689,12 +710,7 @@ fn column_width(sections: &[HelpSection]) -> u16 {
 /// The rendered lines of one column: a styled title, then `keys  action` rows,
 /// with a blank line between sections.
 fn column_lines(sections: &[HelpSection], spaced: bool) -> Vec<Line<'static>> {
-    let key_width = sections
-        .iter()
-        .flat_map(|section| section.entries)
-        .map(|entry| display_width(entry.keys))
-        .max()
-        .unwrap_or(0);
+    let key_width = key_width(sections);
 
     let mut lines = Vec::with_capacity(column_rows(sections, spaced));
     for (index, section) in sections.iter().enumerate() {

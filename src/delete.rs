@@ -59,9 +59,15 @@
 //! [`DeletePlan`] owns copies of everything it needs: id, title, size, status
 //! and the resolved path, all taken at the instant the confirmation dialog
 //! opens. It borrows nothing from the task list, so a background refresh
-//! landing mid-dialog cannot change what the user is about to confirm. (The
-//! poller is suspended in `Mode::Confirm` as well — belt *and* braces, because
-//! the failure mode here is deleting something the user never read.)
+//! landing mid-dialog cannot change what the user is about to confirm.
+//! (`App::apply_tasks` discards refreshes outright while `Mode::Confirm` is
+//! active — belt *and* braces, because the failure mode here is deleting
+//! something the user never read. The poller itself keeps ticking; it is the
+//! *application* of a tick that is suppressed.)
+//!
+//! The snapshot's [`DeleteItem::status`], though, is only good for *display*.
+//! It is as old as the dialog plus the item's place in the batch queue, so the
+//! executor never decides whether to pause from it — see [`plan_delete_ops`].
 
 use crate::config::{DEFAULT_DELETE_FILES, ResolvedConfig};
 use crate::error::{Error, Result};
@@ -187,6 +193,22 @@ fn is_volume_component(component: &str) -> bool {
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Where the on-disk name in a resolved path came from.
+///
+/// The executor needs this to read an *absent* path correctly. A path built
+/// from the file list is what BitTorrent actually wrote, so finding nothing
+/// there really does mean somebody already cleaned up; a path built from the
+/// display title is a **guess**, and finding nothing there is at least as
+/// likely to mean the guess was wrong. See `event::decide_file_phase`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameSource {
+    /// Rule 1: the shared top-level component of the task's file list.
+    FileList,
+    /// Rule 3: the task's display title, the only thing a task with no file
+    /// list offers.
+    Title,
+}
+
 /// The absolute File Station path holding a task's data.
 ///
 /// This is the only function permitted to answer "what does deleting this task
@@ -199,7 +221,13 @@ fn is_volume_component(component: &str) -> bool {
 /// re-validated immediately before the File Station call anyway — the check is
 /// free and the value crosses a task boundary in between.
 pub fn resolve_delete_path(task: &Task) -> Result<String> {
-    let name = resolve_name(task)?;
+    resolve_delete_target(task).map(|(path, _)| path)
+}
+
+/// As [`resolve_delete_path`], also reporting which resolution rule produced
+/// the on-disk name.
+pub fn resolve_delete_target(task: &Task) -> Result<(String, NameSource)> {
+    let (name, source) = resolve_name(task)?;
 
     let destination = normalize_destination(&task.destination);
     if destination.is_empty() {
@@ -213,18 +241,18 @@ pub fn resolve_delete_path(task: &Task) -> Result<String> {
 
     let path = format!("/{destination}/{name}");
     validate_path(&path)?;
-    Ok(path)
+    Ok((path, source))
 }
 
 /// The on-disk name of a task's payload — rules 1 to 3 of the resolution order.
-fn resolve_name(task: &Task) -> Result<String> {
-    let name = if task.files.is_empty() {
+fn resolve_name(task: &Task) -> Result<(String, NameSource)> {
+    let (name, source) = if task.files.is_empty() {
         // Rule 3: no file list to be authoritative, so the title is all there
         // is. Non-BT tasks are named after the file they fetch.
-        task.title.clone()
+        (task.title.clone(), NameSource::Title)
     } else {
         // Rules 1 and 2.
-        common_root(&task.files).ok_or_else(|| {
+        let root = common_root(&task.files).ok_or_else(|| {
             Error::unsafe_path(
                 &task.title,
                 format!(
@@ -235,11 +263,12 @@ fn resolve_name(task: &Task) -> Result<String> {
                     describe_roots(&task.files)
                 ),
             )
-        })?
+        })?;
+        (root, NameSource::FileList)
     };
 
     validate_name(&name)?;
-    Ok(name)
+    Ok((name, source))
 }
 
 /// The distinct first components of a file list, for a refusal message that
@@ -361,22 +390,31 @@ pub struct DeleteItem {
     pub title: String,
     /// Task size as DSM reported it — what the user is told they will reclaim.
     pub size: u64,
-    /// Status **at snapshot time**, which is what picks the delete ordering
-    /// (pause first for an active task).
+    /// Status **at snapshot time**.
+    ///
+    /// For display only. It is deliberately *not* what decides whether the task
+    /// is paused before its files go: by the time the executor reaches this
+    /// item the value is as old as the confirmation dialog plus the item's
+    /// place in the batch queue, and a task that DSM's bandwidth schedule
+    /// resumed in that window would be written into mid-delete. The live check
+    /// lives in `event::pause_and_confirm`.
     pub status: TaskStatus,
     pub target: Target,
+    /// Which resolution rule produced the on-disk name, or `None` for a refused
+    /// item. Decides how an *absent* path is read; see [`NameSource`].
+    pub name_source: Option<NameSource>,
 }
 
 impl DeleteItem {
     /// Resolve one task into a snapshot item. A refusal is recorded on the
     /// item rather than returned, so one bad torrent never aborts the batch.
     fn for_task(task: &Task) -> Self {
-        let target = match resolve_delete_path(task) {
-            Ok(path) => Target::Path(path),
-            Err(Error::UnsafePath { reason, .. }) => Target::Refused(reason),
-            // `resolve_delete_path` only produces `UnsafePath` today; anything
+        let (target, name_source) = match resolve_delete_target(task) {
+            Ok((path, source)) => (Target::Path(path), Some(source)),
+            Err(Error::UnsafePath { reason, .. }) => (Target::Refused(reason), None),
+            // `resolve_delete_target` only produces `UnsafePath` today; anything
             // else is still a refusal, never a fallthrough to deletion.
-            Err(other) => Target::Refused(other.to_string()),
+            Err(other) => (Target::Refused(other.to_string()), None),
         };
         DeleteItem {
             id: task.id.clone(),
@@ -384,6 +422,7 @@ impl DeleteItem {
             size: task.size,
             status: task.status.clone(),
             target,
+            name_source,
         }
     }
 
@@ -504,6 +543,9 @@ pub fn describe_ops(ops: &[Op]) -> String {
 /// already idle costs one round trip, while failing to pause something that is
 /// live risks Download Station writing into the directory as it is being
 /// deleted, or re-creating it afterwards.
+///
+/// ⚠️ Only ever called on a **live** status read at execution time
+/// (`event::pause_and_confirm`), never on [`DeleteItem::status`].
 pub fn requires_pause(status: &TaskStatus) -> bool {
     !matches!(
         status,
@@ -529,7 +571,16 @@ pub fn requires_pause(status: &TaskStatus) -> bool {
 ///   The pause exists only to keep Download Station out of the way of the file
 ///   delete; with no file delete there is nothing to keep it out of, and a
 ///   pause that failed would then block a task-only removal for no reason.
-/// * A task that is already inactive is not paused; see [`requires_pause`].
+///
+/// ⚠️ **The pause phase is unconditional whenever files are being deleted**, and
+/// is *not* filtered by [`requires_pause`] here. [`DeleteItem::status`] is a
+/// snapshot taken when the dialog opened; a task that DSM's bandwidth schedule
+/// resumed while the user was reading it would come out of this function with
+/// no pause at all, and File Station would then recurse through a directory
+/// Download Station is actively writing into. The executor issues the phase and
+/// resolves it against a **live** status read (`event::pause_and_confirm`),
+/// which costs one `getinfo` for a task that turns out to be idle and skips the
+/// pause call itself.
 ///
 /// `dry_run` deliberately does **not** shorten the list: a dry run has to be
 /// able to report the operations it is declining to perform.
@@ -540,9 +591,7 @@ pub fn plan_delete_ops(item: &DeleteItem, options: DeleteOptions) -> Vec<Op> {
 
     let mut ops = Vec::new();
     if options.delete_files {
-        if requires_pause(&item.status) {
-            ops.push(Op::Pause);
-        }
+        ops.push(Op::Pause);
         ops.push(Op::DeleteFiles(path.to_string()));
     }
     ops.push(Op::DeleteTask);
@@ -564,6 +613,7 @@ pub fn ops_cancelled_by(ops: &[Op], failed_at: usize) -> &[Op] {
 mod tests {
     use super::*;
     use crate::api::client::parse_envelope;
+    use crate::config::ResolvedConfig;
     use crate::model::TaskList;
 
     const FIXTURE: &str = include_str!("../tests/fixtures/task_list.json");
@@ -1290,28 +1340,18 @@ mod tests {
     const INACTIVE: [TaskStatus; 3] = [TaskStatus::Paused, TaskStatus::Finished, TaskStatus::Error];
 
     #[test]
-    fn an_active_task_is_paused_before_anything_is_deleted() {
-        for status in ACTIVE {
+    fn every_task_is_paused_before_anything_is_deleted_whatever_the_snapshot_said() {
+        // Including the statuses the plan's table calls inactive. The snapshot
+        // status is as old as the confirmation dialog plus this item's place in
+        // the batch queue, so it cannot be trusted to say a task is idle *now*;
+        // the executor resolves the phase against a live read and skips the
+        // pause call when the task really is idle.
+        for status in ACTIVE.iter().chain(INACTIVE.iter()) {
             let item = item_with(status.clone());
             assert_eq!(
                 plan_delete_ops(&item, DeleteOptions::default()),
                 vec![
                     Op::Pause,
-                    Op::DeleteFiles("/downloads/Some.Release".to_string()),
-                    Op::DeleteTask,
-                ],
-                "{status:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_inactive_task_is_not_paused() {
-        for status in INACTIVE {
-            let item = item_with(status.clone());
-            assert_eq!(
-                plan_delete_ops(&item, DeleteOptions::default()),
-                vec![
                     Op::DeleteFiles("/downloads/Some.Release".to_string()),
                     Op::DeleteTask,
                 ],
@@ -1468,6 +1508,126 @@ mod tests {
     // -----------------------------------------------------------------------
     // describe_ops
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // DeleteOptions::from_config — the only translation of the CLI flags
+    // -----------------------------------------------------------------------
+
+    /// A resolved configuration with the two delete-affecting settings set.
+    fn config_with(delete_files: bool, dry_run: bool) -> ResolvedConfig {
+        ResolvedConfig {
+            host: "nas.invalid".to_string(),
+            port: 5001,
+            https: true,
+            insecure: false,
+            username: "tester".to_string(),
+            refresh_secs: 3,
+            delete_files,
+            dry_run,
+            logout: false,
+        }
+    }
+
+    #[test]
+    fn from_config_carries_both_flags_through_unchanged() {
+        // An inverted `dry_run` here would make `--dry-run` perform the real
+        // recursive delete, and nothing else in the program would notice.
+        for delete_files in [true, false] {
+            for dry_run in [true, false] {
+                let options = DeleteOptions::from_config(&config_with(delete_files, dry_run));
+                assert_eq!(
+                    options,
+                    DeleteOptions {
+                        delete_files,
+                        dry_run
+                    },
+                    "delete_files={delete_files} dry_run={dry_run}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn from_config_and_plan_delete_ops_agree_about_what_a_dry_run_is() {
+        // The end-to-end property the flag exists for: `--dry-run` plans every
+        // op (so it can report them) and `--no-delete-files` plans no file
+        // phase at all.
+        let dry = DeleteOptions::from_config(&config_with(true, true));
+        assert!(dry.dry_run && dry.delete_files);
+        let item = item_with(TaskStatus::Downloading);
+        assert!(
+            plan_delete_ops(&item, dry)
+                .iter()
+                .any(|op| matches!(op, Op::DeleteFiles(_)))
+        );
+
+        let task_only = DeleteOptions::from_config(&config_with(false, false));
+        assert_eq!(plan_delete_ops(&item, task_only), vec![Op::DeleteTask]);
+    }
+
+    #[test]
+    fn the_default_options_are_what_an_unflagged_run_resolves_to() {
+        assert_eq!(
+            DeleteOptions::from_config(&config_with(DEFAULT_DELETE_FILES, false)),
+            DeleteOptions::default()
+        );
+        assert!(!DeleteOptions::default().dry_run, "a dry run is opt-in");
+        assert!(DeleteOptions::dry_run().dry_run);
+    }
+
+    // -----------------------------------------------------------------------
+    // NameSource — how an absent path is allowed to be read
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_path_from_the_file_list_records_that_provenance() {
+        let (path, source) = resolve_delete_target(&task("dbid_001")).expect("resolvable");
+        assert_eq!(path, "/downloads/Ubuntu.24.04.3.LTS.Desktop.amd64");
+        assert_eq!(source, NameSource::FileList);
+        assert_eq!(
+            DeleteItem::for_task(&task("dbid_001")).name_source,
+            Some(NameSource::FileList)
+        );
+    }
+
+    #[test]
+    fn a_path_guessed_from_the_title_is_marked_as_such() {
+        // dbid_007 is an HTTP task with no file block: the on-disk name is the
+        // display title and nothing corroborates it.
+        let (_, source) = resolve_delete_target(&task("dbid_007")).expect("resolvable");
+        assert_eq!(source, NameSource::Title);
+        assert_eq!(
+            DeleteItem::for_task(&task("dbid_008")).name_source,
+            Some(NameSource::Title),
+            "an empty file list is still a guess"
+        );
+    }
+
+    #[test]
+    fn a_refused_item_records_no_provenance_at_all() {
+        assert_eq!(DeleteItem::for_task(&task("dbid_013")).name_source, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // describe_roots
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_refusal_naming_many_roots_is_truncated_rather_than_unbounded() {
+        // A torrent of loose files would otherwise put hundreds of names in a
+        // one-line footer message.
+        let files: Vec<TaskFile> = (0..9).map(|n| file(&format!("root{n}/a.bin"))).collect();
+        let described = describe_roots(&files);
+        assert!(described.ends_with(", …"), "{described}");
+        assert_eq!(described.matches("root").count(), 4, "{described}");
+
+        // Exactly four distinct roots is the boundary: shown in full, no
+        // ellipsis.
+        let files: Vec<TaskFile> = (0..4).map(|n| file(&format!("root{n}/a.bin"))).collect();
+        let described = describe_roots(&files);
+        assert!(!described.contains('…'), "{described}");
+        assert_eq!(described.matches("root").count(), 4, "{described}");
+    }
 
     #[test]
     fn an_op_list_reads_as_a_sentence_for_the_dry_run_report() {

@@ -23,14 +23,17 @@ cargo build
 
 ## The validation gate
 
-Every change must leave the repository in this state, and CI runs the same three
+Every change must leave the repository in this state, and CI runs exactly these three
 commands on Linux and macOS:
 
 ```sh
-cargo fmt --all
+cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo test --all
 ```
+
+Note the `-- --check`: CI *verifies* formatting rather than applying it. Run `cargo fmt
+--all` locally to fix what the check reports.
 
 **Warnings are errors.** Do not silence a lint with `#[allow]` without saying why in a
 comment right above it.
@@ -120,12 +123,21 @@ enabled, since that changes whether space is really reclaimed.
 - Update `CHANGELOG.md` under `Unreleased`.
 - Update `README.md` when a flag, config key, environment variable or keybinding
   changes. The keybinding overlay (`dialog::HELP_SECTIONS`) is data, and a test asserts
-  every key `App` binds appears in it — a new binding without a new row fails the suite.
+  that every key in a **hand-maintained list** appears in it. That list is not derived
+  from `App`'s match arms — it mirrors `handle_normal_key`, `handle_search_key` and
+  `handle_confirm_key` by hand, so adding a binding means adding it in three places: the
+  handler, `HELP_SECTIONS`, and the list in that test. Miss the overlay and the test
+  names the key; miss the test's list and nothing catches you.
 - Update `CLAUDE.md` when a convention or an invariant changes.
 
 ## Reporting bugs
 
 Open an issue with the DSM version, the `syno-clean --version`, what you did, what
-happened, and the relevant lines from `~/.cache/syno-clean/syno-clean.log`. Redact the
-host name if you would rather not share it — nothing else in the log is sensitive
-(credentials are redacted before they can reach it).
+happened, and the relevant lines from `~/.cache/syno-clean/syno-clean.log`. The log is
+written at `INFO` and above and that level is fixed — there is no `--verbose` flag and
+`RUST_LOG` is ignored — so `tracing::debug!` lines never reach it.
+
+Redact the host name if you would rather not share it. The **password** cannot reach the
+log: `Credentials` has a hand-written redacting `Debug`. The session `sid` is *not*
+covered by that guarantee — `SynoClient` derives `Debug` and holds it — so scan for a
+`_sid=` or a `sid:` before pasting, and treat one as a live credential if you find it.

@@ -39,7 +39,8 @@ async fn main() -> Result<()> {
     // network call, so requiring a host, a username and a password to look at
     // a captured response would defeat the point of the flag.
     if let Some(fixture) = cli.fixture.clone() {
-        return run_fixture(&fixture).await;
+        let result = run_fixture(&fixture).await;
+        finish_tui(result, _log_guard);
     }
 
     let config_path = cli.config.clone().unwrap_or_else(|| paths.config_file());
@@ -120,7 +121,58 @@ async fn main() -> Result<()> {
     // than cleanup — but leaving a task mid-request would make the runtime wait
     // out an in-flight HTTP timeout before the process could exit.
     poller.abort();
-    result
+
+    // A session renewed by the transparent re-login is a different sid from the
+    // one on disk; without this the cached entry stays dead forever and every
+    // later run burns a round trip on a 119 before repairing itself again.
+    persist_session(&ops.client, &resolved, &paths);
+
+    finish_tui(result, _log_guard)
+}
+
+/// Write back the sid the client ended the run with, if it is not the one the
+/// cache already holds.
+///
+/// Best-effort by design: a cache is an optimization, and failing to update it
+/// must never turn a successful run into a failed one.
+fn persist_session(client: &SynoClient, resolved: &ResolvedConfig, paths: &Paths) {
+    let Some(sid) = client.sid() else {
+        return;
+    };
+    let session_file = paths.session_file();
+    let key = resolved.session_key();
+    let mut cache = SessionCache::load(&session_file);
+    if cache.sid(&key) == Some(sid.as_str()) {
+        return;
+    }
+
+    cache.set_sid(&key, sid);
+    match cache.save(&session_file) {
+        Ok(()) => tracing::info!(%key, "cached the renewed session"),
+        Err(err) => tracing::warn!(%key, %err, "could not cache the renewed session"),
+    }
+}
+
+/// End the process after the TUI has returned.
+///
+/// On the error path this **exits rather than returning**. The outstanding
+/// `spawn_blocking(event::read)` is parked on stdin and cannot be cancelled;
+/// dropping the runtime waits for started blocking tasks, so returning `Err`
+/// would leave the process hanging until the user happened to press a key. The
+/// log guard is dropped explicitly first, since `exit` runs no destructors.
+fn finish_tui(result: Result<()>, log_guard: tracing_appender::non_blocking::WorkerGuard) -> ! {
+    match result {
+        Ok(()) => {
+            drop(log_guard);
+            std::process::exit(0)
+        }
+        Err(err) => {
+            tracing::error!(%err, "exiting after a TUI failure");
+            drop(log_guard);
+            eprintln!("Error: {err:?}");
+            std::process::exit(1)
+        }
+    }
 }
 
 /// Nothing to connect to: write a starter config, say what is missing, stop.
@@ -235,8 +287,14 @@ async fn run_tui(
     )?;
 
     let mut pending_read = None;
+    // Handles for op batches still running. Kept so that (a) a second batch
+    // cannot be started on top of a live one and (b) quitting does not abandon
+    // one half-way through the three-phase delete.
+    let mut in_flight: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     while !app.should_quit() {
+        in_flight.retain(|handle| !handle.is_finished());
+
         terminal.draw(app)?;
         // A page jump is a screenful of the table, so the app is told how tall
         // that is after every draw — including after a resize.
@@ -271,8 +329,21 @@ async fn run_tui(
         // twenty torrents must not freeze the terminal.
         if let Some(plan) = app.take_confirmed_delete() {
             match ops {
+                // One batch at a time. Two overlapping delete runs would
+                // interleave their pause/delete phases against the same NAS and
+                // report two sets of progress into one footer line, and the
+                // second could reach a task the first had already removed.
+                Some(_) if !in_flight.is_empty() => {
+                    app.set_status(
+                        "an operation is still running — wait for it to finish before deleting",
+                    );
+                    tracing::warn!(
+                        items = plan.len(),
+                        "refusing a second batch while one is in flight"
+                    );
+                }
                 Some(ops) => {
-                    event::spawn_delete(ops.clone(), plan, app.delete_options);
+                    in_flight.push(event::spawn_delete(ops.clone(), plan, app.delete_options));
                 }
                 // `--fixture` has no client at all, which is also why it forces
                 // `DeleteOptions::dry_run()` — the dialog never promises a
@@ -288,25 +359,62 @@ async fn run_tui(
         // through the same channel and refreshing the table when it finishes.
         if let Some(request) = app.take_requested_op() {
             match ops {
+                Some(_) if !in_flight.is_empty() => {
+                    app.set_status(format!(
+                        "an operation is still running — wait for it to finish before {} anything",
+                        request.op.label()
+                    ));
+                }
                 Some(ops) => {
-                    event::spawn_task_op(
+                    in_flight.push(event::spawn_task_op(
                         ops.clone(),
                         request.op,
-                        request.ids,
+                        request.tasks,
                         app.delete_options.dry_run,
-                    );
+                    ));
                 }
                 None => tracing::warn!(
                     op = request.op.label(),
-                    tasks = request.ids.len(),
+                    tasks = request.tasks.len(),
                     "an operation was requested in offline fixture mode; there is nothing to run it against"
                 ),
             }
         }
     }
 
+    // Restore the terminal *before* waiting: a batch that is mid-way between
+    // "the files are gone" and "the task is gone" must be allowed to finish —
+    // abandoning it there is the one outcome the whole three-phase ordering
+    // exists to prevent — but the user should be looking at their shell while
+    // it does, not at a frozen TUI.
+    drop(terminal);
+    await_in_flight(in_flight).await;
+
     tracing::info!("exiting");
     Ok(())
+}
+
+/// Let any still-running op batch finish before the process goes away.
+///
+/// Dropping these handles would not cancel the tasks, but returning from
+/// `main` would: the runtime shuts down and a delete stops wherever it had got
+/// to. Between the File Station delete and the Download Station one, that is a
+/// task left pointing at data it no longer has.
+async fn await_in_flight(handles: Vec<tokio::task::JoinHandle<()>>) {
+    let outstanding: Vec<_> = handles.into_iter().filter(|h| !h.is_finished()).collect();
+    if outstanding.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "waiting for {} operation(s) still running on the NAS…",
+        outstanding.len()
+    );
+    for handle in outstanding {
+        if let Err(err) = handle.await {
+            tracing::warn!(%err, "an operation task did not finish cleanly");
+        }
+    }
 }
 
 /// Which of the two event sources won a pass of the loop.

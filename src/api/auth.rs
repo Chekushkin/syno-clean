@@ -83,10 +83,12 @@ pub struct LoginData {
     pub is_portal_port: Option<bool>,
 }
 
-/// Query parameters for `method=login`.
+/// **Form-body** parameters for `method=login`.
 ///
 /// `format=sid` asks DSM for a session id in the response body rather than a
 /// cookie, which is what lets the sid be cached to disk and reused.
+///
+/// ⚠️ These go in a POST body, never in a query string — see [`login`].
 pub fn build_login_params(credentials: &Credentials, session: &str) -> Vec<(&'static str, String)> {
     let mut params = vec![
         ("account", credentials.username.clone()),
@@ -109,10 +111,17 @@ pub fn build_logout_params(session: &str) -> Vec<(&'static str, String)> {
 ///
 /// Deliberately bypasses [`SynoClient::call_text`]: that path re-logs-in on a
 /// session error, and a login must not recurse into itself.
+///
+/// **The one request in this program that is a POST.** Everything else is a
+/// GET with its parameters in the query string, which DSM's nginx access log
+/// records in full; sending `passwd=` that way would write the account password
+/// to disk on the NAS on every single login, and — with `https = false` — put it
+/// on the wire in cleartext as well. `api`, `version` and `method` stay in the
+/// query because they are routing, not secrets.
 pub async fn login(client: &SynoClient, credentials: &Credentials) -> Result<String> {
     let endpoint = client.endpoint(AUTH_API, AUTH_SUPPORTED)?;
     let params = build_login_params(credentials, AUTH_SESSION);
-    let body = client.send(&endpoint, "login", &params, None).await?;
+    let body = client.post_form(&endpoint, "login", &params).await?;
     let data: LoginData = crate::api::client::parse_envelope(&body, AUTH_API)?;
     tracing::info!(user = %credentials.username, "logged in to DSM");
     Ok(data.sid)
