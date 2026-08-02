@@ -453,6 +453,113 @@ impl DeletePlan {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Op ordering
+// ---------------------------------------------------------------------------
+
+/// One phase of the three-phase delete.
+///
+/// The executor issues these **in order** and stops at the first failure; see
+/// [`plan_delete_ops`] for why the order is what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Op {
+    /// Stop the task, so Download Station is neither holding file handles nor
+    /// re-creating directories underneath the delete.
+    Pause,
+    /// Existence-check and then recursively remove this path.
+    DeleteFiles(String),
+    /// Remove the DSM task. **Last**, always.
+    DeleteTask,
+}
+
+impl Op {
+    /// How the phase reads in a log line or a dry-run report.
+    pub fn describe(&self) -> String {
+        match self {
+            Op::Pause => "pause the task".to_string(),
+            Op::DeleteFiles(path) => format!("delete {path}"),
+            Op::DeleteTask => "delete the DSM task".to_string(),
+        }
+    }
+}
+
+/// A whole op list in one line — what `--dry-run` reports it *would* do.
+pub fn describe_ops(ops: &[Op]) -> String {
+    if ops.is_empty() {
+        return "nothing".to_string();
+    }
+    ops.iter()
+        .map(Op::describe)
+        .collect::<Vec<_>>()
+        .join(", then ")
+}
+
+/// Whether a task must be paused before its files can be removed.
+///
+/// The plan's table names six statuses that need a pause (downloading,
+/// seeding, waiting, finishing, hash-checking, extracting) and three that do
+/// not (paused, finished, error). It names ten statuses in total, so
+/// `filehosting_waiting` — and any status this client does not recognize — is
+/// unclassified. Both are treated as **active**: pausing something that is
+/// already idle costs one round trip, while failing to pause something that is
+/// live risks Download Station writing into the directory as it is being
+/// deleted, or re-creating it afterwards.
+pub fn requires_pause(status: &TaskStatus) -> bool {
+    !matches!(
+        status,
+        TaskStatus::Paused | TaskStatus::Finished | TaskStatus::Error
+    )
+}
+
+/// The ordered phases for one snapshotted item — the plan's ordering table,
+/// expressed as pure data so it can be tested without a NAS.
+///
+/// The order exists for **recoverability**. Files first, task last: if the file
+/// delete fails, the task survives still pointing at its data, so nothing is
+/// orphaned and the user can retry. Reversing them would leave a volume full of
+/// directories nothing references.
+///
+/// Three cases produce no ops at all or a shortened list:
+///
+/// * **A refused item gets an empty list.** `Target::Refused` means the on-disk
+///   location could not be determined, and the confirmation dialog already told
+///   the user the row would be skipped. Deleting the DSM task anyway would
+///   silently orphan exactly the data whose location is in doubt.
+/// * **`delete_files = false` drops the file phase — and the pause with it.**
+///   The pause exists only to keep Download Station out of the way of the file
+///   delete; with no file delete there is nothing to keep it out of, and a
+///   pause that failed would then block a task-only removal for no reason.
+/// * A task that is already inactive is not paused; see [`requires_pause`].
+///
+/// `dry_run` deliberately does **not** shorten the list: a dry run has to be
+/// able to report the operations it is declining to perform.
+pub fn plan_delete_ops(item: &DeleteItem, options: DeleteOptions) -> Vec<Op> {
+    let Some(path) = item.path() else {
+        return Vec::new();
+    };
+
+    let mut ops = Vec::new();
+    if options.delete_files {
+        if requires_pause(&item.status) {
+            ops.push(Op::Pause);
+        }
+        ops.push(Op::DeleteFiles(path.to_string()));
+    }
+    ops.push(Op::DeleteTask);
+    ops
+}
+
+/// The phases an executor **does not** issue because the one at `failed_at`
+/// failed.
+///
+/// The other half of the ordering rule, and the reason the phases are ordered
+/// at all: a failed phase cancels every later phase. A pause that fails cancels
+/// both deletes; a file delete that fails cancels the task delete. The task
+/// then survives still pointing at its data.
+pub fn ops_cancelled_by(ops: &[Op], failed_at: usize) -> &[Op] {
+    ops.get(failed_at + 1..).unwrap_or(&[])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1158,5 +1265,220 @@ mod tests {
             let path = item.path().expect("deletable items have a path");
             validate_path(path).unwrap_or_else(|err| panic!("{}: {err}", item.id));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // plan_delete_ops — the ordering table
+    // -----------------------------------------------------------------------
+
+    /// A resolvable item in a given status.
+    fn item_with(status: TaskStatus) -> DeleteItem {
+        DeleteItem::for_task(&Task { status, ..bare() })
+    }
+
+    /// The statuses the plan's table sends through a pause first.
+    const ACTIVE: [TaskStatus; 6] = [
+        TaskStatus::Downloading,
+        TaskStatus::Seeding,
+        TaskStatus::Waiting,
+        TaskStatus::Finishing,
+        TaskStatus::HashChecking,
+        TaskStatus::Extracting,
+    ];
+
+    /// The statuses the plan's table deletes straight away.
+    const INACTIVE: [TaskStatus; 3] = [TaskStatus::Paused, TaskStatus::Finished, TaskStatus::Error];
+
+    #[test]
+    fn an_active_task_is_paused_before_anything_is_deleted() {
+        for status in ACTIVE {
+            let item = item_with(status.clone());
+            assert_eq!(
+                plan_delete_ops(&item, DeleteOptions::default()),
+                vec![
+                    Op::Pause,
+                    Op::DeleteFiles("/downloads/Some.Release".to_string()),
+                    Op::DeleteTask,
+                ],
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inactive_task_is_not_paused() {
+        for status in INACTIVE {
+            let item = item_with(status.clone());
+            assert_eq!(
+                plan_delete_ops(&item, DeleteOptions::default()),
+                vec![
+                    Op::DeleteFiles("/downloads/Some.Release".to_string()),
+                    Op::DeleteTask,
+                ],
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_statuses_the_plans_table_does_not_name_are_treated_as_active() {
+        // `filehosting_waiting` is not in either column of the plan's table,
+        // and neither is an unrecognized status. Pausing an idle task costs a
+        // round trip; not pausing a live one risks Download Station writing
+        // into the directory mid-delete.
+        for status in [
+            TaskStatus::FilehostingWaiting,
+            TaskStatus::Unknown("captcha_needed".to_string()),
+        ] {
+            assert!(requires_pause(&status), "{status:?}");
+            assert_eq!(
+                plan_delete_ops(&item_with(status.clone()), DeleteOptions::default())[0],
+                Op::Pause,
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_pause_partitions_every_known_status() {
+        for status in ACTIVE {
+            assert!(requires_pause(&status), "{status:?}");
+        }
+        for status in INACTIVE {
+            assert!(!requires_pause(&status), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn the_files_always_go_before_the_task() {
+        // The recoverable ordering: a task that outlives its files is a bug the
+        // user can retry, a volume full of unreferenced directories is not.
+        for status in ACTIVE.iter().chain(INACTIVE.iter()) {
+            let ops = plan_delete_ops(&item_with(status.clone()), DeleteOptions::default());
+            let files = ops
+                .iter()
+                .position(|op| matches!(op, Op::DeleteFiles(_)))
+                .expect("a file phase");
+            let task = ops
+                .iter()
+                .position(|op| *op == Op::DeleteTask)
+                .expect("a task phase");
+            assert!(files < task, "{status:?}: {ops:?}");
+            assert_eq!(task, ops.len() - 1, "the task delete must be last");
+        }
+    }
+
+    #[test]
+    fn a_refused_item_is_touched_by_nothing_at_all() {
+        // Not even the DSM task: the row was shown to the user as SKIPPED, and
+        // deleting the task would orphan precisely the data whose location is
+        // in doubt.
+        let refused = DeleteItem::for_task(&task("dbid_013"));
+        assert!(refused.is_refused());
+        assert_eq!(plan_delete_ops(&refused, DeleteOptions::default()), vec![]);
+        assert_eq!(plan_delete_ops(&refused, DeleteOptions::dry_run()), vec![]);
+        assert_eq!(
+            plan_delete_ops(
+                &refused,
+                DeleteOptions {
+                    delete_files: false,
+                    dry_run: false
+                }
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn no_delete_files_drops_the_file_phase_and_the_pause_with_it() {
+        let options = DeleteOptions {
+            delete_files: false,
+            dry_run: false,
+        };
+        for status in ACTIVE.iter().chain(INACTIVE.iter()) {
+            assert_eq!(
+                plan_delete_ops(&item_with(status.clone()), options),
+                vec![Op::DeleteTask],
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dry_run_still_plans_every_op_so_it_can_report_them() {
+        assert_eq!(
+            plan_delete_ops(
+                &item_with(TaskStatus::Downloading),
+                DeleteOptions::dry_run()
+            ),
+            plan_delete_ops(
+                &item_with(TaskStatus::Downloading),
+                DeleteOptions::default()
+            )
+        );
+    }
+
+    #[test]
+    fn the_file_phase_carries_the_path_the_snapshot_resolved() {
+        let item = DeleteItem::for_task(&task("dbid_001"));
+        let ops = plan_delete_ops(&item, DeleteOptions::default());
+        assert!(ops.contains(&Op::DeleteFiles(
+            "/downloads/Ubuntu.24.04.3.LTS.Desktop.amd64".to_string()
+        )));
+    }
+
+    // -----------------------------------------------------------------------
+    // ops_cancelled_by — "a failed phase cancels every later phase"
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_pause_failure_leaves_both_deletes_unissued() {
+        let ops = plan_delete_ops(&item_with(TaskStatus::Seeding), DeleteOptions::default());
+        assert_eq!(ops[0], Op::Pause);
+        assert_eq!(
+            ops_cancelled_by(&ops, 0),
+            &[
+                Op::DeleteFiles("/downloads/Some.Release".to_string()),
+                Op::DeleteTask,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_delete_failure_leaves_the_task_delete_unissued() {
+        // The task must survive still pointing at its data — otherwise a failed
+        // file delete silently orphans the directory.
+        let ops = plan_delete_ops(&item_with(TaskStatus::Finished), DeleteOptions::default());
+        let files = ops
+            .iter()
+            .position(|op| matches!(op, Op::DeleteFiles(_)))
+            .expect("a file phase");
+        assert_eq!(ops_cancelled_by(&ops, files), &[Op::DeleteTask]);
+    }
+
+    #[test]
+    fn the_last_phase_failing_cancels_nothing() {
+        let ops = plan_delete_ops(&item_with(TaskStatus::Finished), DeleteOptions::default());
+        assert!(ops_cancelled_by(&ops, ops.len() - 1).is_empty());
+        // Out of range is empty too, not a panic.
+        assert!(ops_cancelled_by(&ops, 99).is_empty());
+        assert!(ops_cancelled_by(&[], 0).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // describe_ops
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_op_list_reads_as_a_sentence_for_the_dry_run_report() {
+        let ops = plan_delete_ops(
+            &item_with(TaskStatus::Downloading),
+            DeleteOptions::dry_run(),
+        );
+        assert_eq!(
+            describe_ops(&ops),
+            "pause the task, then delete /downloads/Some.Release, then delete the DSM task"
+        );
+        assert_eq!(describe_ops(&[]), "nothing");
     }
 }

@@ -19,8 +19,8 @@ use syno_clean::api::download_station;
 use syno_clean::app::App;
 use syno_clean::cli::Cli;
 use syno_clean::config::{self, Config, Paths, ResolvedConfig, SessionCache};
-use syno_clean::delete::{DeleteOptions, DeletePlan};
-use syno_clean::event::{self, AppEvent, Receiver, RefreshHandle};
+use syno_clean::delete::DeleteOptions;
+use syno_clean::event::{self, AppEvent, OpContext, Receiver, RefreshHandle};
 use syno_clean::ui::{self, TerminalGuard};
 
 #[tokio::main]
@@ -78,6 +78,9 @@ async fn main() -> Result<()> {
 
     let (tx, rx) = event::channel();
     let refresh = RefreshHandle::new();
+    // What a confirmed delete runs against. The poller takes the other half of
+    // the same client and channel — one session, one event stream.
+    let ops = OpContext::new(Arc::clone(&client), tx.clone(), refresh.clone());
     let poller = event::spawn_poller(
         client,
         Duration::from_secs(resolved.refresh_secs),
@@ -85,7 +88,7 @@ async fn main() -> Result<()> {
         refresh.clone(),
     );
 
-    let result = run_tui(&mut app, rx, &refresh).await;
+    let result = run_tui(&mut app, rx, &refresh, Some(&ops)).await;
     // The poller owns no terminal state, so stopping it is housekeeping rather
     // than cleanup — but leaving a task mid-request would make the runtime wait
     // out an in-flight HTTP timeout before the process could exit.
@@ -117,7 +120,7 @@ async fn run_fixture(path: &Path) -> Result<()> {
     ));
 
     let (_tx, rx) = event::channel();
-    run_tui(&mut app, rx, &RefreshHandle::new()).await
+    run_tui(&mut app, rx, &RefreshHandle::new(), None).await
 }
 
 /// The main event loop: draw, wait for whichever comes first — a key press or
@@ -136,9 +139,17 @@ async fn run_fixture(path: &Path) -> Result<()> {
 /// only thing that sets `quit` is a key press, which consumes it — none is left
 /// over to stall the runtime at shutdown.
 ///
+/// `ops` is `None` in offline `--fixture` mode, where there is no client to run
+/// anything against.
+///
 /// [`select!`]: tokio::select
 /// [`JoinHandle`]: tokio::task::JoinHandle
-async fn run_tui(app: &mut App, mut rx: Receiver, refresh: &RefreshHandle) -> Result<()> {
+async fn run_tui(
+    app: &mut App,
+    mut rx: Receiver,
+    refresh: &RefreshHandle,
+    ops: Option<&OpContext>,
+) -> Result<()> {
     ui::install_panic_hook();
     let mut terminal = TerminalGuard::new().context(
         "could not take over the terminal — syno-clean needs an interactive TTY \
@@ -177,28 +188,27 @@ async fn run_tui(app: &mut App, mut rx: Receiver, refresh: &RefreshHandle) -> Re
             refresh.request();
         }
 
+        // A confirmed delete runs as its own task and reports back through the
+        // same channel as the poller. The loop does not wait for it: deleting
+        // twenty torrents must not freeze the terminal.
         if let Some(plan) = app.take_confirmed_delete() {
-            spawn_delete(plan);
+            match ops {
+                Some(ops) => {
+                    event::spawn_delete(ops.clone(), plan, app.delete_options);
+                }
+                // `--fixture` has no client at all, which is also why it forces
+                // `DeleteOptions::dry_run()` — the dialog never promises a
+                // delete that could not happen.
+                None => tracing::warn!(
+                    items = plan.len(),
+                    "a delete was confirmed in offline fixture mode; there is nothing to run it against"
+                ),
+            }
         }
     }
 
     tracing::info!("exiting");
     Ok(())
-}
-
-/// Act on a confirmed delete plan.
-///
-/// **Task 15 owns the execution**; this is the seam it plugs into. The dialog
-/// deliberately performs no I/O of its own, so until the three-phase delete
-/// lands a confirmation is recorded in the log and nothing on the NAS is
-/// touched — which is the correct half of the behaviour to have first.
-fn spawn_delete(plan: DeletePlan) {
-    tracing::warn!(
-        items = plan.len(),
-        deletable = plan.deletable().count(),
-        refused = plan.refused().count(),
-        "delete confirmed, but execution is not wired up yet (Task 15)"
-    );
 }
 
 /// Which of the two event sources won a pass of the loop.

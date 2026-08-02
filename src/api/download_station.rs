@@ -1,4 +1,4 @@
-//! `SYNO.DownloadStation.Task` — listing tasks.
+//! `SYNO.DownloadStation.Task` — listing, pausing and deleting tasks.
 //!
 //! DSM 7 also ships `SYNO.DownloadStation2.Task` (what the web UI drives), but
 //! its `list` method is undocumented, returns numeric statuses and a different
@@ -6,16 +6,26 @@
 //! still present and supported on DSM 7 and returns the string statuses and
 //! object file lists [`crate::model`] is built around — hence
 //! [`DS_TASK_SUPPORTED`] being pinned to `(1, 1)` rather than following the
-//! NAS up to whatever it advertises. Delete, pause and resume (Tasks 15 and
-//! 16) come from the same v1 API, so there is no mixed-API seam.
+//! NAS up to whatever it advertises. List, delete, pause and resume all come
+//! from the same v1 API, so there is no mixed-API seam.
 //!
-//! Parameter construction is a pure function ([`build_list_params`]) per the
-//! `build_*_params` convention: Download Station encodes list-valued
-//! parameters as **comma-separated strings**, while File Station wants JSON
-//! arrays, and that difference is worth having in exactly one testable place.
+//! Parameter construction is a pure function ([`build_list_params`],
+//! [`build_ds_id_params`]) per the `build_*_params` convention: Download
+//! Station encodes list-valued parameters as **comma-separated strings**, while
+//! File Station wants JSON arrays, and that difference is worth having in
+//! exactly one testable place.
+//!
+//! ⚠️ **`delete`, `pause` and `resume` report failure per task, not in the
+//! envelope.** They answer `{"success": true, "data": [{"id": …, "error": 0}]}`
+//! even when a task could not be touched, so [`check_task_results`] is the step
+//! that turns a non-zero per-item code into an error. Reading only `success`
+//! would report a failed delete as a success — and the delete ordering depends
+//! on knowing that a pause actually happened.
+
+use serde::Deserialize;
 
 use crate::api::client::{SynoClient, VersionRange};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::model::{Task, TaskList};
 
 /// The Download Station task API.
@@ -76,9 +86,111 @@ pub async fn list_tasks_json(client: &SynoClient) -> Result<String> {
         .await
 }
 
+// ---------------------------------------------------------------------------
+// Per-task operations: getinfo, pause, delete
+// ---------------------------------------------------------------------------
+
+/// The `id` parameter shared by `getinfo`, `delete`, `pause` and `resume`.
+///
+/// **Comma-separated**, which is the Download Station v1 encoding — File
+/// Station spells the same idea as a JSON array (see
+/// [`crate::api::file_station::build_fs_path_params`]). Task ids are opaque
+/// DSM handles like `dbid_042` and never contain a comma, so the encoding is
+/// unambiguous here in a way it would not be for paths.
+pub fn build_ds_id_params(ids: &[String]) -> Vec<(&'static str, String)> {
+    vec![("id", ids.join(","))]
+}
+
+/// Query parameters for `method=delete`.
+///
+/// `force_complete=false` matters: the `true` form tells Download Station to
+/// mark an unfinished task complete and *keep* what it downloaded, which is the
+/// opposite of what this program is for.
+pub fn build_delete_params(ids: &[String]) -> Vec<(&'static str, String)> {
+    let mut params = build_ds_id_params(ids);
+    params.push(("force_complete", "false".to_string()));
+    params
+}
+
+/// Query parameters for `method=getinfo`, asking for the same `additional`
+/// blocks the list does so the result parses into the same [`Task`].
+pub fn build_getinfo_params(ids: &[String]) -> Vec<(&'static str, String)> {
+    let mut params = build_ds_id_params(ids);
+    params.push(("additional", LIST_ADDITIONAL.join(",")));
+    params
+}
+
+/// One entry of the per-task result array that `delete` / `pause` / `resume`
+/// answer with. `error` is `0` on success.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TaskOpResult {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub error: i32,
+}
+
+/// Collapse a per-task result array into one [`Result`].
+///
+/// The first non-zero code wins; there is nothing useful to do with the rest,
+/// and the caller acts on one task at a time anyway.
+pub fn check_task_results(results: &[TaskOpResult]) -> Result<()> {
+    match results.iter().find(|result| result.error != 0) {
+        Some(failed) => Err(Error::dsm(failed.error, DS_TASK_API)),
+        None => Ok(()),
+    }
+}
+
+/// Fetch the current state of specific tasks.
+///
+/// Used to **confirm a pause took effect** before anything is deleted: the
+/// pause call returning `error: 0` says DSM accepted the request, not that the
+/// task has stopped writing.
+pub async fn task_info(client: &SynoClient, ids: &[String]) -> Result<Vec<Task>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let params = build_getinfo_params(ids);
+    let list: TaskList = client
+        .call(DS_TASK_API, "getinfo", DS_TASK_SUPPORTED, &params)
+        .await?;
+    Ok(list.tasks)
+}
+
+/// Pause tasks. Returns the per-task results; see [`check_task_results`].
+pub async fn pause_tasks(client: &SynoClient, ids: &[String]) -> Result<Vec<TaskOpResult>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let params = build_ds_id_params(ids);
+    let results: Vec<TaskOpResult> = client
+        .call(DS_TASK_API, "pause", DS_TASK_SUPPORTED, &params)
+        .await?;
+    tracing::info!(count = ids.len(), "paused Download Station tasks");
+    Ok(results)
+}
+
+/// Remove tasks from Download Station.
+///
+/// **This does not touch the files** — that is the entire reason this program
+/// exists. The payload goes via [`crate::api::file_station::delete_paths`],
+/// and it goes *first*; see `delete::plan_delete_ops` for the ordering.
+pub async fn delete_tasks(client: &SynoClient, ids: &[String]) -> Result<Vec<TaskOpResult>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let params = build_delete_params(ids);
+    let results: Vec<TaskOpResult> = client
+        .call(DS_TASK_API, "delete", DS_TASK_SUPPORTED, &params)
+        .await?;
+    tracing::info!(count = ids.len(), "deleted Download Station tasks");
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::client::parse_envelope;
 
     #[test]
     fn list_params_encode_additional_as_a_comma_separated_string() {
@@ -118,5 +230,98 @@ mod tests {
         // The v1 string statuses are what `model::TaskStatus` parses; v2/v3
         // return numeric codes and a different `additional` shape.
         assert_eq!(DS_TASK_SUPPORTED, (1, 1));
+    }
+
+    // ---- id-taking methods -------------------------------------------------
+
+    fn ids(items: &[&str]) -> Vec<String> {
+        items.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    #[test]
+    fn ids_are_encoded_as_one_comma_separated_string() {
+        // Download Station v1's encoding. File Station spells the same list as
+        // a JSON array; see `file_station`'s cross-API test.
+        assert_eq!(
+            build_ds_id_params(&ids(&["dbid_001", "dbid_002", "dbid_003"])),
+            vec![("id", "dbid_001,dbid_002,dbid_003".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_single_id_carries_no_separator() {
+        assert_eq!(
+            build_ds_id_params(&ids(&["dbid_001"])),
+            vec![("id", "dbid_001".to_string())]
+        );
+    }
+
+    #[test]
+    fn delete_never_asks_to_force_complete() {
+        // `force_complete=true` marks an unfinished task complete and keeps
+        // what it downloaded — the opposite of this program's job.
+        let params = build_delete_params(&ids(&["dbid_001", "dbid_002"]));
+        assert_eq!(
+            params,
+            vec![
+                ("id", "dbid_001,dbid_002".to_string()),
+                ("force_complete", "false".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn getinfo_asks_for_the_same_additional_blocks_the_list_does() {
+        // Otherwise a task fetched to confirm a pause would parse with a
+        // different shape than the same task from the poller.
+        assert_eq!(
+            build_getinfo_params(&ids(&["dbid_001"])),
+            vec![
+                ("id", "dbid_001".to_string()),
+                ("additional", "detail,transfer,file".to_string()),
+            ]
+        );
+    }
+
+    // ---- per-task result array ---------------------------------------------
+
+    fn results(body: &str) -> Vec<TaskOpResult> {
+        parse_envelope(body, DS_TASK_API).expect("a per-task result array")
+    }
+
+    #[test]
+    fn a_successful_delete_reports_zero_for_every_task() {
+        let parsed = results(
+            r#"{"success": true, "data": [
+                {"id": "dbid_001", "error": 0},
+                {"id": "dbid_002", "error": 0}
+            ]}"#,
+        );
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, "dbid_001");
+        check_task_results(&parsed).expect("all zero is success");
+    }
+
+    #[test]
+    fn a_per_task_error_is_a_failure_even_though_the_envelope_succeeded() {
+        // The trap this whole result array exists to avoid: `success: true`
+        // with a task that was not deleted.
+        let parsed = results(
+            r#"{"success": true, "data": [
+                {"id": "dbid_001", "error": 0},
+                {"id": "dbid_002", "error": 544}
+            ]}"#,
+        );
+        let err = check_task_results(&parsed).expect_err("544 is a failure");
+        assert!(
+            matches!(err, crate::error::Error::Dsm { code: 544, ref api } if api == DS_TASK_API),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_result_array_is_not_a_failure() {
+        assert!(results(r#"{"success": true, "data": []}"#).is_empty());
+        check_task_results(&[]).expect("nothing to fail");
     }
 }

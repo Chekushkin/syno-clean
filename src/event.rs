@@ -15,18 +15,45 @@
 //!   by whatever arrives, so an idle program with an idle NAS still redraws
 //!   once per refresh interval and no more.
 //!
-//! Op tasks (delete in Task 15, pause/resume in Task 16) report through the
-//! same channel as [`AppEvent::OpProgress`] / [`AppEvent::OpDone`], which is why
-//! those variants exist before anything sends them.
+//! Op tasks report through the same channel as [`AppEvent::OpProgress`] /
+//! [`AppEvent::OpDone`].
+//!
+//! ## The delete executor
+//!
+//! [`spawn_delete`] is where the plan's three-phase ordering is actually
+//! carried out, one item at a time, off the UI thread. The *rules* are pure and
+//! live in [`crate::delete`] ([`plan_delete_ops`] and [`ops_cancelled_by`]);
+//! what is here is the I/O and the accounting:
+//!
+//! * a phase that fails **returns immediately**, so every later phase for that
+//!   item is skipped and the DSM task survives still pointing at its data;
+//! * a resolved path is re-run through [`validate_path`] immediately before the
+//!   File Station call — the guard already ran when the snapshot was taken, and
+//!   it is free to run again on the near side of the one call that cannot be
+//!   undone;
+//! * a path that is **not there** is a *skip*, not a failure, and the DSM task
+//!   is still removed. For an incomplete task that is the expected answer
+//!   (Download Station cleans up its own partial data) and for a finished one
+//!   it means somebody already tidied up by hand;
+//! * `--dry-run` reports what it would do and issues **no destructive call at
+//!   all** — not even the existence check, which is a read but also a round trip
+//!   the user did not ask for.
+//!
+//! [`plan_delete_ops`]: crate::delete::plan_delete_ops
+//! [`ops_cancelled_by`]: crate::delete::ops_cancelled_by
+//! [`validate_path`]: crate::delete::validate_path
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::api::client::SynoClient;
 use crate::api::download_station;
+use crate::api::file_station::{self, PathInfo};
+use crate::delete::{self, DeleteItem, DeleteOptions, DeletePlan, Op};
+use crate::error::Result;
 use crate::model::Task;
 
 /// How many events may queue before a sender has to wait.
@@ -172,6 +199,283 @@ async fn poll_once(client: &SynoClient, tx: &Sender) -> bool {
     tx.send(event).await.is_ok()
 }
 
+// ---------------------------------------------------------------------------
+// Op tasks
+// ---------------------------------------------------------------------------
+
+/// How long a paused task is given to actually report itself paused.
+///
+/// Download Station accepting a `pause` says the request was queued, not that
+/// the task has stopped writing. Short, because this blocks the delete of every
+/// later item in the batch.
+const PAUSE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
+/// How often the pause is re-checked.
+const PAUSE_CONFIRM_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Everything a spawned operation needs: something to call, somewhere to
+/// report, and the poller poke that refreshes the table when it is done.
+#[derive(Debug, Clone)]
+pub struct OpContext {
+    pub client: Arc<SynoClient>,
+    pub tx: Sender,
+    pub refresh: RefreshHandle,
+}
+
+impl OpContext {
+    pub fn new(client: Arc<SynoClient>, tx: Sender, refresh: RefreshHandle) -> Self {
+        OpContext {
+            client,
+            tx,
+            refresh,
+        }
+    }
+}
+
+/// Run a confirmed [`DeletePlan`] in the background.
+///
+/// The plan is an owned snapshot taken when the dialog opened, so nothing this
+/// task reads can have moved since the user read it. Progress is reported per
+/// item; the table is refreshed once at the end rather than per item, so a
+/// twenty-torrent delete is not twenty full task-list round trips.
+pub fn spawn_delete(ops: OpContext, plan: DeletePlan, options: DeleteOptions) -> JoinHandle<()> {
+    tokio::spawn(async move { run_delete(ops, plan, options).await })
+}
+
+/// What happened to one item of a delete batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ItemOutcome {
+    /// Everything the plan asked for was done.
+    Deleted,
+    /// Deliberately not acted on — a refused path, a directory that was already
+    /// gone, or a dry run.
+    Skipped(String),
+    /// A phase failed; every later phase for this item was cancelled.
+    Failed(String),
+}
+
+impl ItemOutcome {
+    /// How the outcome reads in the footer.
+    fn detail(&self) -> String {
+        match self {
+            ItemOutcome::Deleted => "deleted".to_string(),
+            ItemOutcome::Skipped(why) => format!("skipped — {why}"),
+            ItemOutcome::Failed(why) => format!("FAILED — {why}"),
+        }
+    }
+}
+
+async fn run_delete(ops: OpContext, plan: DeletePlan, options: DeleteOptions) {
+    let total = plan.len();
+    let (mut succeeded, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+
+    tracing::info!(
+        items = total,
+        delete_files = options.delete_files,
+        dry_run = options.dry_run,
+        "starting a delete batch"
+    );
+
+    for (index, item) in plan.items.iter().enumerate() {
+        let outcome = delete_one(&ops.client, item, options).await;
+        match outcome {
+            ItemOutcome::Deleted => succeeded += 1,
+            ItemOutcome::Skipped(_) => skipped += 1,
+            ItemOutcome::Failed(_) => failed += 1,
+        }
+
+        let detail = format!("{}: {}", item.title, outcome.detail());
+        let progress = AppEvent::OpProgress {
+            op: OpKind::Delete,
+            done: index + 1,
+            total,
+            detail,
+        };
+        if ops.tx.send(progress).await.is_err() {
+            // The UI has gone. Finishing the batch would be work nobody can see
+            // the result of, and the process is on its way out anyway.
+            tracing::debug!("the event channel closed mid-delete; stopping");
+            return;
+        }
+    }
+
+    tracing::info!(succeeded, skipped, failed, "delete batch finished");
+    let _ = ops
+        .tx
+        .send(AppEvent::OpDone {
+            op: OpKind::Delete,
+            succeeded,
+            skipped,
+            failed,
+        })
+        .await;
+
+    // The table is now wrong in the most visible way a table can be, so do not
+    // make the user stare at deleted rows until the next scheduled tick.
+    ops.refresh.request();
+}
+
+/// Carry out the phases for one item, stopping at the first failure.
+async fn delete_one(client: &SynoClient, item: &DeleteItem, options: DeleteOptions) -> ItemOutcome {
+    let ops = delete::plan_delete_ops(item, options);
+    if ops.is_empty() {
+        // A refused item: the dialog showed it as SKIPPED and nothing —
+        // including the DSM task — is touched.
+        return ItemOutcome::Skipped(
+            item.refusal()
+                .unwrap_or("there is nothing to do for this task")
+                .to_string(),
+        );
+    }
+
+    let mut files_were_already_gone = false;
+
+    for (index, op) in ops.iter().enumerate() {
+        match run_op(client, item, op, options).await {
+            OpOutcome::Done => {}
+            OpOutcome::NothingThere => files_were_already_gone = true,
+            OpOutcome::Failed(why) => {
+                let cancelled = delete::ops_cancelled_by(&ops, index);
+                if !cancelled.is_empty() {
+                    tracing::warn!(
+                        id = %item.id,
+                        cancelled = %delete::describe_ops(cancelled),
+                        "a delete phase failed; the remaining phases are cancelled"
+                    );
+                }
+                return ItemOutcome::Failed(why);
+            }
+        }
+    }
+
+    if options.dry_run {
+        ItemOutcome::Skipped(format!("dry run — would {}", delete::describe_ops(&ops)))
+    } else if files_were_already_gone {
+        ItemOutcome::Skipped("the files were already gone; the task was removed".to_string())
+    } else {
+        ItemOutcome::Deleted
+    }
+}
+
+/// The result of one phase, as far as the ordering rule cares.
+enum OpOutcome {
+    Done,
+    /// The file phase found nothing at the resolved path. Not a failure: the
+    /// later phases still run.
+    NothingThere,
+    Failed(String),
+}
+
+/// Carry out one phase.
+async fn run_op(
+    client: &SynoClient,
+    item: &DeleteItem,
+    op: &Op,
+    options: DeleteOptions,
+) -> OpOutcome {
+    match op {
+        Op::Pause => {
+            if options.dry_run {
+                tracing::info!(id = %item.id, "dry run: would pause the task");
+                return OpOutcome::Done;
+            }
+            match pause_and_confirm(client, &item.id).await {
+                Ok(()) => OpOutcome::Done,
+                Err(err) => OpOutcome::Failed(format!("could not pause it: {err}")),
+            }
+        }
+
+        Op::DeleteFiles(path) => {
+            // Defence in depth. The guard ran when the snapshot was taken; it
+            // runs again here because this value has crossed a task boundary
+            // since, and the next call is the one with no undo.
+            if let Err(err) = delete::validate_path(path) {
+                tracing::error!(id = %item.id, %err, "a resolved path failed re-validation");
+                return OpOutcome::Failed(err.to_string());
+            }
+
+            if options.dry_run {
+                tracing::info!(id = %item.id, path, "dry run: would recursively delete this path");
+                return OpOutcome::Done;
+            }
+
+            match file_station::path_info(client, path).await {
+                Ok(PathInfo::Found { .. }) => {
+                    let paths = [path.clone()];
+                    match file_station::delete_paths(client, &paths).await {
+                        Ok(()) => OpOutcome::Done,
+                        Err(err) => OpOutcome::Failed(format!("could not delete {path}: {err}")),
+                    }
+                }
+                Ok(PathInfo::Missing) => {
+                    tracing::info!(id = %item.id, path, "nothing on disk at the resolved path");
+                    OpOutcome::NothingThere
+                }
+                // Not absence — "I could not look" must never be read as
+                // "there is nothing to delete", which would remove the task and
+                // strand the files.
+                Ok(PathInfo::Error(code)) => OpOutcome::Failed(format!(
+                    "could not check {path}: {}",
+                    crate::error::Error::dsm(code, file_station::FS_LIST_API)
+                )),
+                Err(err) => OpOutcome::Failed(format!("could not check {path}: {err}")),
+            }
+        }
+
+        Op::DeleteTask => {
+            if options.dry_run {
+                tracing::info!(id = %item.id, "dry run: would delete the DSM task");
+                return OpOutcome::Done;
+            }
+            match delete_task(client, &item.id).await {
+                Ok(()) => OpOutcome::Done,
+                Err(err) => OpOutcome::Failed(format!("could not delete the task: {err}")),
+            }
+        }
+    }
+}
+
+/// Remove one DSM task, treating a per-task error code as a failure.
+async fn delete_task(client: &SynoClient, id: &str) -> Result<()> {
+    let ids = [id.to_string()];
+    let results = download_station::delete_tasks(client, &ids).await?;
+    download_station::check_task_results(&results)
+}
+
+/// Pause one task and wait until DSM agrees that it is no longer active.
+///
+/// The plan's "pause → **confirm paused** → delete files" step. Accepting the
+/// pause is not the same as having stopped, and deleting a directory a torrent
+/// client is still writing into is how a delete half-succeeds and the directory
+/// reappears.
+async fn pause_and_confirm(client: &SynoClient, id: &str) -> Result<()> {
+    let ids = [id.to_string()];
+    let results = download_station::pause_tasks(client, &ids).await?;
+    download_station::check_task_results(&results)?;
+
+    let deadline = Instant::now() + PAUSE_CONFIRM_TIMEOUT;
+    loop {
+        match download_station::task_info(client, &ids).await?.first() {
+            // The task is not there any more. Whatever it was holding, it is
+            // not holding it now.
+            None => return Ok(()),
+            Some(task) if !delete::requires_pause(&task.status) => return Ok(()),
+            Some(_) => {}
+        }
+
+        if Instant::now() + PAUSE_CONFIRM_INTERVAL >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "task {id} did not report itself paused within {}s",
+                    PAUSE_CONFIRM_TIMEOUT.as_secs()
+                ),
+            )
+            .into());
+        }
+        tokio::time::sleep(PAUSE_CONFIRM_INTERVAL).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The poller itself needs a NAS and a clock, so what is tested here is the
@@ -244,5 +548,31 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    // ---- delete executor ---------------------------------------------------
+    //
+    // The executor's *rules* are pure and tested in `delete.rs`; the I/O around
+    // them needs a NAS and is verified by running the binary. What is left here
+    // is the wording that reaches the footer.
+
+    #[test]
+    fn each_outcome_reads_differently_in_the_footer() {
+        // A skip and a failure must not be mistakable for one another, and
+        // neither may be mistakable for a delete that happened.
+        assert_eq!(ItemOutcome::Deleted.detail(), "deleted");
+        assert_eq!(
+            ItemOutcome::Skipped("the files were already gone".into()).detail(),
+            "skipped — the files were already gone"
+        );
+        assert_eq!(
+            ItemOutcome::Failed("could not pause it".into()).detail(),
+            "FAILED — could not pause it"
+        );
+    }
+
+    #[test]
+    fn the_pause_confirmation_is_bounded_and_polls_more_than_once() {
+        assert!(PAUSE_CONFIRM_TIMEOUT > PAUSE_CONFIRM_INTERVAL * 2);
     }
 }

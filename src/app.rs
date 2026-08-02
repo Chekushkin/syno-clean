@@ -26,7 +26,7 @@ use crate::api::client::parse_envelope;
 use crate::api::download_station::DS_TASK_API;
 use crate::delete::{DeleteOptions, DeletePlan};
 use crate::error::Result;
-use crate::event::AppEvent;
+use crate::event::{AppEvent, OpKind};
 use crate::model::{Task, TaskList};
 use crate::ui::dialog;
 use crate::view::{self, View};
@@ -222,10 +222,18 @@ impl App {
         match event {
             AppEvent::Tasks(tasks) => self.apply_tasks(tasks),
             AppEvent::Error(message) => self.set_error(message),
-            // Tasks 15 and 16 own the operations; the variants exist now so the
-            // channel has one definition. Reporting them is deliberately not
-            // guessed at here.
-            AppEvent::OpProgress { .. } | AppEvent::OpDone { .. } => {}
+            AppEvent::OpProgress {
+                op,
+                done,
+                total,
+                detail,
+            } => self.set_status(format!("{} {done}/{total} · {detail}", op.label())),
+            AppEvent::OpDone {
+                op,
+                succeeded,
+                skipped,
+                failed,
+            } => self.set_status(op_summary(op, succeeded, skipped, failed)),
         }
     }
 
@@ -803,6 +811,36 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// The one-line footer report of a finished background operation.
+///
+/// Three deliberate choices:
+///
+/// * **Only non-zero categories are named.** "delete finished: 3 succeeded" is
+///   readable; "3 succeeded, 0 skipped, 0 failed" is a form to be decoded.
+/// * **Any failure is marked.** A count of failures sitting quietly beside a
+///   count of successes is exactly how a failed delete goes unnoticed.
+/// * **It goes in the status message, not the error banner.** An operation asks
+///   for an immediate refresh when it finishes, and the banner is cleared by the
+///   next successful tick — the report would vanish a moment after appearing.
+pub fn op_summary(op: OpKind, succeeded: usize, skipped: usize, failed: usize) -> String {
+    let mut parts = Vec::new();
+    if succeeded > 0 {
+        parts.push(format!("{succeeded} succeeded"));
+    }
+    if skipped > 0 {
+        parts.push(format!("{skipped} skipped"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    if parts.is_empty() {
+        parts.push("nothing to do".to_string());
+    }
+
+    let marker = if failed > 0 { "⚠ " } else { "" };
+    format!("{marker}{} finished: {}", op.label(), parts.join(", "))
 }
 
 /// A page jump as a signed row count, saturating rather than wrapping on the
@@ -1853,24 +1891,119 @@ mod tests {
     }
 
     #[test]
-    fn operation_events_are_accepted_and_change_nothing_yet() {
-        // Tasks 15 and 16 give these meaning; until then they must be inert
-        // rather than unhandled.
+    fn op_progress_reports_the_item_and_how_far_through_the_batch_it_is() {
         let mut app = app_with(2);
-        let before = format!("{app:?}");
         app.apply_event(AppEvent::OpProgress {
-            op: crate::event::OpKind::Delete,
+            op: OpKind::Delete,
             done: 1,
-            total: 2,
-            detail: "deleted /downloads/x".into(),
+            total: 3,
+            detail: "task 000: deleted".into(),
         });
+        let status = app.status_message.clone().expect("a progress line");
+        assert!(status.contains("delete 1/3"), "{status}");
+        assert!(status.contains("task 000: deleted"), "{status}");
+    }
+
+    #[test]
+    fn op_progress_leaves_the_task_list_and_the_selection_alone() {
+        // Reporting is reporting: an op event must not move the cursor or
+        // disarm a row while a batch is running.
+        let mut app = app_with(4);
+        app.cursor = 2;
+        app.toggle_selection();
+        let (tasks, cursor, selected) = (app.tasks.clone(), app.cursor, app.selected.clone());
+
+        app.apply_event(AppEvent::OpProgress {
+            op: OpKind::Delete,
+            done: 1,
+            total: 4,
+            detail: "task 000: deleted".into(),
+        });
+
+        assert_eq!(app.tasks, tasks);
+        assert_eq!(app.cursor, cursor);
+        assert_eq!(app.selected, selected);
+    }
+
+    #[test]
+    fn op_done_summarizes_only_the_categories_that_happened() {
+        let mut app = app_with(1);
         app.apply_event(AppEvent::OpDone {
-            op: crate::event::OpKind::Delete,
-            succeeded: 1,
-            skipped: 1,
+            op: OpKind::Delete,
+            succeeded: 3,
+            skipped: 0,
             failed: 0,
         });
-        assert_eq!(format!("{app:?}"), before);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("delete finished: 3 succeeded")
+        );
+    }
+
+    #[test]
+    fn a_failure_in_the_batch_is_marked_in_the_summary() {
+        // A silent "1 failed" beside "3 succeeded" is how a failed delete goes
+        // unnoticed.
+        let summary = op_summary(OpKind::Delete, 3, 1, 1);
+        assert_eq!(
+            summary,
+            "⚠ delete finished: 3 succeeded, 1 skipped, 1 failed"
+        );
+        assert!(!op_summary(OpKind::Delete, 3, 1, 0).starts_with('⚠'));
+    }
+
+    #[test]
+    fn a_batch_that_did_nothing_says_so_rather_than_reporting_zeroes() {
+        assert_eq!(
+            op_summary(OpKind::Delete, 0, 0, 0),
+            "delete finished: nothing to do"
+        );
+        // A dry run is entirely skips, and must not read as a delete.
+        let dry = op_summary(OpKind::Delete, 0, 4, 0);
+        assert_eq!(dry, "delete finished: 4 skipped");
+        assert!(!dry.contains("succeeded"), "{dry}");
+    }
+
+    #[test]
+    fn the_op_summary_names_the_operation() {
+        for op in [OpKind::Delete, OpKind::Pause, OpKind::Resume] {
+            assert!(
+                op_summary(op, 1, 0, 0).starts_with(op.label()),
+                "{}",
+                op.label()
+            );
+        }
+    }
+
+    #[test]
+    fn an_op_report_goes_to_the_status_message_not_the_error_banner() {
+        // The banner is cleared by the next successful refresh, and an op asks
+        // for one the moment it finishes — the report would vanish.
+        let mut app = app_with(1);
+        app.apply_event(AppEvent::OpDone {
+            op: OpKind::Delete,
+            succeeded: 0,
+            skipped: 0,
+            failed: 2,
+        });
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|s| s.contains("2 failed")),
+            "{:?}",
+            app.status_message
+        );
+
+        // And it survives the refresh that follows.
+        app.apply_event(AppEvent::Tasks(vec![task("id_000", "task 000", 0)]));
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|s| s.contains("2 failed")),
+            "{:?}",
+            app.status_message
+        );
     }
 
     // ---- manual refresh ----------------------------------------------------
