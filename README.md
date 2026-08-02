@@ -278,7 +278,7 @@ recognize is shown only under `All` — it cannot be classified without guessing
 
 | Key | Action |
 |---|---|
-| `Enter` | apply and close the box |
+| `Enter` | commit and close the box |
 | `Esc` | cancel, restoring the previous query |
 | `Backspace` | delete a character |
 

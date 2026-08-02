@@ -304,7 +304,7 @@ async fn await_delete(client: &SynoClient, taskid: &str, timeout: Duration) -> R
                 return Ok(());
             }
             DeleteProgress::Failed(errors) => {
-                return Err(fs_error(format!(
+                return Err(Error::operation_failed(format!(
                     "File Station could not delete {errors} path(s) (task {taskid})"
                 )));
             }
@@ -312,27 +312,13 @@ async fn await_delete(client: &SynoClient, taskid: &str, timeout: Duration) -> R
         }
 
         if Instant::now() + DELETE_POLL_INTERVAL >= deadline {
-            return Err(fs_timeout(format!(
+            return Err(Error::timed_out(format!(
                 "File Station delete task {taskid} did not finish within {}s",
                 timeout.as_secs()
             )));
         }
         tokio::time::sleep(DELETE_POLL_INTERVAL).await;
     }
-}
-
-/// A File Station failure with no DSM code behind it.
-///
-/// Reuses [`Error::Io`] rather than adding an enum variant, the same way
-/// `api::client` reuses [`Error::Parse`] for protocol violations: the delete
-/// did not happen, and the plan's variant list stays as documented.
-fn fs_error(message: String) -> Error {
-    Error::Io(std::io::Error::other(message))
-}
-
-/// A bounded wait that ran out.
-fn fs_timeout(message: String) -> Error {
-    Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, message))
 }
 
 #[cfg(test)]
@@ -651,18 +637,7 @@ mod tests {
         // below has an empty API map (`discover()` was never called), so any
         // request would fail in `endpoint()` — `Ok(())` is therefore positive
         // proof that the early return fired.
-        let config = crate::config::ResolvedConfig {
-            host: "nas.invalid".to_string(),
-            port: 5001,
-            https: true,
-            insecure: false,
-            username: "tester".to_string(),
-            refresh_secs: 3,
-            delete_files: true,
-            dry_run: true,
-            logout: false,
-        };
-        let client = SynoClient::new(&config).expect("building a client issues no request");
+        let client = crate::testutil::offline_client();
         delete_paths(&client, &[])
             .await
             .expect("no paths means no call");

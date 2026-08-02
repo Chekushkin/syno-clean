@@ -138,11 +138,16 @@ impl Config {
     /// Build a configuration layer from the environment.
     pub fn from_env(get: EnvLookup<'_>) -> Result<Self> {
         Ok(Config {
-            host: get(env_vars::HOST).filter(|v| !v.is_empty()),
+            // `trim().is_empty()`, matching `parse_env`: every env var has to
+            // agree on what "blank" means. `SYNO_CLEAN_HOST="  "` reaching
+            // `first_set` would be trimmed to nothing *there*, leaving the host
+            // unresolved and reporting "no NAS host configured" at a user whose
+            // config file names a perfectly good one.
+            host: get(env_vars::HOST).filter(|v| !v.trim().is_empty()),
             port: parse_env(get, env_vars::PORT, |v| v.parse::<u16>().ok())?,
             https: parse_env(get, env_vars::HTTPS, parse_bool)?,
             insecure: parse_env(get, env_vars::INSECURE, parse_bool)?,
-            username: get(env_vars::USERNAME).filter(|v| !v.is_empty()),
+            username: get(env_vars::USERNAME).filter(|v| !v.trim().is_empty()),
             refresh_secs: parse_env(get, env_vars::REFRESH_SECS, |v| v.parse::<u64>().ok())?,
             // No `SYNO_CLEAN_DELETE_FILES`: `--no-delete-files` and the config
             // key cover it, and an env var that silently disables the tool's
@@ -267,10 +272,16 @@ fn resolved_username(file: &Config, env: &Config, cli: &Cli) -> Option<String> {
     )
 }
 
-/// CLI beats env beats file, and a value that is only whitespace counts as
-/// **unset at the layer that supplied it** — it does not fall through, because
-/// `--host "  "` is a mistake to report, not a reason to silently use the
-/// config file's host.
+/// CLI beats env beats file, and a whitespace-only value **does not fall
+/// through**: the first layer that supplied anything at all wins, and if what
+/// it supplied trims to nothing the result is `None` — unresolved — rather than
+/// the next layer's value. `--host "  "` is a mistake to report, not a reason
+/// to silently connect to the config file's host.
+///
+/// Only the CLI can get a blank this far. Both env layers filter blanks in
+/// [`Config::from_env`] (and `parse_env`), so `SYNO_CLEAN_HOST="  "` is unset
+/// at the point it is read and the config file is used — one rule for env vars,
+/// one for the flag the user just typed.
 fn first_set(cli: Option<&str>, env: Option<&str>, file: Option<&str>) -> Option<String> {
     cli.or(env)
         .or(file)
@@ -423,12 +434,13 @@ pub fn merge(file: Config, env: Config, cli: &Cli) -> Result<ResolvedConfig> {
         ));
     }
 
+    // No `env.delete_files` in this chain: `Config::from_env` hardcodes it to
+    // `None` (see the comment there), so an env half would be a branch that can
+    // never be taken.
     let delete_files = if cli.no_delete_files {
         false
     } else {
-        env.delete_files
-            .or(file.delete_files)
-            .unwrap_or(DEFAULT_DELETE_FILES)
+        file.delete_files.unwrap_or(DEFAULT_DELETE_FILES)
     };
 
     Ok(ResolvedConfig {
@@ -782,9 +794,21 @@ delete_files = true
 
     #[test]
     fn blank_env_values_are_treated_as_unset() {
+        // Whitespace as well as empty, and for the string vars as well as the
+        // parsed ones: a `SYNO_CLEAN_HOST="  "` that survived to `first_set`
+        // would be trimmed to nothing there and leave the host *unresolved*,
+        // reporting "no NAS host configured" over a config file that names one.
+        let env = env_of(&[
+            (env_vars::HOST, "  "),
+            (env_vars::PORT, "  "),
+            (env_vars::USERNAME, "\t"),
+        ]);
+        let config = Config::from_env(&env).expect("blank values are not errors");
+        assert_eq!(config, Config::default());
+
         let env = env_of(&[
             (env_vars::HOST, ""),
-            (env_vars::PORT, "  "),
+            (env_vars::PORT, ""),
             (env_vars::USERNAME, ""),
         ]);
         let config = Config::from_env(&env).expect("blank values are not errors");
@@ -969,6 +993,25 @@ delete_files = true
         let msg = err.to_string();
         assert!(msg.contains("--user"), "{msg}");
         assert!(msg.contains(env_vars::USERNAME), "{msg}");
+    }
+
+    #[test]
+    fn a_blank_env_host_falls_through_to_the_config_file() {
+        // The whole point of filtering blanks in `from_env`: an exported but
+        // empty `SYNO_CLEAN_HOST` — a shell profile line the user forgot about
+        // — must not make a perfectly good config file unusable with "no NAS
+        // host configured".
+        let file = Config {
+            host: Some("nas.local".into()),
+            username: Some("eduard".into()),
+            ..Config::default()
+        };
+        let env = Config::from_env(&env_of(&[(env_vars::HOST, "  "), (env_vars::USERNAME, "")]))
+            .expect("blank values are not errors");
+
+        let resolved = merge(file, env, &cli()).expect("the file's host is used");
+        assert_eq!(resolved.host, "nas.local");
+        assert_eq!(resolved.username, "eduard");
     }
 
     #[test]

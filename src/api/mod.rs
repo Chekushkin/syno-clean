@@ -6,7 +6,7 @@
 //!   envelope, sid handling and the re-login-once retry.
 //! * [`auth`] — `SYNO.API.Auth` login and logout.
 //! * [`download_station`] — `SYNO.DownloadStation.Task`, the v1 task list plus
-//!   the per-task `getinfo` / `pause` / `delete` methods.
+//!   the per-task `getinfo` / `pause` / `resume` / `delete` methods.
 //! * [`file_station`] — `SYNO.FileStation.List` `getinfo` (the pre-delete
 //!   existence check) and `SYNO.FileStation.Delete` (`start` + `status`
 //!   polling), which is what actually reclaims the space.

@@ -5,10 +5,15 @@
 //! integer into something a user can act on is the whole job of this module.
 //!
 //! Two code spaces overlap: the *common* codes (100-119) mean the same thing
-//! for every API, while the 400-range is API-specific — the table here covers
-//! `SYNO.API.Auth`, where transposing 401 and 402 turns "your account is
-//! disabled" into "permission denied" and sends the user hunting in the wrong
-//! place.
+//! for every API, while the 400-range is **API-specific**. Two tables are
+//! implemented — [`auth_message`] for `SYNO.API.Auth`, where transposing 401
+//! and 402 turns "your account is disabled" into "permission denied" and sends
+//! the user hunting in the wrong place, and [`file_station_message`] for
+//! `SYNO.FileStation.*`, which reuses the same numbers for something else
+//! entirely (403 is a permission problem there, a 2FA prompt on Auth). Any
+//! other API's 400-range code falls through to the common table and then to a
+//! message naming the raw number, so a Download Station 400 can never render
+//! as "incorrect password".
 
 use std::fmt;
 
@@ -99,6 +104,26 @@ impl Error {
             api: api.into(),
             reason: ApiUnavailableReason::NotInstalled,
         }
+    }
+
+    /// An operation that failed with no DSM code behind it.
+    ///
+    /// Reuses [`Error::Io`] rather than growing the enum, the same way
+    /// `api::client` reuses [`Error::Parse`] for protocol violations: a
+    /// `path_err_num` with no code, or a per-task result array that never
+    /// mentioned the task asked about. One spelling, so the three call sites
+    /// cannot drift apart.
+    pub fn operation_failed(message: impl Into<String>) -> Self {
+        Error::Io(std::io::Error::other(message.into()))
+    }
+
+    /// A bounded wait that ran out — same [`Error::Io`] reuse as
+    /// [`Error::operation_failed`], with the kind that says which it was.
+    pub fn timed_out(message: impl Into<String>) -> Self {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            message.into(),
+        ))
     }
 
     /// The API exists but this client and the NAS share no supported version.

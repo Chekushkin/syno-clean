@@ -680,7 +680,7 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
         entries: &[
             HelpEntry {
                 keys: "Enter",
-                action: "apply and close the box",
+                action: "commit and close the box",
             },
             HelpEntry {
                 keys: "Esc",
@@ -932,23 +932,8 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::client::parse_envelope;
-    use crate::model::{Task, TaskList};
-
-    const FIXTURE: &str = include_str!("../../tests/fixtures/task_list.json");
-
-    fn fixture_tasks() -> Vec<Task> {
-        parse_envelope::<TaskList>(FIXTURE, "SYNO.DownloadStation.Task")
-            .expect("the fixture must parse")
-            .tasks
-    }
-
-    fn task(id: &str) -> Task {
-        fixture_tasks()
-            .into_iter()
-            .find(|task| task.id == id)
-            .unwrap_or_else(|| panic!("fixture has no task {id}"))
-    }
+    use crate::model::Task;
+    use crate::testutil::fixture_task as task;
 
     /// A plan over the named fixture tasks, in the order given.
     fn plan(ids: &[&str]) -> DeletePlan {

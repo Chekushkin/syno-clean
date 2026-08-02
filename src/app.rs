@@ -92,13 +92,6 @@ pub struct TaskOpRequest {
     pub tasks: Vec<TaskRef>,
 }
 
-impl TaskOpRequest {
-    /// The ids alone, for callers that only need to name the tasks.
-    pub fn ids(&self) -> Vec<String> {
-        self.tasks.iter().map(|task| task.id.clone()).collect()
-    }
-}
-
 /// The whole of the application state.
 #[derive(Debug, Clone)]
 pub struct App {
@@ -173,8 +166,9 @@ pub struct App {
     /// A plan the user confirmed, waiting to be picked up.
     ///
     /// **The dialog performs no I/O.** Confirming records the intent here and
-    /// the event loop drains it with [`App::take_confirmed_delete`]; Task 15
-    /// hangs the actual three-phase delete off that hook. Keeping it a value
+    /// the event loop drains it with [`App::take_confirmed_delete`], which
+    /// hands it to [`crate::event::spawn_delete`] — the owner of the actual
+    /// three-phase execution. Keeping it a value
     /// means the whole confirmation flow stays testable without a runtime, a
     /// client or a NAS.
     confirmed_delete: Option<DeletePlan>,
@@ -395,13 +389,16 @@ impl App {
 
         change(self);
 
-        if let Some(id) = cursor_id {
-            let visible = self.visible();
-            if let Some(row) = visible.iter().position(|&index| self.tasks[index].id == id) {
-                self.cursor = row;
-            }
+        // One [`App::visible`] for the whole transition: it filters, searches
+        // and sorts, and the reconciliation, the clamp and the scroll all want
+        // the same answer.
+        let visible = self.visible();
+        if let Some(id) = cursor_id
+            && let Some(row) = visible.iter().position(|&index| self.tasks[index].id == id)
+        {
+            self.cursor = row;
         }
-        self.clamp_cursor();
+        self.settle_cursor(visible.len());
     }
 
     /// Ask for an immediate refresh (`r`).
@@ -419,11 +416,26 @@ impl App {
     }
 
     /// Indices into [`App::tasks`] of the rows to display, in display order.
+    ///
+    /// **Derived on every call, never stored.** `tasks` and `view` are public
+    /// and mutated directly (by the poller, by every view key and by the
+    /// tests), so a cached list would have to be invalidated from more places
+    /// than can be checked — and a stale one puts the cursor, the selection
+    /// and the confirmation dialog on different rows than the table.
+    ///
+    /// It is not free — a `Vec` plus an O(n log n) sort — so a caller that
+    /// needs it more than once holds on to the answer: [`crate::ui::render`]
+    /// takes it once per frame and passes it down, and everything that moves
+    /// the cursor reuses the row count it already has (see
+    /// [`App::scroll_offset_for`]).
     pub fn visible(&self) -> Vec<usize> {
         view::visible_indices(&self.tasks, &self.view)
     }
 
     /// How many rows the current sort/filter/search leaves on screen.
+    ///
+    /// Costs a whole [`App::visible`]; prefer `visible().len()` where the list
+    /// itself is wanted too.
     pub fn visible_count(&self) -> usize {
         self.visible().len()
     }
@@ -433,11 +445,6 @@ impl App {
         self.visible()
             .get(self.cursor)
             .map(|&index| &self.tasks[index])
-    }
-
-    /// Rows a page jump moves.
-    pub fn page_size(&self) -> usize {
-        self.page_size
     }
 
     // ---- sort, filter and search -------------------------------------------
@@ -538,7 +545,8 @@ impl App {
 
     /// The selected tasks that still exist, in [`App::tasks`] order.
     ///
-    /// Selections are dropped when a refresh removes their task (Task 11), but
+    /// Selections are dropped when a refresh removes their task
+    /// ([`App::apply_tasks`]), but
     /// the footer must not over-report in the window before that happens, so
     /// both the count and the size sum are derived from the *tasks*, not from
     /// the raw set — they can never disagree with each other.
@@ -607,7 +615,7 @@ impl App {
     // modal describing it; only `y`, or `Enter` on a deliberately re-focused
     // Delete button, records the intent. Even then nothing here touches the
     // network — [`App::take_confirmed_delete`] hands the plan to the event loop,
-    // and Task 15 owns the three-phase execution.
+    // and [`crate::event::spawn_delete`] owns the three-phase execution.
 
     /// Open the confirmation modal for the current target (`d`).
     ///
@@ -796,7 +804,7 @@ impl App {
     ///
     /// **This performs no I/O.** The snapshot is parked in `confirmed_delete`
     /// for [`App::take_confirmed_delete`]; the execution — pause, files, task —
-    /// belongs to Task 15.
+    /// belongs to [`crate::event::spawn_delete`].
     pub fn confirm_delete(&mut self) {
         if let Some(plan) = self.pending_delete.take() {
             tracing::info!(
@@ -818,8 +826,8 @@ impl App {
 
     /// Take the confirmed plan, if the user confirmed one since the last call.
     ///
-    /// The counterpart of [`App::take_refresh_request`], and the seam Task 15
-    /// plugs the executor into.
+    /// The counterpart of [`App::take_refresh_request`], and the seam the event
+    /// loop plugs [`crate::event::spawn_delete`] into.
     pub fn take_confirmed_delete(&mut self) -> Option<DeletePlan> {
         self.confirmed_delete.take()
     }
@@ -839,7 +847,15 @@ impl App {
     /// knows the real height of the frame it is drawing, which the app may not
     /// have been told about yet.
     pub fn scroll_offset(&self, height: usize) -> usize {
-        table::scroll_offset(self.scroll, self.cursor, self.visible_count(), height)
+        self.scroll_offset_for(self.visible_count(), height)
+    }
+
+    /// As [`App::scroll_offset`], for a caller that already knows how many rows
+    /// are visible — which spares it a second filter-and-sort. The row count
+    /// must be `self.visible().len()`; passing anything else scrolls the table
+    /// to a row that is not there.
+    pub fn scroll_offset_for(&self, rows: usize, height: usize) -> usize {
+        table::scroll_offset(self.scroll, self.cursor, rows, height)
     }
 
     /// Re-seat the window around the cursor, in the height the last frame had.
@@ -850,17 +866,28 @@ impl App {
     /// keeping the stored value in step here is what makes the scrolling
     /// edge-triggered rather than one-row-at-a-time.
     fn follow_cursor(&mut self) {
-        self.scroll = self.scroll_offset(self.page_size);
+        self.follow_cursor_in(self.visible_count());
+    }
+
+    /// [`App::follow_cursor`] for a caller holding the row count already.
+    fn follow_cursor_in(&mut self, rows: usize) {
+        self.scroll = self.scroll_offset_for(rows, self.page_size);
     }
 
     /// Pull the cursor back inside the visible list.
     ///
-    /// Called after anything that can shrink the list — a filter change (Task
-    /// 12), a refresh that removed rows (Task 11) — and by every movement, so
+    /// Called after anything that can shrink the list — a filter change
+    /// ([`App::cycle_filter`]), a refresh that removed rows
+    /// ([`App::apply_tasks`]) — and by every movement, so
     /// [`App::cursor`] is never a position that does not exist.
     pub fn clamp_cursor(&mut self) {
-        self.cursor = self.cursor.min(self.visible_count().saturating_sub(1));
-        self.follow_cursor();
+        self.settle_cursor(self.visible_count());
+    }
+
+    /// [`App::clamp_cursor`] for a caller holding the row count already.
+    fn settle_cursor(&mut self, rows: usize) {
+        self.cursor = self.cursor.min(rows.saturating_sub(1));
+        self.follow_cursor_in(rows);
     }
 
     /// Move the cursor by `delta` rows, clamped to the ends of the list.
@@ -875,7 +902,7 @@ impl App {
             return;
         }
         self.cursor = shift(self.cursor, delta, rows.saturating_sub(1));
-        self.follow_cursor();
+        self.follow_cursor_in(rows);
     }
 
     /// Jump to the first visible row (`Home`, `g`).
@@ -886,8 +913,9 @@ impl App {
 
     /// Jump to the last visible row (`End`, `G`).
     pub fn cursor_to_last(&mut self) {
-        self.cursor = self.visible_count().saturating_sub(1);
-        self.follow_cursor();
+        let rows = self.visible_count();
+        self.cursor = rows.saturating_sub(1);
+        self.follow_cursor_in(rows);
     }
 
     /// Up one screenful (`PageUp`).
@@ -957,7 +985,11 @@ impl App {
         self.mode = Mode::Normal;
     }
 
-    /// Keys while browsing the table. The operations land in Tasks 14-16.
+    /// Keys while browsing the table.
+    ///
+    /// No key here touches the network: `d` opens the confirmation modal, `p`
+    /// and `u` record a [`TaskOpRequest`], and the event loop hands both to
+    /// [`crate::event::spawn_delete`] / [`crate::event::spawn_task_op`].
     fn handle_normal_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.quit(),
@@ -1119,21 +1151,7 @@ mod tests {
     use crate::model::TaskStatus;
     use crate::view::StatusFilter;
 
-    const FIXTURE: &str = include_str!("../tests/fixtures/task_list.json");
-
-    fn fixture_tasks() -> Vec<Task> {
-        parse_envelope::<TaskList>(FIXTURE, "SYNO.DownloadStation.Task")
-            .expect("the fixture must parse")
-            .tasks
-    }
-
-    /// One fixture task by id.
-    fn fixture_task(id: &str) -> Task {
-        fixture_tasks()
-            .into_iter()
-            .find(|task| task.id == id)
-            .unwrap_or_else(|| panic!("fixture has no task {id}"))
-    }
+    use crate::testutil::{fixture_task, fixture_tasks};
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1432,15 +1450,42 @@ mod tests {
     #[test]
     fn the_page_size_starts_usable_and_never_falls_to_zero() {
         let mut app = app_with(100);
-        assert_eq!(app.page_size(), DEFAULT_PAGE_SIZE);
+        assert_eq!(app.page_size, DEFAULT_PAGE_SIZE);
         app.handle_key(press(KeyCode::PageDown));
         assert_eq!(app.cursor, DEFAULT_PAGE_SIZE);
 
         // A terminal too short for even one table row still has to page.
         app.set_page_size(0);
-        assert_eq!(app.page_size(), 1);
+        assert_eq!(app.page_size, 1);
         app.handle_key(press(KeyCode::PageDown));
         assert_eq!(app.cursor, DEFAULT_PAGE_SIZE + 1);
+    }
+
+    #[test]
+    fn the_row_count_shortcut_answers_exactly_as_the_full_derivation_does() {
+        // `scroll_offset_for` exists only to spare the caller a second
+        // filter-and-sort per frame; the moment it disagrees with
+        // `scroll_offset` the table scrolls to a row the cursor is not on.
+        let mut app = App::new(fixture_tasks());
+        for filter in [
+            StatusFilter::All,
+            StatusFilter::Seeding,
+            StatusFilter::Error,
+        ] {
+            app.view.filter = filter;
+            app.clamp_cursor();
+            let rows = app.visible_count();
+            for cursor in 0..=rows {
+                app.cursor = cursor;
+                for height in [0, 1, 3, 40] {
+                    assert_eq!(
+                        app.scroll_offset(height),
+                        app.scroll_offset_for(rows, height),
+                        "{filter:?} cursor {cursor} height {height}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1459,8 +1504,8 @@ mod tests {
 
     #[test]
     fn clamping_pulls_a_stale_cursor_back_into_a_narrowed_list() {
-        // Task 12 changes the filter under the cursor and Task 11 refreshes the
-        // list under it; both rely on this.
+        // `cycle_filter` changes the filter under the cursor and `apply_tasks`
+        // refreshes the list under it; both rely on this.
         let mut app = App::new(fixture_tasks());
         app.handle_key(press(KeyCode::End));
         assert_eq!(app.cursor, 13);
@@ -1880,7 +1925,8 @@ mod tests {
 
     #[test]
     fn select_all_never_touches_a_task_the_filter_hides() {
-        // The heart of Task 10: with a filter on, `a` must not arm a delete
+        // The heart of `toggle_select_all_visible`: with a filter on, `a` must
+        // not arm a delete
         // against rows that are not on screen — in either direction.
         let mut app = App::new(fixture_tasks());
         app.view.filter = StatusFilter::Seeding;
@@ -1963,8 +2009,8 @@ mod tests {
 
     #[test]
     fn a_selected_id_with_no_task_behind_it_is_not_counted_or_summed() {
-        // Task 11 prunes these on refresh; until it does, the footer must not
-        // claim a task that is not there.
+        // `apply_tasks` prunes these on refresh; until it does, the footer must
+        // not claim a task that is not there.
         let mut app = app_with(2);
         app.selected.insert("id_000".to_string());
         app.selected.insert("ghost".to_string());
@@ -1974,7 +2020,7 @@ mod tests {
 
     // ---- refresh reconciliation --------------------------------------------
     //
-    // The heart of Task 11. A refresh lands every few seconds, unannounced,
+    // The heart of `apply_tasks`. A refresh lands every few seconds, unannounced,
     // possibly while the user is reaching for `d` — so what it may *not* do is
     // move the cursor onto a different task or leave a selection armed against
     // one that is gone.
@@ -2704,6 +2750,12 @@ mod tests {
         app.take_requested_op()
     }
 
+    /// The ids a request names, in order — which task a key aimed at is the
+    /// whole subject of these tests.
+    fn ids(request: &TaskOpRequest) -> Vec<&str> {
+        request.tasks.iter().map(|task| task.id.as_str()).collect()
+    }
+
     #[test]
     fn p_with_nothing_selected_acts_on_the_row_under_the_cursor() {
         let mut app = app_with(4);
@@ -2713,7 +2765,7 @@ mod tests {
 
         let request = requested(&mut app).expect("a pause was requested");
         assert_eq!(request.op, TaskOp::Pause);
-        assert_eq!(request.ids(), ["id_002"]);
+        assert_eq!(ids(&request), ["id_002"]);
         assert!(
             app.selected.is_empty(),
             "the cursor fallback must not arm anything"
@@ -2729,7 +2781,7 @@ mod tests {
 
         let request = requested(&mut app).expect("a resume was requested");
         assert_eq!(request.op, TaskOp::Resume);
-        assert_eq!(request.ids(), ["id_003"]);
+        assert_eq!(ids(&request), ["id_003"]);
     }
 
     #[test]
@@ -2742,9 +2794,9 @@ mod tests {
         app.handle_key(press(KeyCode::Char('p')));
 
         let request = requested(&mut app).expect("a pause was requested");
-        assert_eq!(request.ids(), ["id_000", "id_003"]);
+        assert_eq!(ids(&request), ["id_000", "id_003"]);
         assert!(
-            !request.ids().contains(&"id_001".to_string()),
+            !ids(&request).contains(&"id_001"),
             "the cursor row must not be added to a selection"
         );
     }
@@ -2786,10 +2838,7 @@ mod tests {
         );
 
         app.handle_key(press(KeyCode::Char('u')));
-        assert_eq!(
-            requested(&mut app).expect("a resume").ids(),
-            ["dbid_004".to_string()]
-        );
+        assert_eq!(ids(&requested(&mut app).expect("a resume")), ["dbid_004"]);
     }
 
     #[test]
@@ -2867,7 +2916,7 @@ mod tests {
         app.cursor = 1;
 
         app.handle_key(press(KeyCode::Char('p')));
-        assert_eq!(requested(&mut app).expect("a pause").ids(), ["id_001"]);
+        assert_eq!(ids(&requested(&mut app).expect("a pause")), ["id_001"]);
     }
 
     #[test]

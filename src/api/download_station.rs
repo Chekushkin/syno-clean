@@ -87,7 +87,7 @@ pub async fn list_tasks_json(client: &SynoClient) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Per-task operations: getinfo, pause, delete
+// Per-task operations: getinfo, pause, resume, delete
 // ---------------------------------------------------------------------------
 
 /// The `id` parameter shared by `getinfo`, `delete`, `pause` and `resume`.
@@ -156,9 +156,9 @@ pub fn check_task_results(results: &[TaskOpResult]) -> Result<()> {
 pub fn check_task_result(id: &str, results: &[TaskOpResult]) -> Result<()> {
     match results.iter().find(|result| result.id == id) {
         Some(result) => check_task_results(std::slice::from_ref(result)),
-        None => Err(Error::Io(std::io::Error::other(format!(
+        None => Err(Error::operation_failed(format!(
             "DSM reported no result for task {id}"
-        )))),
+        ))),
     }
 }
 

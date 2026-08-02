@@ -84,8 +84,11 @@ impl TaskStatus {
         }
     }
 
-    /// Every recognized variant, for exhaustiveness checks and for the status
-    /// filter in `view.rs`.
+    /// Every recognized variant, in one place so a test can enumerate the
+    /// documented statuses — that a new variant is classified by
+    /// `view::StatusFilter`, labelled by `ui::table` and round-trips through
+    /// [`TaskStatus::as_dsm_str`] is checked by walking this array. Production code
+    /// matches on the variants directly.
     pub const KNOWN: [TaskStatus; 10] = [
         TaskStatus::Waiting,
         TaskStatus::Downloading,
@@ -355,9 +358,12 @@ mod tests {
     use super::*;
     use crate::api::client::parse_envelope;
 
-    /// The checked-in list response. Currently hand-written and marked
-    /// PROVISIONAL inside the file itself; plan Task 21 re-captures it from a
-    /// real NAS, at which point these tests are the regression net.
+    /// The checked-in list response. Still hand-written and marked
+    /// PROVISIONAL inside the file itself — no NAS was reachable when it was
+    /// written. Re-capturing it from a real NAS with `--dump-tasks-json` is
+    /// outstanding work; these tests are the regression net for when it lands,
+    /// and `the_fixture_is_still_marked_provisional` fails the moment the
+    /// marker goes without them being re-checked.
     const FIXTURE: &str = include_str!("../tests/fixtures/task_list.json");
 
     const DS_TASK: &str = "SYNO.DownloadStation.Task";
@@ -377,7 +383,7 @@ mod tests {
     // ---- fixture shape ----------------------------------------------------
 
     #[test]
-    fn the_fixture_is_still_marked_provisional_until_task_21_recaptures_it() {
+    fn the_fixture_is_still_marked_provisional() {
         // If this fails because the marker is gone, the fixture came from a
         // real NAS — delete this test along with the marker.
         assert!(

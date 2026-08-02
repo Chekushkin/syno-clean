@@ -254,13 +254,6 @@ impl View {
     pub fn cycle_filter(&mut self) {
         self.filter = self.filter.next();
     }
-
-    /// Whether anything is currently hiding rows, for the empty-state message
-    /// in Task 17 — "no tasks" and "nothing matches your filter" are different
-    /// things to tell the user.
-    pub fn is_narrowed(&self) -> bool {
-        self.filter != StatusFilter::All || !self.search.is_empty()
-    }
 }
 
 /// Indices into `tasks` of the rows to display, in display order.
@@ -304,16 +297,7 @@ fn title_matches(title: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::client::parse_envelope;
-    use crate::model::TaskList;
-
-    const FIXTURE: &str = include_str!("../tests/fixtures/task_list.json");
-
-    fn fixture_tasks() -> Vec<Task> {
-        parse_envelope::<TaskList>(FIXTURE, "SYNO.DownloadStation.Task")
-            .expect("the fixture must parse")
-            .tasks
-    }
+    use crate::testutil::fixture_tasks;
 
     /// A view sorted on `key` in `dir`, everything visible.
     fn sorted(key: SortKey, dir: SortDir) -> View {
@@ -385,7 +369,6 @@ mod tests {
         assert_eq!(view.sort_dir, SortDir::Asc);
         assert_eq!(view.filter, StatusFilter::All);
         assert!(view.search.is_empty());
-        assert!(!view.is_narrowed());
         assert_eq!(visible_indices(&fixture_tasks(), &view).len(), 14);
     }
 
@@ -427,19 +410,6 @@ mod tests {
         view.toggle_dir();
         assert_eq!(view.sort_dir, SortDir::Asc);
         assert_ne!(SortDir::Asc.arrow(), SortDir::Desc.arrow());
-    }
-
-    #[test]
-    fn a_filter_or_a_search_marks_the_view_as_narrowed() {
-        let mut view = View::default();
-        view.cycle_filter();
-        assert!(view.is_narrowed());
-
-        let searching = View {
-            search: "x".to_string(),
-            ..View::default()
-        };
-        assert!(searching.is_narrowed());
     }
 
     // ---- one test per sort key, both directions ---------------------------
