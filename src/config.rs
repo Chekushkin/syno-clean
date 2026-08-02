@@ -208,6 +208,165 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+/// What to say when `host` could not be resolved from any layer.
+///
+/// One definition, used both by [`merge`] (which refuses to produce a
+/// [`ResolvedConfig`] without it) and by the first-run path in `main`, which
+/// prints the same sentence beside the config template it just wrote.
+pub const MISSING_HOST_HELP: &str = "no NAS host configured — pass --host <HOST>, \
+     set SYNO_CLEAN_HOST, or add `host = \"nas.local\"` to the config file";
+
+/// What to say when `username` could not be resolved from any layer.
+pub const MISSING_USERNAME_HELP: &str = "no DSM username configured — pass --user <NAME>, \
+     set SYNO_CLEAN_USERNAME, or add `username = \"admin\"` to the config file";
+
+/// Which required values are still unresolved after the CLI/env/file merge.
+///
+/// A merely *missing config file* is not an error — `syno-clean --host nas
+/// --user me` must work on a clean machine — so "should we write a template and
+/// stop?" is a question about the **merged** values, never about the file. This
+/// is that question, asked without building (and failing to build) a
+/// [`ResolvedConfig`]; [`merge`] enforces exactly the same rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MissingRequired {
+    pub host: bool,
+    pub username: bool,
+}
+
+impl MissingRequired {
+    /// Whether anything required is missing.
+    pub fn any(self) -> bool {
+        self.host || self.username
+    }
+
+    /// The actionable sentence for each missing value, in flag order.
+    pub fn help_lines(self) -> Vec<&'static str> {
+        let mut lines = Vec::new();
+        if self.host {
+            lines.push(MISSING_HOST_HELP);
+        }
+        if self.username {
+            lines.push(MISSING_USERNAME_HELP);
+        }
+        lines
+    }
+}
+
+/// Ask whether the three layers resolve the required values, without merging.
+///
+/// Uses the very same resolution [`merge`] does — see [`resolved_host`] and
+/// [`resolved_username`] — so the two can never disagree about what counts as
+/// configured.
+pub fn missing_required(file: &Config, env: &Config, cli: &Cli) -> MissingRequired {
+    MissingRequired {
+        host: resolved_host(file, env, cli).is_none(),
+        username: resolved_username(file, env, cli).is_none(),
+    }
+}
+
+/// The `host` the three layers resolve to, trimmed, if any layer supplies one.
+fn resolved_host(file: &Config, env: &Config, cli: &Cli) -> Option<String> {
+    first_set(
+        cli.host.as_deref(),
+        env.host.as_deref(),
+        file.host.as_deref(),
+    )
+}
+
+/// The `username` the three layers resolve to, trimmed, if any layer supplies
+/// one.
+fn resolved_username(file: &Config, env: &Config, cli: &Cli) -> Option<String> {
+    first_set(
+        cli.username.as_deref(),
+        env.username.as_deref(),
+        file.username.as_deref(),
+    )
+}
+
+/// CLI beats env beats file, and a value that is only whitespace counts as
+/// **unset at the layer that supplied it** — it does not fall through, because
+/// `--host "  "` is a mistake to report, not a reason to silently use the
+/// config file's host.
+fn first_set(cli: Option<&str>, env: Option<&str>, file: Option<&str>) -> Option<String> {
+    cli.or(env)
+        .or(file)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// A commented starter config, written on a first run that has nothing to
+/// connect to.
+///
+/// **Every key is commented out.** A template that shipped a live
+/// `host = "nas.local"` would send the next invocation off to a host the user
+/// never named; leaving the examples inert means the file documents the format
+/// and changes nothing until it is edited. The password is deliberately absent:
+/// it is never stored here.
+pub const CONFIG_TEMPLATE: &str = r#"# syno-clean configuration
+#
+# Precedence: command-line flags beat SYNO_CLEAN_* environment variables,
+# which beat this file, which beats the built-in defaults.
+#
+# `host` and `username` are required. Uncomment and fill them in below, or
+# pass --host and --user on the command line.
+#
+# The password is never stored here: set SYNO_CLEAN_PASSWORD or type it at
+# the prompt. A 2-step verification code comes from SYNO_CLEAN_OTP or the
+# prompt DSM asks for.
+
+# DSM hostname or IP address (required).
+# host = "nas.local"
+
+# DSM account name (required).
+# username = "admin"
+
+# DSM management port. Defaults to 5001 with https, 5000 without.
+# port = 5001
+
+# Talk to DSM over HTTPS.
+# https = true
+
+# Accept a self-signed or otherwise invalid TLS certificate.
+# insecure = false
+
+# Seconds between automatic task-list refreshes.
+# refresh_secs = 3
+
+# Delete the downloaded files as well as the Download Station task.
+# Set to false to remove the task only and leave the files on the volume.
+# delete_files = true
+"#;
+
+/// Write [`CONFIG_TEMPLATE`] to `path`, creating the directory if needed.
+///
+/// Returns whether it wrote anything: an existing file is **never** overwritten,
+/// however incomplete it is. Losing a user's settings while explaining that
+/// their settings are incomplete would be an unusually poor trade.
+pub fn write_config_template(path: &Path) -> Result<bool> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // `create_new` rather than a prior `exists()` check: the check-then-write
+    // race is small but the cost of losing the file is not.
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            file.write_all(CONFIG_TEMPLATE.as_bytes())?;
+            file.flush()?;
+            tracing::info!(path = %path.display(), "wrote a starter config");
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(Error::Io(err)),
+    }
+}
+
 /// Everything the rest of the program needs, with every value resolved and
 /// validated. `host` and `username` are guaranteed non-empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,33 +408,9 @@ pub fn session_key(host: &str, port: u16, username: &str) -> String {
 /// can only turn something off, so an unset flag falls through to the lower
 /// layers instead of overriding them with `false`.
 pub fn merge(file: Config, env: Config, cli: &Cli) -> Result<ResolvedConfig> {
-    let host = cli
-        .host
-        .clone()
-        .or(env.host)
-        .or(file.host)
-        .map(|h| h.trim().to_string())
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| {
-            Error::config(
-                "no NAS host configured — pass --host <HOST>, set SYNO_CLEAN_HOST, \
-                 or add `host = \"nas.local\"` to the config file",
-            )
-        })?;
-
-    let username = cli
-        .username
-        .clone()
-        .or(env.username)
-        .or(file.username)
-        .map(|u| u.trim().to_string())
-        .filter(|u| !u.is_empty())
-        .ok_or_else(|| {
-            Error::config(
-                "no DSM username configured — pass --user <NAME>, set SYNO_CLEAN_USERNAME, \
-                 or add `username = \"admin\"` to the config file",
-            )
-        })?;
+    let host = resolved_host(&file, &env, cli).ok_or_else(|| Error::config(MISSING_HOST_HELP))?;
+    let username =
+        resolved_username(&file, &env, cli).ok_or_else(|| Error::config(MISSING_USERNAME_HELP))?;
 
     let https = cli_none()
         .or(env.https)
@@ -909,6 +1044,163 @@ delete_files = true
         };
         let err = merge(Config::default(), Config::default(), &cli).expect_err("0 is invalid");
         assert!(err.to_string().contains("refresh_secs"), "{err}");
+    }
+
+    // ---- the first-run template -------------------------------------------
+
+    /// Uncomment the example assignments in a template, leaving the prose
+    /// comments alone: `# host = "nas.local"` becomes `host = "nas.local"`.
+    fn uncomment(template: &str) -> String {
+        template
+            .lines()
+            .map(|line| match line.strip_prefix("# ") {
+                Some(rest) if rest.split_once(" = ").is_some() => rest,
+                _ => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_template_parses_as_written_and_changes_nothing() {
+        // Every key is commented out, so a freshly written template is a valid
+        // config file that supplies no values at all — it must not send the
+        // next run off to an example host.
+        let (config, unknown) = parse_config(CONFIG_TEMPLATE).expect("the template must parse");
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn the_template_documents_every_key_and_round_trips_uncommented() {
+        for key in KNOWN_KEYS {
+            assert!(
+                CONFIG_TEMPLATE.contains(&format!("# {key} = ")),
+                "the template does not document {key}"
+            );
+        }
+
+        // Uncommented, the examples must still be a config this binary
+        // understands — a typo in a key name would otherwise ship silently and
+        // be "ignored unknown key" the moment a user followed the template.
+        let (config, unknown) = parse_config(&uncomment(CONFIG_TEMPLATE)).expect("valid TOML");
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert_eq!(config.host.as_deref(), Some("nas.local"));
+        assert_eq!(config.username.as_deref(), Some("admin"));
+        assert_eq!(config.port, Some(DEFAULT_HTTPS_PORT));
+        assert_eq!(config.https, Some(DEFAULT_HTTPS));
+        assert_eq!(config.insecure, Some(DEFAULT_INSECURE));
+        assert_eq!(config.refresh_secs, Some(DEFAULT_REFRESH_SECS));
+        assert_eq!(config.delete_files, Some(DEFAULT_DELETE_FILES));
+    }
+
+    #[test]
+    fn writing_the_template_creates_the_config_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::with_base(dir.path());
+        let path = paths.config_file();
+        assert!(!paths.config_dir().exists());
+
+        assert!(write_config_template(&path).expect("write"));
+        assert_eq!(fs::read_to_string(&path).expect("read"), CONFIG_TEMPLATE);
+        // ...and what was written loads as an empty layer, not an error.
+        assert_eq!(Config::load(&path).expect("load"), Config::default());
+    }
+
+    #[test]
+    fn writing_the_template_never_clobbers_an_existing_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = Paths::with_base(dir.path()).config_file();
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, "port = 5011\n").expect("write");
+
+        assert!(
+            !write_config_template(&path).expect("no error"),
+            "an existing file must be reported as not written"
+        );
+        assert_eq!(fs::read_to_string(&path).expect("read"), "port = 5011\n");
+    }
+
+    // ---- missing required values ------------------------------------------
+
+    #[test]
+    fn nothing_is_missing_once_the_layers_supply_host_and_username() {
+        let both_on_the_cli = Cli {
+            host: Some("nas".into()),
+            username: Some("me".into()),
+            ..cli()
+        };
+        assert!(!missing_required(&Config::default(), &Config::default(), &both_on_the_cli).any());
+
+        // ...from any mix of layers.
+        let env = Config::from_env(&env_of(&[(env_vars::USERNAME, "envuser")])).expect("valid");
+        let file = Config {
+            host: Some("filehost".into()),
+            ..Config::default()
+        };
+        assert!(!missing_required(&file, &env, &cli()).any());
+    }
+
+    #[test]
+    fn a_missing_config_file_alone_is_not_a_first_run() {
+        // The whole point: `syno-clean --host nas --user me` on a clean machine
+        // must run, with no config file anywhere.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::with_base(dir.path());
+        let file = Config::load(&paths.config_file()).expect("absent file is fine");
+        let cli = Cli {
+            host: Some("nas.local".into()),
+            username: Some("eduard".into()),
+            ..cli()
+        };
+
+        assert!(!missing_required(&file, &Config::default(), &cli).any());
+        assert!(merge(file, Config::default(), &cli).is_ok());
+        assert!(!paths.config_file().exists(), "nothing was written");
+    }
+
+    #[test]
+    fn missing_required_agrees_with_what_merge_refuses() {
+        let cases = [
+            (None, None, (true, true)),
+            (Some("nas"), None, (false, true)),
+            (None, Some("me"), (true, false)),
+            (Some("  "), Some("me"), (true, false)),
+        ];
+        for (host, username, (host_missing, user_missing)) in cases {
+            let cli = Cli {
+                host: host.map(str::to_string),
+                username: username.map(str::to_string),
+                ..cli()
+            };
+            let missing = missing_required(&Config::default(), &Config::default(), &cli);
+            assert_eq!(missing.host, host_missing, "{host:?}/{username:?}");
+            assert_eq!(missing.username, user_missing, "{host:?}/{username:?}");
+            assert_eq!(
+                missing.any(),
+                merge(Config::default(), Config::default(), &cli).is_err(),
+                "{host:?}/{username:?}: the two must never disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_run_message_names_the_values_that_are_missing() {
+        let both = MissingRequired {
+            host: true,
+            username: true,
+        };
+        assert_eq!(both.help_lines().len(), 2);
+        assert!(both.help_lines()[0].contains("--host"));
+        assert!(both.help_lines()[1].contains("--user"));
+
+        let host_only = MissingRequired {
+            host: true,
+            username: false,
+        };
+        assert_eq!(host_only.help_lines(), vec![MISSING_HOST_HELP]);
+        assert!(MissingRequired::default().help_lines().is_empty());
+        assert!(!MissingRequired::default().any());
     }
 
     // ---- resolved helpers -------------------------------------------------

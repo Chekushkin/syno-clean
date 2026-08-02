@@ -505,6 +505,35 @@ call, so what the user read on screen is exactly what gets deleted.
 - Cursor movement **clamps and never wraps** — a `j` held at the bottom of a
   long list wrapping to the top is how the wrong row gets deleted.
 
+### Help overlay and first run (`ui::dialog`, `config`, `main`)
+
+- **`dialog::HELP_SECTIONS` is the keymap's public face.** It is data, not
+  formatted text, and a test in `ui::dialog` tokenizes every `keys` field and
+  asserts each key `App` binds appears there — add a binding, add a row, or the
+  suite tells you which one you forgot. The *implementation* is the source of
+  truth for what the overlay says (notably: `Enter` presses the focused button
+  in the confirmation, and commits an already-live query in the search box).
+- The overlay binds nothing itself: **any key closes it and does nothing else**,
+  so dismissing with `d` cannot also open a delete confirmation. It lays out in
+  two columns and drops its inter-section blank lines rather than clipping when
+  the terminal is short — the whole card has to fit 80x24.
+- **A missing config *file* is never an error.** Only values still unresolved
+  after the CLI > env > file merge are, and `config::missing_required` asks that
+  question with the very same resolution `merge` enforces (`resolved_host` /
+  `resolved_username`) — never a second copy of the rule. `main::first_run` then
+  writes `config::CONFIG_TEMPLATE` and exits non-zero without entering the TUI.
+  The template has **every key commented out** (it must change nothing) and
+  `write_config_template` never overwrites an existing file.
+- **A startup connection or login failure exits non-zero with
+  `error::connection_diagnostic`** — host and port tried, the DSM code in words,
+  and one hint — rather than entering the TUI. An empty table is what a NAS with
+  no downloads looks like, so a failed login must never be able to render as
+  one. Poll failures *during* a session stay non-fatal (the footer banner).
+- The two empty states are chosen by `App::tasks` being empty, **not** by
+  `View::is_narrowed`: with zero tasks and a filter set both are true, and only
+  "there is nothing on the NAS" is the user's real problem. The narrowed state
+  names how many rows are hidden and what is hiding them.
+
 ## Testing philosophy
 
 Deliberately narrow. Pure logic where bugs are silent and expensive is tested:

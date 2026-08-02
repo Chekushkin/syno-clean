@@ -20,6 +20,7 @@ use syno_clean::app::App;
 use syno_clean::cli::Cli;
 use syno_clean::config::{self, Config, Paths, ResolvedConfig, SessionCache};
 use syno_clean::delete::DeleteOptions;
+use syno_clean::error::{self, Error};
 use syno_clean::event::{self, AppEvent, OpContext, Receiver, RefreshHandle};
 use syno_clean::ui::{self, TerminalGuard};
 
@@ -44,6 +45,16 @@ async fn main() -> Result<()> {
     let config_path = cli.config.clone().unwrap_or_else(|| paths.config_file());
     let file_config = Config::load(&config_path)?;
     let env_config = Config::from_env(&config::system_env)?;
+
+    // A missing config *file* is not an error; unresolved *values* are. Only
+    // when the whole CLI > env > file merge still leaves `host` or `username`
+    // unset does this become a first run: write a template, explain, and stop
+    // short of the TUI. `--host nas --user me` on a clean machine never gets
+    // here.
+    let missing = config::missing_required(&file_config, &env_config, &cli);
+    if missing.any() {
+        return Err(first_run(&config_path, missing));
+    }
     let resolved = config::merge(file_config, env_config, &cli)?;
 
     tracing::info!(
@@ -72,9 +83,21 @@ async fn main() -> Result<()> {
     // Discovery and login happen *before* the alternate screen: both can prompt
     // (password, 2FA code) and both can fail with a message worth reading, and
     // neither is any use inside a terminal the TUI has already taken over.
+    //
+    // A failure here **exits non-zero with a diagnostic** rather than starting
+    // the TUI: an empty table is what a NAS with no downloads looks like, so
+    // entering it after a failed login would leave the user unable to tell a
+    // wrong password from an idle Download Station.
     let mut client = SynoClient::new(&resolved)?;
-    client.discover().await?;
-    let client = Arc::new(authenticate(client, &resolved, &paths).await?);
+    client
+        .discover()
+        .await
+        .map_err(|err| startup_failure(&err, &resolved))?;
+    let client = Arc::new(
+        authenticate(client, &resolved, &paths)
+            .await
+            .map_err(|err| startup_failure(&err, &resolved))?,
+    );
 
     let (tx, rx) = event::channel();
     let refresh = RefreshHandle::new();
@@ -94,6 +117,57 @@ async fn main() -> Result<()> {
     // out an in-flight HTTP timeout before the process could exit.
     poller.abort();
     result
+}
+
+/// Nothing to connect to: write a starter config, say what is missing, stop.
+///
+/// This is the *first-run* path, not the "no config file" path — the difference
+/// matters. A missing file with `--host` and `--user` on the command line is a
+/// perfectly good invocation and never reaches here; only values still
+/// unresolved after the whole merge do. The template is written for the user to
+/// edit, and an existing file is never overwritten, so a config that merely
+/// lacks a username keeps everything else it had.
+fn first_run(config_path: &Path, missing: config::MissingRequired) -> anyhow::Error {
+    tracing::warn!(
+        config = %config_path.display(),
+        host = missing.host,
+        username = missing.username,
+        "required configuration is unresolved"
+    );
+
+    let mut message = missing.help_lines().join("\n");
+    match config::write_config_template(config_path) {
+        Ok(true) => message.push_str(&format!(
+            "\n\nwrote a starter config to {} — uncomment and fill in `host` and `username` \
+             there, or pass --host and --user",
+            config_path.display()
+        )),
+        Ok(false) => message.push_str(&format!(
+            "\n\nthe config file {} exists but does not set them",
+            config_path.display()
+        )),
+        // The template is a convenience; failing to write it must not replace
+        // the message that says what is actually wrong.
+        Err(err) => message.push_str(&format!(
+            "\n\ncould not write a starter config to {}: {err}",
+            config_path.display()
+        )),
+    }
+    anyhow::anyhow!(message)
+}
+
+/// A startup failure the user has to read before anything else.
+///
+/// The diagnostic names the host and port that were tried, what DSM said in
+/// words rather than as a bare code, and one thing to try — see
+/// [`syno_clean::error::connection_diagnostic`].
+fn startup_failure(err: &Error, resolved: &ResolvedConfig) -> anyhow::Error {
+    tracing::error!(target_url = %resolved.base_url(), %err, "startup failed");
+    anyhow::anyhow!(error::connection_diagnostic(
+        err,
+        &resolved.base_url(),
+        &resolved.username
+    ))
 }
 
 /// The hidden `--fixture` mode: the TUI over a captured `list` response.
@@ -245,7 +319,10 @@ enum Next {
 /// with no reformatting, so the capture is exactly what DSM sent.
 async fn dump(cli: &Cli, resolved: &ResolvedConfig, paths: &Paths) -> Result<()> {
     let mut client = SynoClient::new(resolved)?;
-    client.discover().await?;
+    client
+        .discover()
+        .await
+        .map_err(|err| startup_failure(&err, resolved))?;
 
     // Discovery needs no session, so this half works before any credentials
     // exist — useful precisely when a login is what is being debugged.
@@ -254,7 +331,9 @@ async fn dump(cli: &Cli, resolved: &ResolvedConfig, paths: &Paths) -> Result<()>
     }
 
     if cli.dump_tasks_json {
-        let client = authenticate(client, resolved, paths).await?;
+        let client = authenticate(client, resolved, paths)
+            .await
+            .map_err(|err| startup_failure(&err, resolved))?;
         println!("{}", download_station::list_tasks_json(&client).await?);
     }
     Ok(())
@@ -272,7 +351,7 @@ async fn authenticate(
     client: SynoClient,
     resolved: &ResolvedConfig,
     paths: &Paths,
-) -> Result<SynoClient> {
+) -> error::Result<SynoClient> {
     let session_file = paths.session_file();
     let key = resolved.session_key();
     let mut cache = SessionCache::load(&session_file);
@@ -298,7 +377,7 @@ async fn authenticate(
                     credentials = credentials.with_otp(prompt_otp()?);
                     auth::login(&client, &credentials).await?
                 }
-                Err(err) => return Err(err.into()),
+                Err(err) => return Err(err),
             };
             cache.set_sid(&key, &sid);
             cache.save(&session_file)?;
@@ -313,7 +392,7 @@ async fn authenticate(
 ///
 /// Not secret in the way a password is, so it is read as plain input — and it
 /// must happen before any alternate screen is entered.
-fn prompt_otp() -> Result<String> {
+fn prompt_otp() -> std::io::Result<String> {
     use std::io::{BufRead, Write};
 
     print!("DSM 2-step verification code: ");

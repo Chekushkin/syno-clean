@@ -165,6 +165,81 @@ pub fn api_unavailable_message(api: &str, reason: ApiUnavailableReason) -> Strin
     }
 }
 
+/// A startup diagnostic for a NAS that could not be reached or logged in to.
+///
+/// Printed **instead of** entering the TUI: a table that is empty because the
+/// program never got a session looks exactly like a NAS with no downloads on
+/// it, and the user would have no way to tell which they were looking at. Three
+/// lines, in the order the reader needs them:
+///
+/// 1. what failed, naming the host and port that were tried and the account
+/// 2. the underlying error, including the DSM code's meaning via [`Error`]'s
+///    own `Display` (so `dsm_message` is reached exactly once, here as
+///    everywhere else)
+/// 3. one hint, chosen from the failure — see [`connection_hint`]
+pub fn connection_diagnostic(err: &Error, target: &str, username: &str) -> String {
+    let headline = if is_auth_failure(err) {
+        format!("cannot log in to {target} as {username}")
+    } else {
+        format!("cannot reach {target}")
+    };
+    format!("{headline}\n  {err}\n  hint: {}", connection_hint(err))
+}
+
+/// Whether a failure is about credentials rather than connectivity.
+fn is_auth_failure(err: &Error) -> bool {
+    match err {
+        Error::Auth(_) => true,
+        Error::Dsm { api, .. } => api == AUTH_API,
+        _ => false,
+    }
+}
+
+/// The one thing most likely to fix this failure.
+///
+/// Deliberately a single sentence per case: a wall of possibilities is a wall
+/// the user scrolls past. The DSM-code cases lean on the auth table above —
+/// "no such account or incorrect password" and "blocked IP source" need very
+/// different next steps.
+pub fn connection_hint(err: &Error) -> String {
+    match err {
+        Error::Http(_) => "check the host, the port and that DSM is reachable — HTTPS is 5001 \
+             and HTTP is 5000 by default, and a self-signed certificate needs --insecure"
+            .to_string(),
+        Error::Dsm { code, api } if api == AUTH_API => auth_hint(*code).to_string(),
+        Error::Dsm { code: 105, .. } => {
+            "this DSM account lacks permission — grant it Download Station and File Station \
+             access in Control Panel > User"
+                .to_string()
+        }
+        Error::Dsm { code, api } => format!(
+            "{api} refused the request: {}",
+            dsm_message(*code, api.as_str())
+        ),
+        Error::ApiUnavailable { .. } => {
+            "install and start the package in DSM's Package Center, then try again".to_string()
+        }
+        Error::Auth(_) => "check the account name and SYNO_CLEAN_PASSWORD".to_string(),
+        _ => "check the configuration and the log file for details".to_string(),
+    }
+}
+
+/// Next step for a login DSM rejected.
+fn auth_hint(code: i32) -> &'static str {
+    match code {
+        400 => "check the account name and the password (SYNO_CLEAN_PASSWORD, or the prompt)",
+        401 => "this DSM account is disabled — re-enable it in Control Panel > User",
+        402 => "this DSM account may not use Download Station — check its permissions in DSM",
+        OTP_REQUIRED_CODE | 404 | 406 => {
+            "this account uses 2-step verification — set SYNO_CLEAN_OTP or enter the code \
+             at the prompt"
+        }
+        407 => "DSM has blocked this IP — clear it in Control Panel > Security > Auto Block",
+        408..=410 => "the DSM password has expired — change it in DSM, then try again",
+        _ => "check the account name and the password, then the DSM log",
+    }
+}
+
 /// Human-readable text for a DSM numeric error code.
 ///
 /// `api` selects the code table: the 400-range is API-specific, so
@@ -367,5 +442,83 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("/downloads"), "{rendered}");
         assert!(rendered.contains("fewer than two"), "{rendered}");
+    }
+
+    // ---- the startup connection diagnostic ---------------------------------
+
+    const TARGET: &str = "https://nas.local:5001";
+
+    #[test]
+    fn a_login_failure_names_the_account_and_what_the_code_means() {
+        let err = Error::dsm(400, AUTH_API);
+        let diagnostic = connection_diagnostic(&err, TARGET, "eduard");
+        // Where it tried, as whom...
+        assert!(diagnostic.contains("nas.local"), "{diagnostic}");
+        assert!(diagnostic.contains("5001"), "{diagnostic}");
+        assert!(diagnostic.contains("eduard"), "{diagnostic}");
+        assert!(diagnostic.starts_with("cannot log in"), "{diagnostic}");
+        // ...what DSM said, in words rather than as a bare 400...
+        assert!(
+            diagnostic.contains("no such account or incorrect password"),
+            "{diagnostic}"
+        );
+        // ...and what to do about it.
+        assert!(diagnostic.contains("SYNO_CLEAN_PASSWORD"), "{diagnostic}");
+    }
+
+    #[test]
+    fn each_auth_failure_points_somewhere_different() {
+        // These are the codes whose fixes are in completely different places;
+        // rendering them all as "check your password" is the failure mode.
+        let hint = |code| connection_hint(&Error::dsm(code, AUTH_API));
+        assert!(hint(401).contains("disabled"), "{}", hint(401));
+        assert!(hint(402).contains("permissions"), "{}", hint(402));
+        assert!(
+            hint(OTP_REQUIRED_CODE).contains("SYNO_CLEAN_OTP"),
+            "{}",
+            hint(OTP_REQUIRED_CODE)
+        );
+        assert!(hint(407).contains("Auto Block"), "{}", hint(407));
+        assert!(hint(409).contains("expired"), "{}", hint(409));
+        // An auth code nobody has documented still gets a usable next step.
+        assert!(!hint(499).is_empty());
+    }
+
+    #[test]
+    fn a_non_auth_failure_reads_as_a_connection_problem() {
+        let err = Error::dsm(105, OTHER_API);
+        let diagnostic = connection_diagnostic(&err, TARGET, "eduard");
+        assert!(diagnostic.starts_with("cannot reach"), "{diagnostic}");
+        assert!(diagnostic.contains("nas.local:5001"), "{diagnostic}");
+        assert!(diagnostic.contains("Download Station"), "{diagnostic}");
+    }
+
+    #[test]
+    fn a_missing_package_says_to_install_it() {
+        let err = Error::api_missing("SYNO.FileStation.List");
+        let diagnostic = connection_diagnostic(&err, TARGET, "eduard");
+        assert!(
+            diagnostic.contains("File Station is not installed"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("Package Center"), "{diagnostic}");
+    }
+
+    #[test]
+    fn every_diagnostic_is_headline_error_and_hint() {
+        for err in [
+            Error::dsm(400, AUTH_API),
+            Error::dsm(101, OTHER_API),
+            Error::api_missing("SYNO.DownloadStation.Task"),
+            Error::Auth("no sid in the login response".into()),
+            Error::config("nothing configured"),
+        ] {
+            let diagnostic = connection_diagnostic(&err, TARGET, "eduard");
+            let lines: Vec<&str> = diagnostic.lines().collect();
+            assert_eq!(lines.len(), 3, "{diagnostic}");
+            assert!(lines[1].trim() == err.to_string(), "{diagnostic}");
+            assert!(lines[2].starts_with("  hint: "), "{diagnostic}");
+            assert!(lines[2].len() > "  hint: ".len(), "{diagnostic}");
+        }
     }
 }

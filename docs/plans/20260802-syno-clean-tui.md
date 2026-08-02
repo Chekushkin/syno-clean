@@ -650,12 +650,24 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 - Modify: `src/app.rs`
 - Modify: `src/config.rs`
 
-- [ ] implement the `?` help overlay listing every keybinding, dismissed with any key
-- [ ] when required values are unresolved after the merge (per Task 3), write a commented config template to the config path and print an actionable message — do **not** enter the TUI; a merely-missing config file with sufficient CLI/env values must still run
-- [ ] make connection/auth failures print a clear diagnostic (host, port, DSM error meaning) and exit non-zero rather than showing an empty table
-- [ ] show a helpful empty state when there are zero tasks, and a distinct one when a filter/search hides everything
-- [ ] write a test for config-template generation (the produced template round-trips through the parser)
-- [ ] run `cargo test` — must pass before task 18
+- [x] implement the `?` help overlay listing every keybinding, dismissed with any key — `dialog::HELP_SECTIONS` (data) + `render_help`, two columns, `App::show_help` / `close_help`
+- [x] when required values are unresolved after the merge (per Task 3), write a commented config template to the config path and print an actionable message — do **not** enter the TUI; a merely-missing config file with sufficient CLI/env values must still run — `config::missing_required` + `CONFIG_TEMPLATE` + `write_config_template`, dispatched by `main::first_run`
+- [x] make connection/auth failures print a clear diagnostic (host, port, DSM error meaning) and exit non-zero rather than showing an empty table — `error::connection_diagnostic` / `connection_hint`, applied to discovery and login in `main::startup_failure`
+- [x] show a helpful empty state when there are zero tasks, and a distinct one when a filter/search hides everything — `ui::empty_state` keyed on `App::tasks.is_empty()`, plus `ui::narrowing_summary`
+- [x] write a test for config-template generation (the produced template round-trips through the parser) — parses as written (an empty layer) **and** parses with every key uncommented, plus a check that it documents all of `KNOWN_KEYS`
+- [x] run `cargo test` — must pass before task 18 — 479 tests pass (27 new)
+
+⚠️ **Decisions taken during Task 17** (plan text above kept verbatim; actuals recorded here):
+- ➕ **Three files beyond the plan's list**: `src/main.rs` (the first-run dispatch and the startup diagnostic both live in the startup path), `src/ui/mod.rs` (the empty states and the overlay's draw call), and `src/error.rs` (the diagnostic belongs with the DSM code table it renders).
+- **"Required values unresolved" is asked with the same resolution `merge` enforces, not a second copy.** `merge`'s host/username resolution was factored into `resolved_host`/`resolved_username`, and ➕ `config::missing_required` reports on those; a test asserts `missing_required(..).any()` and `merge(..).is_err()` never disagree. `main` asks *before* merging so it can write a template instead of surfacing an error, and `merge` still validates for every other caller. **No error-enum variant was added** — same restraint as Tasks 2 and 4.
+- **The template has every key commented out.** A starter config shipping a live `host = "nas.local"` would send the next invocation at a host the user never named. It therefore parses as an *empty* layer, which is what one test asserts; a second uncomments every example line and asserts the result is a full, unknown-key-free `Config`, so a typo in a key name cannot ship.
+- **An existing config file is never overwritten** (`create_new`), and a template that could not be written appends its own error rather than replacing the message about what is actually missing.
+- 🔺 **`Enter` on the confirmation and in the search box are documented as implemented, not as the plan's Keybindings table describes** (Tasks 14 and 12 already deviated; the overlay is what users read). The table's `Esc`/`d`/`p`/`u`/`s`/`S`/`f`/`/`/`r`/`?`/`q` all match. The overlay additionally documents keys the table never listed: `Tab`/`←`/`→`/`h`/`l` focus switching, `y`/`n` in the modal, `Backspace` in the search box and `Ctrl-C`.
+- **Any key closes the help and does nothing else.** Dismissing with `d` must not also open a delete confirmation — the screen that exists to remove surprises cannot be the one that causes one. `?` is Normal-mode only: in the search box it is a character, in the confirmation it is unbound.
+- **The overlay drops its inter-section blank lines rather than clipping** when the terminal is short, and `split_columns` minimizes the *taller* column rather than the difference between them. Both exist so the whole card fits **80x24**, which two tests pin.
+- **The empty state is chosen by `tasks.is_empty()`, not `View::is_narrowed()`.** With zero tasks and a filter set both are true, and blaming the filter sends the user pressing `f` at a NAS that has nothing to show. The narrowed state names how many rows are hidden and by what (`filter Error and search "zzz"`), so the fix is on screen rather than guessed at.
+- **Startup failures exit non-zero with a three-line diagnostic** (what failed and where, the error including the DSM code's meaning, one hint) and never reach the TUI; a poll failure *during* a session stays the non-fatal banner from Task 11. `main::authenticate` now returns `error::Result` so the same diagnostic covers discovery, login and the `--dump-*` modes.
+- ➕ 27 tests, none needing a TTY or a network: the template round-trip and the missing-required/merge agreement in `config`, the diagnostic's shape and every auth-code hint in `error`, the help data and layout in `ui::dialog` (including the cross-check that every bound key is documented), the `?` state machine in `app`, and `TestBackend` frames for both empty states and the overlay at six terminal sizes. `CLAUDE.md` gained a "Help overlay and first run" section.
 
 ### Task 18: Open-source scaffolding
 

@@ -33,7 +33,7 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 
 use crate::app::{App, Mode};
@@ -221,6 +221,10 @@ pub fn render(frame: &mut Frame, app: &App) {
             app.confirm_focus(),
         );
     }
+
+    if app.mode == Mode::Help {
+        dialog::render_help(frame, frame.area());
+    }
 }
 
 /// The title bar: what this is on the left, how much of it is on screen on the
@@ -247,19 +251,66 @@ fn render_title_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 /// The body when the table has no rows to show.
 ///
-/// "There is nothing on the NAS" and "your filter hides everything" are
-/// different problems with different fixes, so they read differently. Task 17
-/// owns the polished wording.
+/// **"The NAS has no tasks" and "your filter is hiding all of them" are
+/// different problems with different fixes**, and a user who cannot tell them
+/// apart will go looking for a network fault that is really an `f` press. So
+/// the two states name their own cause and their own way out:
+///
+/// * nothing to show at all → say so, and point at refresh
+/// * rows exist but none survive the view → say **how many** are hidden and
+///   **what is hiding them** (the live filter and query, from
+///   [`narrowing_summary`]), then name the keys that widen it again
+///
+/// The test for which one to draw is [`App::tasks`] being empty, *not*
+/// [`View::is_narrowed`]: with zero tasks and a filter set, both are true and
+/// only the first is the user's actual problem.
 fn empty_state(app: &App) -> Paragraph<'static> {
-    let message = if app.view.is_narrowed() {
-        "No tasks match the current filter"
+    let (headline, hint) = if app.tasks.is_empty() {
+        (
+            "No Download Station tasks".to_string(),
+            "nothing is queued on the NAS · r refresh · ? help · q quit".to_string(),
+        )
     } else {
-        "No tasks"
+        let total = app.tasks.len();
+        let plural = if total == 1 { "task" } else { "tasks" };
+        (
+            "No tasks match the current view".to_string(),
+            format!(
+                "all {total} {plural} hidden by {} · f filter · / search · Esc clears the selection",
+                narrowing_summary(&app.view)
+            ),
+        )
     };
 
-    Paragraph::new(message)
-        .centered()
-        .block(Block::new().padding(Padding::top(1)))
+    Paragraph::new(vec![
+        Line::from(headline),
+        Line::from(Span::styled(
+            hint,
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+    ])
+    .centered()
+    .block(Block::new().padding(Padding::top(1)))
+}
+
+/// What is currently hiding rows, as a phrase for the empty state.
+///
+/// Only the parts that narrow — the sort orders rows, it never removes them —
+/// so the sentence names something the user can actually undo.
+fn narrowing_summary(view: &View) -> String {
+    let mut parts = Vec::new();
+    if view.filter != StatusFilter::All {
+        parts.push(format!("filter {}", view.filter.label()));
+    }
+    if !view.search.is_empty() {
+        parts.push(format!("search \"{}\"", view.search));
+    }
+    if parts.is_empty() {
+        // Unreachable in practice — with nothing narrowing, every task is
+        // visible — but the sentence must still parse if it ever is reached.
+        return "the current view".to_string();
+    }
+    parts.join(" and ")
 }
 
 /// How many tasks are selected and how much space deleting them would free.
@@ -418,7 +469,11 @@ mod tests {
 
         assert!(lines[0].contains(env!("CARGO_PKG_NAME")), "{:?}", lines[0]);
         assert!(lines[0].contains("0 / 0 tasks"), "{:?}", lines[0]);
-        assert!(lines.iter().any(|line| line.contains("No tasks")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("No Download Station tasks"))
+        );
         // No table header when there is no table.
         assert!(!lines.iter().any(|line| line.contains("Destination")));
         assert!(lines[7].contains(NORMAL_HINTS), "{:?}", lines[7]);
@@ -500,11 +555,111 @@ mod tests {
 
     #[test]
     fn a_narrowed_view_with_no_matches_reads_differently_from_no_tasks() {
-        let mut app = App::default();
+        let mut app = App::new(fixture_tasks());
         app.view.search = "no-such-task".to_string();
-        assert!(frame_text(&app, 60, 8).contains("No tasks match"));
+        let narrowed = frame_words(&app, 90, 8);
+        assert!(
+            narrowed.contains("No tasks match the current view"),
+            "{narrowed}"
+        );
+        // It says how many rows are hidden and what is hiding them, so the fix
+        // is on screen rather than guessed at.
+        assert!(narrowed.contains("all 14 tasks hidden"), "{narrowed}");
+        assert!(narrowed.contains("search \"no-such-task\""), "{narrowed}");
+        assert!(narrowed.contains("f filter"), "{narrowed}");
+
         // ...whereas a plain empty list does not claim a filter is to blame.
-        assert!(!frame_text(&App::default(), 60, 8).contains("No tasks match"));
+        let empty = frame_words(&App::default(), 90, 8);
+        assert!(empty.contains("No Download Station tasks"), "{empty}");
+        assert!(!empty.contains("No tasks match"), "{empty}");
+        assert!(empty.contains("r refresh"), "{empty}");
+    }
+
+    #[test]
+    fn zero_tasks_beats_a_filter_as_the_explanation() {
+        // Both are true with an empty list and a filter set, and only one of
+        // them is the user's actual problem: pressing `f` will not conjure a
+        // download that does not exist.
+        let mut app = App::default();
+        app.view.filter = StatusFilter::Seeding;
+        app.view.search = "anything".to_string();
+        assert!(app.view.is_narrowed());
+
+        let text = frame_words(&app, 90, 8);
+        assert!(text.contains("No Download Station tasks"), "{text}");
+        assert!(!text.contains("hidden"), "{text}");
+    }
+
+    #[test]
+    fn the_narrowed_empty_state_names_both_the_filter_and_the_search() {
+        let mut app = App::new(fixture_tasks());
+        app.view.filter = StatusFilter::Error;
+        app.view.search = "zzz".to_string();
+        let text = frame_words(&app, 90, 8);
+        assert!(text.contains("filter Error and search \"zzz\""), "{text}");
+    }
+
+    // ---- the help overlay --------------------------------------------------
+
+    #[test]
+    fn the_help_overlay_draws_over_the_table_with_every_binding_on_it() {
+        let mut app = App::new(fixture_tasks());
+        app.show_help();
+        let text = frame_words(&app, 120, 40);
+
+        assert!(text.contains(dialog::HELP_TITLE), "{text}");
+        assert!(text.contains(dialog::HELP_DISMISS), "{text}");
+        for section in dialog::HELP_SECTIONS {
+            assert!(text.contains(section.title), "{} missing", section.title);
+            for entry in section.entries {
+                assert!(text.contains(entry.action), "{:?} missing", entry.action);
+            }
+        }
+        // The table is still underneath, but the overlay is over it.
+        assert!(text.contains("Destination"), "{text}");
+    }
+
+    #[test]
+    fn the_help_overlay_never_overflows_the_terminal() {
+        let mut app = App::new(fixture_tasks());
+        app.show_help();
+        // Including sizes too narrow for two columns and too short for the
+        // whole card: it clips, it does not panic or spill.
+        for (width, height) in [(120, 40), (100, 30), (80, 24), (60, 20), (30, 10), (1, 1)] {
+            let lines = frame_lines(&app, width, height);
+            assert_eq!(lines.len(), usize::from(height), "{width}x{height}");
+            for line in &lines {
+                assert_eq!(
+                    line.chars().count(),
+                    usize::from(width),
+                    "{width}x{height}: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_whole_card_fits_an_ordinary_terminal() {
+        // 80x24 is the size a help overlay has to work at, and the two-column
+        // layout plus the tightening in `render_help` is what buys it. If a new
+        // section pushes it over, this fails rather than silently clipping the
+        // last bindings off the bottom.
+        let mut app = App::new(fixture_tasks());
+        app.show_help();
+        let text = frame_words(&app, 80, 24);
+        for section in dialog::HELP_SECTIONS {
+            assert!(text.contains(section.title), "{} missing", section.title);
+            for entry in section.entries {
+                assert!(text.contains(entry.action), "{:?} missing", entry.action);
+            }
+        }
+        assert!(text.contains(dialog::HELP_DISMISS), "{text}");
+    }
+
+    #[test]
+    fn the_help_overlay_is_gone_once_the_mode_is() {
+        let app = App::new(fixture_tasks());
+        assert!(!frame_words(&app, 120, 40).contains(dialog::HELP_DISMISS));
     }
 
     #[test]
