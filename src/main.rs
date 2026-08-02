@@ -116,10 +116,12 @@ async fn main() -> Result<()> {
         refresh.clone(),
     );
 
-    let result = run_tui(&mut app, rx, &refresh, Some(&ops)).await;
-    // The poller owns no terminal state, so stopping it is housekeeping rather
-    // than cleanup — but leaving a task mid-request would make the runtime wait
-    // out an in-flight HTTP timeout before the process could exit.
+    let result = run_tui(&mut app, rx, &refresh, Some(&ops), Some(&poller)).await;
+    // The loop's own shutdown already aborted it — it *has* to, before waiting
+    // on any in-flight op batch (see `shutdown`). This second abort covers the
+    // paths that leave `run_tui` through a `?` instead: the poller owns no
+    // terminal state, but leaving a task mid-request would make the runtime
+    // wait out an in-flight HTTP timeout before the process could exit.
     poller.abort();
 
     // A session renewed by the transparent re-login is a different sid from the
@@ -250,7 +252,7 @@ async fn run_fixture(path: &Path) -> Result<()> {
     ));
 
     let (_tx, rx) = event::channel();
-    run_tui(&mut app, rx, &RefreshHandle::new(), None).await
+    run_tui(&mut app, rx, &RefreshHandle::new(), None, None).await
 }
 
 /// The main event loop: draw, wait for whichever comes first — a key press or
@@ -270,7 +272,7 @@ async fn run_fixture(path: &Path) -> Result<()> {
 /// over to stall the runtime at shutdown.
 ///
 /// `ops` is `None` in offline `--fixture` mode, where there is no client to run
-/// anything against.
+/// anything against, and so is `poller` — nothing polls there.
 ///
 /// [`select!`]: tokio::select
 /// [`JoinHandle`]: tokio::task::JoinHandle
@@ -279,6 +281,7 @@ async fn run_tui(
     mut rx: Receiver,
     refresh: &RefreshHandle,
     ops: Option<&OpContext>,
+    poller: Option<&tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
     ui::install_panic_hook();
     let mut terminal = TerminalGuard::new().context(
@@ -294,6 +297,12 @@ async fn run_tui(
 
     while !app.should_quit() {
         in_flight.retain(|handle| !handle.is_finished());
+        // The app refuses `d`, `p` and `u` while a batch is live, so the
+        // refusal is on screen *before* the user commits to a plan. Refusing
+        // only here — after `take_confirmed_delete` had already consumed it —
+        // dropped the plan on the floor and said so in a footer line the
+        // running batch overwrote a moment later.
+        app.set_op_in_flight(!in_flight.is_empty());
 
         terminal.draw(app)?;
         // A page jump is a screenful of the table, so the app is told how tall
@@ -327,21 +336,18 @@ async fn run_tui(
         // A confirmed delete runs as its own task and reports back through the
         // same channel as the poller. The loop does not wait for it: deleting
         // twenty torrents must not freeze the terminal.
-        if let Some(plan) = app.take_confirmed_delete() {
+        //
+        // **One batch at a time.** Two overlapping delete runs would interleave
+        // their pause/delete phases against the same NAS and report two sets of
+        // progress into one footer line, and the second could reach a task the
+        // first had already removed. `App` is what says no (the flag above);
+        // the guard here only decides whether to *drain* the hook, so a plan
+        // that somehow arrived anyway stays armed for the next pass instead of
+        // being taken and thrown away.
+        if in_flight.is_empty()
+            && let Some(plan) = app.take_confirmed_delete()
+        {
             match ops {
-                // One batch at a time. Two overlapping delete runs would
-                // interleave their pause/delete phases against the same NAS and
-                // report two sets of progress into one footer line, and the
-                // second could reach a task the first had already removed.
-                Some(_) if !in_flight.is_empty() => {
-                    app.set_status(
-                        "an operation is still running — wait for it to finish before deleting",
-                    );
-                    tracing::warn!(
-                        items = plan.len(),
-                        "refusing a second batch while one is in flight"
-                    );
-                }
                 Some(ops) => {
                     in_flight.push(event::spawn_delete(ops.clone(), plan, app.delete_options));
                 }
@@ -357,14 +363,10 @@ async fn run_tui(
 
         // `p` / `u`, the same handshake: one batch call off the loop, reporting
         // through the same channel and refreshing the table when it finishes.
-        if let Some(request) = app.take_requested_op() {
+        if in_flight.is_empty()
+            && let Some(request) = app.take_requested_op()
+        {
             match ops {
-                Some(_) if !in_flight.is_empty() => {
-                    app.set_status(format!(
-                        "an operation is still running — wait for it to finish before {} anything",
-                        request.op.label()
-                    ));
-                }
                 Some(ops) => {
                     in_flight.push(event::spawn_task_op(
                         ops.clone(),
@@ -388,10 +390,43 @@ async fn run_tui(
     // exists to prevent — but the user should be looking at their shell while
     // it does, not at a frozen TUI.
     drop(terminal);
-    await_in_flight(in_flight).await;
+    shutdown(rx, poller, in_flight, IN_FLIGHT_GRACE).await;
 
     tracing::info!("exiting");
     Ok(())
+}
+
+/// How long the wait for in-flight op batches may run before it gives up.
+///
+/// Generous — as long as a single File Station delete is itself allowed to take
+/// ([`syno_clean::api::file_station::DELETE_TIMEOUT`]) — because the whole point
+/// of the wait is to let an item get from "the files are gone" to "the task is
+/// gone". Finite, because a wait that cannot end is indistinguishable to the
+/// user from the hang it replaced, and `Ctrl-C` out of it abandons the batch in
+/// exactly the place this code exists to protect.
+const IN_FLIGHT_GRACE: Duration = Duration::from_secs(300);
+
+/// Stop the background work, in the one order that cannot deadlock.
+///
+/// The poller and the op tasks **share one channel**, and the main loop has
+/// stopped draining it. A poller left running keeps pushing a task list every
+/// `refresh_secs` into that channel's [`EVENT_CHANNEL_CAPACITY`] slots; once
+/// they are full the op task's next `OpProgress` send blocks forever and the
+/// wait below never returns — with the terminal already restored, so the only
+/// way out is the `Ctrl-C` that abandons the batch mid-delete. Hence: abort the
+/// poller first, then wait *while draining*.
+///
+/// [`EVENT_CHANNEL_CAPACITY`]: syno_clean::event::EVENT_CHANNEL_CAPACITY
+async fn shutdown(
+    rx: Receiver,
+    poller: Option<&tokio::task::JoinHandle<()>>,
+    in_flight: Vec<tokio::task::JoinHandle<()>>,
+    grace: Duration,
+) {
+    if let Some(poller) = poller {
+        poller.abort();
+    }
+    await_in_flight(rx, in_flight, grace).await;
 }
 
 /// Let any still-running op batch finish before the process goes away.
@@ -400,7 +435,17 @@ async fn run_tui(
 /// `main` would: the runtime shuts down and a delete stops wherever it had got
 /// to. Between the File Station delete and the Download Station one, that is a
 /// task left pointing at data it no longer has.
-async fn await_in_flight(handles: Vec<tokio::task::JoinHandle<()>>) {
+///
+/// **The event channel keeps being drained for the whole wait.** The events
+/// have nowhere to go — there is no terminal left to draw them on — but a task
+/// reporting progress per item is a task that blocks on a full channel, and
+/// blocking it here would wedge the very batch this is waiting for. What is
+/// received is deliberately discarded.
+async fn await_in_flight(
+    mut rx: Receiver,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    grace: Duration,
+) {
     let outstanding: Vec<_> = handles.into_iter().filter(|h| !h.is_finished()).collect();
     if outstanding.is_empty() {
         return;
@@ -410,10 +455,38 @@ async fn await_in_flight(handles: Vec<tokio::task::JoinHandle<()>>) {
         "waiting for {} operation(s) still running on the NAS…",
         outstanding.len()
     );
-    for handle in outstanding {
-        if let Err(err) = handle.await {
-            tracing::warn!(%err, "an operation task did not finish cleanly");
+
+    let joined = async {
+        for handle in outstanding {
+            if let Err(err) = handle.await {
+                tracing::warn!(%err, "an operation task did not finish cleanly");
+            }
         }
+    };
+    tokio::pin!(joined);
+
+    let drained = async {
+        // Once every sender is gone nothing can arrive and nothing can block,
+        // so the `recv` branch switches itself off rather than spinning on the
+        // `None` a closed channel returns immediately and forever.
+        let mut open = true;
+        loop {
+            tokio::select! {
+                () = &mut joined => return,
+                event = rx.recv(), if open => open = event.is_some(),
+            }
+        }
+    };
+
+    if tokio::time::timeout(grace, drained).await.is_err() {
+        tracing::error!(
+            secs = grace.as_secs(),
+            "gave up waiting for an operation still running on the NAS"
+        );
+        eprintln!(
+            "an operation was still running after {}s; exiting anyway — check Download Station",
+            grace.as_secs()
+        );
     }
 }
 
@@ -548,4 +621,110 @@ fn prompt_otp() -> std::io::Result<String> {
     let mut code = String::new();
     std::io::stdin().lock().read_line(&mut code)?;
     Ok(code.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Startup, the terminal and the loop itself all need a TTY or a NAS. What
+    //! is testable here is the shutdown — and it is worth testing, because
+    //! getting it wrong hangs the process *after* the terminal has been
+    //! restored, which looks like a crash and is escapable only by the
+    //! `Ctrl-C` that abandons a delete half-way through.
+
+    use super::*;
+    use syno_clean::event::{EVENT_CHANNEL_CAPACITY, OpKind};
+
+    /// Every wait in these tests is bounded: a shutdown that does not finish is
+    /// exactly the bug, and an unbounded `await` would express it as a hung
+    /// suite rather than as a failure.
+    const TEST_LIMIT: Duration = Duration::from_secs(10);
+
+    /// A batch task that reports progress per item, like `event::run_delete`.
+    ///
+    /// It sends **more events than the channel has slots**, so it can only run
+    /// to completion if somebody is draining the receiving end.
+    fn chatty_batch(tx: event::Sender, items: usize) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            for done in 1..=items {
+                let progress = AppEvent::OpProgress {
+                    op: OpKind::Delete,
+                    done,
+                    total: items,
+                    detail: String::new(),
+                };
+                if tx.send(progress).await.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn quitting_during_a_batch_neither_deadlocks_nor_leaves_the_poller_running() {
+        // The regression: the poller kept filling the shared channel while
+        // nothing drained it, so the delete's next progress send blocked on
+        // backpressure and the wait never returned.
+        let (tx, rx) = event::channel();
+
+        let poller_tx = tx.clone();
+        let poller = tokio::spawn(async move {
+            while poller_tx.send(AppEvent::Tasks(Vec::new())).await.is_ok() {}
+        });
+        let batch = chatty_batch(tx, EVENT_CHANNEL_CAPACITY * 3);
+
+        tokio::time::timeout(
+            TEST_LIMIT,
+            shutdown(rx, Some(&poller), vec![batch], IN_FLIGHT_GRACE),
+        )
+        .await
+        .expect("the shutdown must drain the channel rather than deadlock on it");
+
+        assert!(
+            poller.await.is_err_and(|err| err.is_cancelled()),
+            "the poller must be aborted *before* the wait, not after run_tui returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_never_finishes_does_not_wedge_the_process_forever() {
+        // The bound on the wait. A `Ctrl-C` out of an unbounded one abandons
+        // the batch in the very place the wait exists to protect, so the
+        // program gives up on its own terms and says so.
+        let (tx, rx) = event::channel();
+        let stuck = tokio::spawn(async move {
+            let _tx = tx;
+            std::future::pending::<()>().await;
+        });
+
+        tokio::time::timeout(
+            TEST_LIMIT,
+            shutdown(rx, None, vec![stuck], Duration::from_millis(50)),
+        )
+        .await
+        .expect("the wait is bounded");
+    }
+
+    #[tokio::test]
+    async fn nothing_in_flight_waits_for_nothing() {
+        let (tx, rx) = event::channel();
+        drop(tx);
+        let finished = tokio::spawn(async {});
+        tokio::time::timeout(TEST_LIMIT, async {
+            while !finished.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a task that does nothing finishes");
+
+        // A handle that has already resolved is not something to wait on, and
+        // the quit path must not print the "still running" line for it — nor
+        // may the closed channel spin the drain loop.
+        tokio::time::timeout(
+            TEST_LIMIT,
+            await_in_flight(rx, vec![finished], Duration::from_millis(50)),
+        )
+        .await
+        .expect("an empty wait returns immediately");
+    }
 }
