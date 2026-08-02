@@ -653,6 +653,45 @@ mod tests {
     }
 
     #[test]
+    fn every_column_lines_up_at_every_terminal_width() {
+        // The stronger form of the test above, and the one that pins the whole
+        // point of measuring in display width: a *composed* row, at widths
+        // narrow enough that the CJK and emoji titles are being truncated
+        // mid-title. Every span — cell and gap alike — is exactly its declared
+        // width, so column N begins in the same screen column on every row
+        // whatever the title is made of. A char-count truncation passes the
+        // 120-cell case above and fails here.
+        for total in [60usize, 80, 100, 120, 160, 200] {
+            let widths = column_widths(total);
+            let expected: Vec<usize> = (0..COLUMNS.len())
+                .flat_map(|index| {
+                    if index == 0 {
+                        vec![widths[0]]
+                    } else {
+                        vec![COLUMN_GAP, widths[index]]
+                    }
+                })
+                .collect();
+            for task in fixture_tasks() {
+                for selected in [false, true] {
+                    let spans: Vec<usize> = row_line(&task, selected, &widths)
+                        .spans
+                        .iter()
+                        .map(|span| display_width(&span.content))
+                        .collect();
+                    assert_eq!(spans, expected, "{} at width {total}", task.id);
+                }
+                let spans: Vec<usize> = header_line(&View::default(), &widths)
+                    .spans
+                    .iter()
+                    .map(|span| display_width(&span.content))
+                    .collect();
+                assert_eq!(spans, expected, "the header at width {total}");
+            }
+        }
+    }
+
+    #[test]
     fn a_cjk_title_is_truncated_by_cell_width_not_character_count() {
         let title = &task("dbid_006").title;
         assert!(display_width(title) > title.chars().count());
