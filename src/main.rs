@@ -289,11 +289,53 @@ async fn run_tui(
          (use --dump-api-info or --dump-tasks-json when piping output)",
     )?;
 
-    let mut pending_read = None;
     // Handles for op batches still running. Kept so that (a) a second batch
     // cannot be started on top of a live one and (b) quitting does not abandon
     // one half-way through the three-phase delete.
     let mut in_flight: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // **The loop's result is captured, never returned from here.** A terminal
+    // write that fails — an SSH connection dropped, the window closed, a resize
+    // race — used to leave through a `?` that skipped the wait below entirely,
+    // tearing the runtime down on top of whatever the delete batch was in the
+    // middle of. That is the one outcome the wait exists to prevent, and a
+    // broken terminal is a *more* likely way to reach it than a clean `q`.
+    let loop_result = event_loop(app, &mut rx, refresh, ops, &mut terminal, &mut in_flight).await;
+
+    // Restore the terminal *before* waiting: a batch that is mid-way between
+    // "the files are gone" and "the task is gone" must be allowed to finish —
+    // abandoning it there is the one outcome the whole three-phase ordering
+    // exists to prevent — but the user should be looking at their shell while
+    // it does, not at a frozen TUI.
+    drop(terminal);
+    let finished = shutdown(rx, poller, in_flight, IN_FLIGHT_GRACE).await;
+
+    // The loop's own failure is the more informative one, so it wins.
+    loop_result?;
+    if !finished {
+        anyhow::bail!(
+            "an operation was still running on the NAS and did not finish in time — \
+             check Download Station before assuming it completed"
+        );
+    }
+
+    tracing::info!("exiting");
+    Ok(())
+}
+
+/// Draw, wait, dispatch — until the app says to stop or the terminal fails.
+///
+/// Split out of [`run_tui`] purely so that **every** way out of it, `?`
+/// included, still reaches the shutdown wait.
+async fn event_loop(
+    app: &mut App,
+    rx: &mut Receiver,
+    refresh: &RefreshHandle,
+    ops: Option<&OpContext>,
+    terminal: &mut TerminalGuard,
+    in_flight: &mut Vec<tokio::task::JoinHandle<()>>,
+) -> Result<()> {
+    let mut pending_read = None;
 
     while !app.should_quit() {
         in_flight.retain(|handle| !handle.is_finished());
@@ -384,26 +426,23 @@ async fn run_tui(
         }
     }
 
-    // Restore the terminal *before* waiting: a batch that is mid-way between
-    // "the files are gone" and "the task is gone" must be allowed to finish —
-    // abandoning it there is the one outcome the whole three-phase ordering
-    // exists to prevent — but the user should be looking at their shell while
-    // it does, not at a frozen TUI.
-    drop(terminal);
-    shutdown(rx, poller, in_flight, IN_FLIGHT_GRACE).await;
-
-    tracing::info!("exiting");
     Ok(())
 }
 
-/// How long the wait for in-flight op batches may run before it gives up.
+/// How long a still-running batch may go **without reporting progress** before
+/// the wait gives up on it.
 ///
-/// Generous — as long as a single File Station delete is itself allowed to take
-/// ([`syno_clean::api::file_station::DELETE_TIMEOUT`]) — because the whole point
-/// of the wait is to let an item get from "the files are gone" to "the task is
-/// gone". Finite, because a wait that cannot end is indistinguishable to the
-/// user from the hang it replaced, and `Ctrl-C` out of it abandons the batch in
-/// exactly the place this code exists to protect.
+/// Per item, not per batch: every item of a delete sends an
+/// [`AppEvent::OpProgress`] as it finishes, and each one restarts this clock, so
+/// a twenty-item batch quit part-way is allowed twenty times this rather than
+/// being cut at item seven. Sized as long as a single File Station delete may
+/// itself take ([`syno_clean::api::file_station::DELETE_TIMEOUT`]), which is the
+/// longest one item can legitimately be silent for.
+///
+/// Finite, because a wait that cannot end is indistinguishable to the user from
+/// the hang it replaced, and `Ctrl-C` out of it abandons the batch in exactly
+/// the place this code exists to protect. When it does expire the process says
+/// what was still running and **exits non-zero**.
 const IN_FLIGHT_GRACE: Duration = Duration::from_secs(300);
 
 /// Stop the background work, in the one order that cannot deadlock.
@@ -417,16 +456,20 @@ const IN_FLIGHT_GRACE: Duration = Duration::from_secs(300);
 /// poller first, then wait *while draining*.
 ///
 /// [`EVENT_CHANNEL_CAPACITY`]: syno_clean::event::EVENT_CHANNEL_CAPACITY
+///
+/// Returns whether everything finished; `false` means the wait expired and the
+/// caller must exit non-zero.
+#[must_use]
 async fn shutdown(
     rx: Receiver,
     poller: Option<&tokio::task::JoinHandle<()>>,
     in_flight: Vec<tokio::task::JoinHandle<()>>,
     grace: Duration,
-) {
+) -> bool {
     if let Some(poller) = poller {
         poller.abort();
     }
-    await_in_flight(rx, in_flight, grace).await;
+    await_in_flight(rx, in_flight, grace).await
 }
 
 /// Let any still-running op batch finish before the process goes away.
@@ -439,16 +482,27 @@ async fn shutdown(
 /// **The event channel keeps being drained for the whole wait.** The events
 /// have nowhere to go — there is no terminal left to draw them on — but a task
 /// reporting progress per item is a task that blocks on a full channel, and
-/// blocking it here would wedge the very batch this is waiting for. What is
-/// received is deliberately discarded.
+/// blocking it here would wedge the very batch this is waiting for.
+///
+/// The drained events are *also* what bounds the wait. `grace` is a
+/// **no-progress** timeout, restarted by every item the batch reports, rather
+/// than one budget for the whole remaining queue: a twenty-item delete of large
+/// directories would blow through a single budget and be cut somewhere between
+/// "the files are gone" and "the task is gone", which is precisely the state
+/// this function exists to avoid. Each item is echoed on stderr, so the user
+/// watches the batch drain instead of staring at one line — and if the wait does
+/// expire, the last thing printed names what was still running.
+///
+/// Returns `false` if it gave up.
+#[must_use]
 async fn await_in_flight(
     mut rx: Receiver,
     handles: Vec<tokio::task::JoinHandle<()>>,
     grace: Duration,
-) {
+) -> bool {
     let outstanding: Vec<_> = handles.into_iter().filter(|h| !h.is_finished()).collect();
     if outstanding.is_empty() {
-        return;
+        return true;
     }
 
     eprintln!(
@@ -465,28 +519,77 @@ async fn await_in_flight(
     };
     tokio::pin!(joined);
 
-    let drained = async {
-        // Once every sender is gone nothing can arrive and nothing can block,
-        // so the `recv` branch switches itself off rather than spinning on the
-        // `None` a closed channel returns immediately and forever.
-        let mut open = true;
-        loop {
+    // Once every sender is gone nothing can arrive and nothing can block, so
+    // the `recv` branch switches itself off rather than spinning on the `None`
+    // a closed channel returns immediately and forever.
+    let mut open = true;
+    let mut last_progress: Option<String> = None;
+
+    loop {
+        let step = tokio::time::timeout(grace, async {
             tokio::select! {
-                () = &mut joined => return,
-                event = rx.recv(), if open => open = event.is_some(),
+                () = &mut joined => Step::Finished,
+                event = rx.recv(), if open => Step::Event(event),
+            }
+        })
+        .await;
+
+        match step {
+            Ok(Step::Finished) => return true,
+            Ok(Step::Event(Some(event))) => {
+                if let Some(line) = progress_line(&event) {
+                    eprintln!("  {line}");
+                    last_progress = Some(line);
+                }
+            }
+            Ok(Step::Event(None)) => open = false,
+            Err(_) => {
+                let running = last_progress
+                    .as_deref()
+                    .unwrap_or("an operation that reported no progress at all");
+                tracing::error!(
+                    secs = grace.as_secs(),
+                    running,
+                    "gave up waiting for an operation still running on the NAS"
+                );
+                eprintln!(
+                    "nothing has completed for {}s; exiting anyway — still running after: \
+                     {running}. Check Download Station: a task may have been removed while \
+                     its files were not, or the other way round.",
+                    grace.as_secs()
+                );
+                return false;
             }
         }
-    };
+    }
+}
 
-    if tokio::time::timeout(grace, drained).await.is_err() {
-        tracing::error!(
-            secs = grace.as_secs(),
-            "gave up waiting for an operation still running on the NAS"
-        );
-        eprintln!(
-            "an operation was still running after {}s; exiting anyway — check Download Station",
-            grace.as_secs()
-        );
+/// What the wait saw: the batch finishing, or one event off the channel.
+enum Step {
+    Finished,
+    Event(Option<AppEvent>),
+}
+
+/// How one drained event reads on stderr, or `None` for the events that say
+/// nothing about progress (a poller task list, most of them).
+fn progress_line(event: &AppEvent) -> Option<String> {
+    match event {
+        AppEvent::OpProgress {
+            op,
+            done,
+            total,
+            detail,
+        } => Some(format!("[{done}/{total}] {} · {detail}", op.label())),
+        AppEvent::OpDone {
+            op,
+            succeeded,
+            skipped,
+            failed,
+        } => Some(format!(
+            "{} finished: {succeeded} succeeded, {skipped} skipped, {failed} failed",
+            op.label()
+        )),
+        _ => None,
     }
 }
 
@@ -672,12 +775,13 @@ mod tests {
         });
         let batch = chatty_batch(tx, EVENT_CHANNEL_CAPACITY * 3);
 
-        tokio::time::timeout(
+        let finished = tokio::time::timeout(
             TEST_LIMIT,
             shutdown(rx, Some(&poller), vec![batch], IN_FLIGHT_GRACE),
         )
         .await
         .expect("the shutdown must drain the channel rather than deadlock on it");
+        assert!(finished, "the batch ran to completion");
 
         assert!(
             poller.await.is_err_and(|err| err.is_cancelled()),
@@ -696,12 +800,94 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        tokio::time::timeout(
+        let finished = tokio::time::timeout(
             TEST_LIMIT,
             shutdown(rx, None, vec![stuck], Duration::from_millis(50)),
         )
         .await
         .expect("the wait is bounded");
+        assert!(
+            !finished,
+            "giving up on a live batch must be reported, so the process exits non-zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bound_is_per_item_not_per_batch() {
+        // A twenty-item delete of large directories cannot fit in one budget
+        // sized for a *single* File Station delete, and cutting it at item
+        // seven is exactly the mid-batch abandonment the wait exists to
+        // prevent. Every item reported restarts the clock, so a batch that
+        // keeps making progress runs as long as it needs to.
+        let (tx, rx) = event::channel();
+        let grace = Duration::from_millis(120);
+        let items = 8;
+
+        let batch = tokio::spawn(async move {
+            for done in 1..=items {
+                tokio::time::sleep(grace / 2).await;
+                let progress = AppEvent::OpProgress {
+                    op: OpKind::Delete,
+                    done,
+                    total: items,
+                    detail: format!("item {done}"),
+                };
+                if tx.send(progress).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        // The whole batch takes four grace periods; only its silences are
+        // shorter than one.
+        let finished = tokio::time::timeout(TEST_LIMIT, shutdown(rx, None, vec![batch], grace))
+            .await
+            .expect("the wait is bounded");
+        assert!(
+            finished,
+            "a batch reporting progress must not be cut off by a per-batch budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_goes_silent_mid_way_still_expires() {
+        // The other half: progress *stops* meaning the item in flight has gone
+        // quiet for longer than a single delete may take.
+        let (tx, rx) = event::channel();
+        let grace = Duration::from_millis(80);
+        let stalled = tokio::spawn(async move {
+            let progress = AppEvent::OpProgress {
+                op: OpKind::Delete,
+                done: 1,
+                total: 9,
+                detail: "Some.Release: deleted".to_string(),
+            };
+            let _ = tx.send(progress).await;
+            std::future::pending::<()>().await;
+        });
+
+        let finished = tokio::time::timeout(TEST_LIMIT, shutdown(rx, None, vec![stalled], grace))
+            .await
+            .expect("the wait is bounded");
+        assert!(!finished);
+    }
+
+    #[test]
+    fn the_expiry_message_can_name_what_was_still_running() {
+        // What the user is told when the wait gives up: which item the batch
+        // had got to, not just that "an operation" was running.
+        let line = progress_line(&AppEvent::OpProgress {
+            op: OpKind::Delete,
+            done: 7,
+            total: 20,
+            detail: "Some.Release: deleted".to_string(),
+        })
+        .expect("progress reads as a line");
+        assert!(line.contains("7/20"), "{line}");
+        assert!(line.contains("Some.Release"), "{line}");
+        // A poller task list says nothing about progress and must not restart
+        // the clock's *report* — the poller is aborted first anyway.
+        assert!(progress_line(&AppEvent::Tasks(Vec::new())).is_none());
     }
 
     #[tokio::test]
@@ -720,11 +906,12 @@ mod tests {
         // A handle that has already resolved is not something to wait on, and
         // the quit path must not print the "still running" line for it — nor
         // may the closed channel spin the drain loop.
-        tokio::time::timeout(
+        let completed = tokio::time::timeout(
             TEST_LIMIT,
             await_in_flight(rx, vec![finished], Duration::from_millis(50)),
         )
         .await
         .expect("an empty wait returns immediately");
+        assert!(completed, "nothing outstanding is not a timeout");
     }
 }

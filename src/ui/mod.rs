@@ -598,6 +598,91 @@ mod tests {
     }
 
     #[test]
+    fn the_window_moves_only_at_its_edges_on_a_twelve_row_terminal() {
+        // Found by driving the binary in a pty against the fixture: with the
+        // offset derived from the cursor, the cursor was welded to the bottom
+        // row — no row below it was ever visible while moving down, and a
+        // single Up press slid the whole table up with it.
+        //
+        // Twelve rows is nine body rows for fourteen tasks.
+        let mut app = App::new(fixture_tasks());
+        let height = table_page_size(12);
+        assert_eq!(height, 9);
+        app.set_page_size(height);
+
+        let title = |app: &App, row: usize| app.tasks[app.visible()[row]].title.clone();
+
+        // Down inside the first screenful: nothing scrolls.
+        for _ in 0..8 {
+            app.move_cursor(1);
+        }
+        assert_eq!((app.cursor, app.scroll_offset(height)), (8, 0));
+
+        // Two more presses take the cursor off the bottom edge, and the window
+        // follows by exactly those two rows.
+        app.move_cursor(1);
+        app.move_cursor(1);
+        assert_eq!((app.cursor, app.scroll_offset(height)), (10, 2));
+
+        let text = frame_text_narrow(&app, 160, 12);
+        assert!(
+            text.contains(&title(&app, 10)),
+            "the cursor row is off screen:\n{text}"
+        );
+        assert!(
+            !text.contains(&title(&app, 0)),
+            "row 0 should have scrolled off:\n{text}"
+        );
+
+        // The press that mattered: coming back up *inside* the window must not
+        // move it, so the rows the user is reading stay where they are.
+        app.move_cursor(-1);
+        assert_eq!((app.cursor, app.scroll_offset(height)), (9, 2));
+        assert!(
+            frame_text_narrow(&app, 160, 12).contains(&title(&app, 10)),
+            "the row below the cursor stopped being visible"
+        );
+
+        // Only when the cursor reaches the top edge does it move again.
+        for _ in 0..7 {
+            app.move_cursor(-1);
+        }
+        assert_eq!((app.cursor, app.scroll_offset(height)), (2, 2));
+        app.move_cursor(-1);
+        assert_eq!((app.cursor, app.scroll_offset(height)), (1, 1));
+    }
+
+    #[test]
+    fn a_shrinking_list_pulls_a_stale_window_back_into_range() {
+        // The property the derived offset had for free: whatever is stored, a
+        // refresh that removed rows must never leave the table showing a window
+        // past the end of the list.
+        let mut app = App::new(fixture_tasks());
+        app.set_page_size(4);
+        app.cursor_to_last();
+        assert_eq!(app.scroll_offset(4), 10);
+
+        app.apply_event(crate::event::AppEvent::Tasks(
+            fixture_tasks().into_iter().take(5).collect(),
+        ));
+        assert_eq!(
+            app.scroll_offset(4),
+            1,
+            "the window must follow the list in"
+        );
+        let text = frame_text_narrow(&app, 160, 7);
+        assert!(
+            text.contains(
+                &app.cursor_task()
+                    .expect("a row under the cursor")
+                    .title
+                    .clone()
+            ),
+            "the cursor row is off screen after the list shrank:\n{text}"
+        );
+    }
+
+    #[test]
     fn a_list_far_longer_than_the_screen_scrolls_and_still_fits() {
         // The 500+ task case. The fixture's fourteen tasks never exercise a
         // scrolled window, and the cheapest way a long list breaks is a cursor
@@ -621,8 +706,7 @@ mod tests {
 
         // The window holding the cursor is the last full page, not a partial
         // one scrolled past the end.
-        let offset = table::scroll_offset(app.cursor, total, 40);
-        assert_eq!(offset, total - 40);
+        assert_eq!(app.scroll_offset(40), total - 40);
 
         for (width, height) in [(80_u16, 24_u16), (160, 50)] {
             for line in frame_lines(&app, width, height) {

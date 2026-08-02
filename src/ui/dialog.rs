@@ -19,10 +19,14 @@
 //!
 //! Three rules the dialog exists to enforce:
 //!
-//! * **Refused items are shown, never dropped.** A task the path resolver would
-//!   not touch (`Target::Refused`) is listed as `SKIPPED` with the reason, and
-//!   its bytes are left out of the total. Silently omitting it would let a user
-//!   believe a torrent was cleaned up when it was not.
+//! * **Refused items are shown, never dropped.** While files are being deleted,
+//!   a task the path resolver would not touch (`Target::Refused`) is listed as
+//!   `SKIPPED` with the reason, and its bytes are left out of the total.
+//!   Silently omitting it would let a user believe a torrent was cleaned up when
+//!   it was not. Under `--no-delete-files` the same task is an ordinary
+//!   deletable row — no path is used, so there is nothing to refuse — and the
+//!   dialog says exactly that. Which it is comes from `delete::will_act`, the
+//!   same rule the executor runs on, so the two cannot disagree.
 //! * **The modal says what will actually happen.** With `delete_files = false`
 //!   only the DSM task goes and the files stay; under `--dry-run` nothing goes
 //!   at all. Both are stated in the title *and* in the effect line, because
@@ -39,7 +43,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 
 use crate::app::ConfirmFocus;
-use crate::delete::{DeleteItem, DeleteOptions, DeletePlan};
+use crate::delete::{self, DeleteItem, DeleteOptions, DeletePlan};
 use crate::format::{self, display_width, truncate_ellipsis};
 
 /// Bullet in front of a task that will be deleted.
@@ -113,9 +117,11 @@ pub struct ConfirmSummary {
     pub totals: String,
     /// How many tasks will be deleted.
     pub delete_count: usize,
-    /// How many were refused and will be left alone.
+    /// How many will be left entirely alone — refused items, and only while
+    /// their refusal means something (see [`build_confirmation`]).
     pub skipped_count: usize,
-    /// Bytes the deletable items add up to — refused items excluded.
+    /// Bytes the acted-on items add up to; items nothing happens to are
+    /// excluded.
     pub total_size: u64,
     pub dry_run: bool,
     pub delete_files: bool,
@@ -142,13 +148,23 @@ impl ConfirmSummary {
 /// `options` is a parameter rather than a field of the plan because it is
 /// session state, not per-task state; see [`DeleteOptions`].
 pub fn build_confirmation(plan: &DeletePlan, options: DeleteOptions) -> ConfirmSummary {
-    let delete_count = plan.deletable().count();
-    let skipped_count = plan.refused().count();
-    let total_size = plan.total_size();
+    // What counts as skipped is `plan_delete_ops`' answer, never a second copy
+    // of the rule: under `--no-delete-files` a task whose *path* could not be
+    // resolved is deleted like any other, because no path is used, and a dialog
+    // that still called it SKIPPED would be describing a different program.
+    let acted_on = |item: &&DeleteItem| delete::will_act(item, options);
+    let delete_count = plan.items.iter().filter(acted_on).count();
+    let skipped_count = plan.len() - delete_count;
+    let total_size = plan
+        .items
+        .iter()
+        .filter(acted_on)
+        .map(|item| item.size)
+        .sum();
 
     let mut lines = Vec::with_capacity(plan.len() * 2);
     for item in &plan.items {
-        lines.extend(item_lines(item));
+        lines.extend(item_lines(item, options));
     }
 
     ConfirmSummary {
@@ -165,13 +181,29 @@ pub fn build_confirmation(plan: &DeletePlan, options: DeleteOptions) -> ConfirmS
 }
 
 /// The two lines one item contributes: what it is, then what happens to it.
-fn item_lines(item: &DeleteItem) -> [SummaryLine; 2] {
+fn item_lines(item: &DeleteItem, options: DeleteOptions) -> [SummaryLine; 2] {
+    let deleted = SummaryLine::new(LineKind::Delete, format!("{DELETE_MARKER} {}", item.title));
+
     match (item.path(), item.refusal()) {
         (Some(path), _) => [
-            SummaryLine::new(LineKind::Delete, format!("{DELETE_MARKER} {}", item.title)),
+            deleted,
             SummaryLine::new(
                 LineKind::Path,
                 format!("    {}  {path}", format::bytes(item.size)),
+            ),
+        ],
+        // Refused, but nothing about to be deleted needs the path: the row goes
+        // and the files stay wherever they are. Said in place of the path,
+        // because that is the line the user reads to check the aim.
+        (None, _) if !options.delete_files => [
+            deleted,
+            SummaryLine::new(
+                LineKind::Path,
+                format!(
+                    "    {}  DSM task only — its on-disk location is unknown, and no file \
+                     is touched",
+                    format::bytes(item.size)
+                ),
             ),
         ],
         // A refused item shows no size: it is excluded from the total, and a
@@ -1021,6 +1053,49 @@ mod tests {
             "{:?}",
             summary.totals
         );
+    }
+
+    #[test]
+    fn no_delete_files_lists_a_refused_item_as_deletable_because_no_path_is_used() {
+        // The dialog and the executor must tell the same story. Under this flag
+        // `plan_delete_ops` removes the DSM row of a task whose path could not
+        // be resolved — those are the tasks the flag exists for — so calling it
+        // SKIPPED here would be describing a different program.
+        let options = DeleteOptions {
+            delete_files: false,
+            dry_run: false,
+        };
+        let ids = ["dbid_001", "dbid_013"];
+        let summary = build_confirmation(&plan(&ids), options);
+
+        assert_eq!(summary.delete_count, 2);
+        assert_eq!(summary.skipped_count, 0);
+        assert!(!summary.totals.contains("skipped"), "{:?}", summary.totals);
+        assert!(
+            !body(&summary).contains(SKIP_MARKER),
+            "no row is skipped: {}",
+            body(&summary)
+        );
+        // Its bytes stay on disk with everything else's, so they belong in the
+        // "left on disk" figure.
+        let expected: u64 = ids.iter().map(|id| task(id).size).sum();
+        assert_eq!(summary.total_size, expected);
+        // ...and the row still says its location is unknown, so nobody reads it
+        // as "the files were dealt with".
+        assert!(
+            body(&summary).contains("on-disk location is unknown"),
+            "{}",
+            body(&summary)
+        );
+    }
+
+    #[test]
+    fn deleting_files_still_reports_a_refused_item_as_skipped() {
+        // The other half of the same rule: with files in scope the refusal is
+        // load-bearing again.
+        let summary = summary(&["dbid_001", "dbid_013"]);
+        assert_eq!((summary.delete_count, summary.skipped_count), (1, 1));
+        assert!(body(&summary).contains(SKIP_MARKER));
     }
 
     #[test]

@@ -351,10 +351,16 @@ Supporting rules, each of which exists because the alternative is a guess:
 - **A deselected file still counts towards the common root.** `selected`
   describes what was downloaded, not what is on disk, and filtering to selected
   entries would *resolve* some of the ambiguous cases rule 2 exists to refuse.
-- **Only the absolute `/volumeN` form is stripped.** A relative
-  `volume1/downloads` passes through untouched — a share may legally be named
-  `volume1`. Unrecognized forms (`/volumeUSB1/…`) also pass through and simply
-  fail the existence check later.
+- **Only an absolute destination has its mount point stripped**, and *every*
+  DSM mount spelling counts: `/volume1`, `/volume`, `/volumeUSB1/usbshare1-2`,
+  `/volumeSATA1/…` — anything whose first component starts with `volume`, since
+  on DSM the first component of an absolute path is always a mount point. A
+  relative `volume1/downloads` passes through untouched (a share may legally be
+  named `volume1`), and so does an absolute first component that is *not* a
+  mount (`/downloads` is share-rooted and already correct). Leaving `/volumeUSB1`
+  in place used to build a path File Station has never heard of, and "it fails
+  the existence check later" is **not** harmless: absence is one of the answers
+  the executor may read as "already cleaned up".
 - **An empty normalized destination is refused with its own reason**, because
   `/{name}` names a *share*, and "the task reports no destination" is the message
   the user can act on.
@@ -416,7 +422,12 @@ deleted.
   its own success — `classify_delete_status` fails the phase when
   `path_err_num > 0`.
 - For **incomplete** tasks, "path not found" during the file phase counts as
-  success — Download Station cleans up its own partial data.
+  success — Download Station cleans up its own partial data. For a task that
+  **finished** (`delete::payload_should_exist`: Finished, Seeding, Extracting)
+  it does not: the payload demonstrably existed, so an absent path means the
+  resolved *location* is wrong far more often than it means the files are gone,
+  and deleting the DSM row on that evidence orphans them. That item fails and
+  keeps its task.
 - **"Confirm paused" is a real re-read** (`download_station::task_info`, polled
   until the task reports itself paused, bounded at 15 s). DSM accepting a `pause`
   says the request was queued, not that the task stopped writing. The answer is
@@ -449,12 +460,17 @@ deleted.
   then recursed through a directory DS was writing into. The live read also
   skips the pause *call* for a genuinely idle task, so DSM's "already paused"
   per-task error cannot fail an otherwise good delete.
-- **`DeleteItem::name_source` records where the on-disk name came from**
-  (`FileList` or `Title`), and the executor needs it: an *absent* path is only
-  read as "already cleaned up" for a file-list path. For a name guessed from the
-  display title, absence is at least as likely to mean the guess missed, and
-  removing the DSM task would destroy the only pointer to data still on the
-  volume — so it is a failure. See `event::decide_file_phase`.
+- **An absent path is only benign when something explains the absence**
+  (`event::decide_file_phase`). Three inputs decide it:
+  `DeleteItem::name_source` (`FileList` or `Title` — a name guessed from the
+  display title is at least as likely to have missed as to have been tidied up),
+  the task's status (above), and `event::DeletedPaths` — the set of paths *this
+  process* has already deleted successfully. The last one is what keeps the
+  strictness from becoming a trap: an item whose files went but whose
+  post-delete re-check could not be made fails and keeps its task, and the
+  obvious retry would otherwise hit the refusal for ever. Record the fact where
+  it is known (the delete returning success) rather than reading a failed lookup
+  as a success.
 - **The existence check has four answers, not three.** `PathInfo::Unknown` is a
   `getinfo` response carrying no entry attributable to the requested path — an
   empty `files` array (which is what a shape this client cannot parse produces,
@@ -467,26 +483,37 @@ deleted.
   `path_err_num` alone. That field is `#[serde(default)]` and no real NAS
   response has been captured to check the spelling, so a rename would make a
   delete that removed nothing look finished and clean.
-- ⚠️ **The same `getinfo` answer means opposite things before and after the
-  delete**, and `event::decide_file_phase` / `event::decide_confirm_phase` are
-  deliberately *not* one function. Before: `Unknown` (and any error) is a hard
-  failure — nothing has been touched yet and an unreadable response must not
-  authorize a delete. After: only a path that is **still `Found`** fails.
-  `confirm_deleted` is only ever reached through a `Found` on the same call for
-  the same path, so the shape demonstrably parses on this NAS and an entry that
-  has stopped being attributable is a path that has stopped being there.
-  Demanding a positive `Missing` there made every item of every run half-complete
-  (files gone, task kept, footer reporting FAILED) on any DSM build that answers
-  an absent path with `{"files": []}` — and for a `NameSource::Title` item the
-  retry then hits the Missing+Title refusal, so the task could never be removed
-  at all.
+- ⚠️ **One `getinfo` answer means opposite things before and after the delete**,
+  and `event::decide_file_phase` / `event::decide_confirm_phase` are deliberately
+  *not* one function. That answer is **`Unknown`, and only `Unknown`**. Before:
+  a hard failure — nothing has been touched yet and an unreadable response must
+  not authorize a delete. After: acceptable — `confirm_deleted` is only ever
+  reached through a `Found` on the same call for the same path, so the shape
+  demonstrably parses on this NAS and an entry that has stopped being
+  attributable is a path that has stopped being there. Demanding a positive
+  `Missing` there made every item of every run half-complete (files gone, task
+  kept, footer reporting FAILED) on any DSM build that answers an absent path
+  with `{"files": []}`.
+- ⚠️ **The relaxation stops there.** After the delete, `Found` fails, an
+  `Error(code)` fails (a readable "I could not look" — the shape a directory
+  holding one undeletable entry produces — which says nothing about the path
+  being gone), and a `path_info` call that **errors outright** fails too. Only
+  `Missing` and `Unknown` confirm. A failed re-check used to count as
+  confirmation; that deleted the DSM task on the strength of an answer that never
+  came. The retry-deadlock this was protecting against is handled by
+  `DeletedPaths` instead.
 - **`delete_files = false` drops the file phase *and* the pause.** The pause
   exists only to keep DS out of the way of the file delete; with no file delete a
   failed pause would block a task-only removal for nothing.
-- **A refused item (`Target::Refused`) gets an empty op list** — not even the
-  DSM task goes. The dialog already showed the row as SKIPPED, and removing the
-  task would orphan precisely the data whose location is in doubt. This holds
-  under `--no-delete-files` too.
+- **A refused item (`Target::Refused`) gets an empty op list *while files are
+  being deleted*** — not even the DSM task goes. The dialog showed the row as
+  SKIPPED, and removing the task would orphan precisely the data whose location
+  is in doubt. **Under `--no-delete-files` it is an ordinary deletable row**: no
+  path is used, so the refusal protects nothing, and those tasks (no destination,
+  or a file list with several top-level roots) are exactly the ones that flag
+  exists for — refusing them there left them unremovable by this tool by any
+  route. `delete::will_act` is the single rule; `ui::dialog` reads it too, so the
+  dialog and the executor cannot disagree about which rows are skipped.
 - **`--dry-run` issues no call at all** — not even the read-only `getinfo`
   existence check — and covers **pause and resume as well as delete**. Every
   phase logs what it would do and the item is reported as a *skip*, never a
@@ -598,11 +625,17 @@ deleted.
 - Long statuses are shortened to fit the column (`hash_checking` → `checking`,
   `filehosting_waiting` → `hosting`); an **unknown status is rendered verbatim**
   and coloured magenta, never renamed.
-- **The scroll offset is derived, never stored** (`table::scroll_offset`): a pure
-  function of cursor, row count and viewport height, so no second piece of state
-  can disagree with a cursor a refresh moved. `App` holds only the cursor; the
-  event loop pushes the body height in via `App::set_page_size` after each draw
-  so `PageUp`/`PageDown` move a real screenful.
+- **Scrolling is edge-triggered, and the offset is stored but re-clamped on
+  every use** (`App::scroll`, `App::scroll_offset`, `table::scroll_offset`). The
+  window moves only when the cursor would leave it. Deriving the offset from the
+  cursor alone cannot express that — for any `cursor >= height` there is exactly
+  one answer, `cursor - height + 1`, which welds the cursor to the bottom row, so
+  no row below it is ever visible and one `Up` slides the whole table. The old
+  rationale (a derived value cannot fall out of step with a refresh-moved cursor)
+  is kept by clamping the stored offset against the *current* cursor, row count
+  and viewport height at every read: a stale offset self-corrects. The event loop
+  pushes the body height in via `App::set_page_size` after each draw, and
+  `table::render` re-clamps against the real height of the frame it is drawing.
 - Cursor movement **clamps and never wraps** — a `j` held at the bottom of a long
   list wrapping to the top is how the wrong row gets deleted.
 
@@ -704,6 +737,16 @@ rows are hidden and by what, so the fix is on screen rather than guessed at.
   restored, escapable only by the `Ctrl-C` that abandons the batch between "the
   files are gone" and "the task is gone". The wait is bounded
   (`main::IN_FLIGHT_GRACE`) for the same reason.
+- ⚠️ **Every exit from the loop reaches that wait, `?` included.** The loop body
+  lives in `main::event_loop` and `run_tui` captures its result: a failed
+  terminal write (SSH dropped, window closed, resize race) used to return past
+  the wait entirely, tearing the runtime down on top of whatever item the batch
+  was on. Do not `?` out of `run_tui` before `shutdown`.
+- **`IN_FLIGHT_GRACE` bounds *silence*, not the batch.** Every drained
+  `OpProgress` restarts the clock and is echoed on stderr, so a twenty-item
+  delete gets twenty grace periods rather than one and the user watches it
+  drain. On expiry the process names the last item it saw and **exits non-zero**;
+  a batch cut mid-item is not a successful run.
 - **One op batch at a time, refused in `App` rather than in the loop.** The loop
   pushes `App::set_op_in_flight` before each draw and `d` / `p` / `u` say no on
   the spot. Refusing where the plan is *drained* meant
