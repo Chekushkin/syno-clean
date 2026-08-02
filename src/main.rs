@@ -68,6 +68,10 @@ async fn main() -> Result<()> {
         "starting"
     );
 
+    if resolved.logout {
+        return logout(&resolved, &paths).await;
+    }
+
     if cli.is_dump() {
         return dump(&cli, &resolved, &paths).await;
     }
@@ -336,6 +340,42 @@ async fn dump(cli: &Cli, resolved: &ResolvedConfig, paths: &Paths) -> Result<()>
             .map_err(|err| startup_failure(&err, resolved))?;
         println!("{}", download_station::list_tasks_json(&client).await?);
     }
+    Ok(())
+}
+
+/// The `--logout` mode: invalidate the cached session and stop.
+///
+/// This is the **only** thing that ever calls `SYNO.API.Auth` `logout`. A normal
+/// quit deliberately leaves the session alive — that is what makes the next
+/// start fast — so forgetting it has to be something the user asks for.
+///
+/// No password is resolved: with nothing cached there is no session to end, and
+/// prompting for credentials in order to throw a session away would be an odd
+/// trade. The local entry is dropped **whether or not DSM accepted the call**,
+/// since a sid this program has just tried to invalidate is not one worth
+/// keeping; the DSM error is still surfaced afterwards.
+async fn logout(resolved: &ResolvedConfig, paths: &Paths) -> Result<()> {
+    let session_file = paths.session_file();
+    let key = resolved.session_key();
+    let mut cache = SessionCache::load(&session_file);
+
+    let Some(sid) = cache.sid(&key).map(str::to_string) else {
+        println!("no cached session for {key}");
+        return Ok(());
+    };
+
+    let mut client = SynoClient::new(resolved)?;
+    client
+        .discover()
+        .await
+        .map_err(|err| startup_failure(&err, resolved))?;
+    let result = auth::logout(&client.with_sid(sid)).await;
+
+    cache.remove(&key);
+    cache.save(&session_file)?;
+
+    result.map_err(|err| startup_failure(&err, resolved))?;
+    println!("logged out of {key}");
     Ok(())
 }
 
