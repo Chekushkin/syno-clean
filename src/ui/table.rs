@@ -63,7 +63,7 @@ pub struct Column {
 /// truncated: `Size` holds `1023.0 GiB`, `Progress` holds `Progress▲`, the
 /// speed columns hold `1023.0 MiB/s`.
 pub const COLUMNS: [Column; 11] = [
-    // The selection marker (Task 10) lives here; blank until then.
+    // The selection marker. Headerless: a one-cell heading would be noise.
     Column {
         header: "",
         width: 1,
@@ -135,9 +135,37 @@ pub const MIN_NAME_WIDTH: usize = 12;
 /// Blank cells between columns.
 pub const COLUMN_GAP: usize = 1;
 
+/// What a selected row shows in the [`SELECTION`] column.
+///
+/// Exactly one cell wide (asserted by a test), because the column is one cell
+/// wide and a two-cell glyph here would shear every column to its right.
+pub const SELECTED_MARKER: &str = "✓";
+
 /// The cursor row: reversed, so it reads as a selection in any colour scheme.
 fn cursor_style() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
+}
+
+/// A selected row. Deliberately a *colour* change where the cursor is a
+/// *reversal*, so the two read differently when they land on the same row —
+/// "where I am" and "what is armed" are different questions.
+fn selection_style() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Base style for a row, given whether it is selected and whether the cursor is
+/// on it. The cursor is patched on last, so it always wins where they overlap.
+pub fn row_style(selected: bool, cursor: bool) -> Style {
+    let mut style = Style::default();
+    if selected {
+        style = style.patch(selection_style());
+    }
+    if cursor {
+        style = style.patch(cursor_style());
+    }
+    style
 }
 
 /// The header row.
@@ -242,8 +270,11 @@ pub fn status_style(status: &TaskStatus) -> Style {
 /// The text of every cell of one row, in column order.
 ///
 /// Separated from rendering so the contents can be asserted without a backend:
-/// this is where a wrong formatter or a swapped column shows up.
-pub fn row_cells(task: &Task) -> [String; COLUMNS.len()] {
+/// this is where a wrong formatter or a swapped column shows up. `selected` is
+/// passed in rather than read from the app because a `Task` does not know
+/// whether it is selected — the selection set is keyed by ID and lives on
+/// [`App`].
+pub fn row_cells(task: &Task, selected: bool) -> [String; COLUMNS.len()] {
     let peers = if task.seeders == 0 && task.leechers == 0 {
         DASH.to_string()
     } else {
@@ -256,8 +287,11 @@ pub fn row_cells(task: &Task) -> [String; COLUMNS.len()] {
     };
 
     [
-        // The selection marker is Task 10's; a blank keeps the column reserved.
-        String::new(),
+        if selected {
+            SELECTED_MARKER.to_string()
+        } else {
+            String::new()
+        },
         task.title.clone(),
         status_label(&task.status).to_string(),
         format::bytes(task.size),
@@ -320,8 +354,8 @@ fn compose(
 }
 
 /// One task as a table row.
-pub fn row_line(task: &Task, widths: &[usize]) -> Line<'static> {
-    compose(&row_cells(task), widths, |index| {
+pub fn row_line(task: &Task, selected: bool, widths: &[usize]) -> Line<'static> {
+    compose(&row_cells(task, selected), widths, |index| {
         if index == STATUS {
             status_style(&task.status)
         } else {
@@ -359,12 +393,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         .skip(offset)
         .take(height)
         .map(|(row, &index)| {
-            let line = row_line(&app.tasks[index], &widths);
-            if row == app.cursor {
-                line.style(cursor_style())
-            } else {
-                line
-            }
+            let task = &app.tasks[index];
+            let selected = app.is_selected(&task.id);
+            row_line(task, selected, &widths).style(row_style(selected, row == app.cursor))
         })
         .collect();
 
@@ -483,7 +514,7 @@ mod tests {
 
     #[test]
     fn a_row_reads_the_formatted_values_of_its_task() {
-        let cells = row_cells(&task("dbid_001"));
+        let cells = row_cells(&task("dbid_001"), false);
         assert_eq!(cells[SELECTION], "");
         assert_eq!(cells[NAME], "Ubuntu.24.04.3.LTS.Desktop.amd64");
         assert_eq!(cells[STATUS], "downloading");
@@ -497,7 +528,7 @@ mod tests {
 
     #[test]
     fn an_idle_task_shows_sentinels_rather_than_zeroes() {
-        let cells = row_cells(&task("dbid_004"));
+        let cells = row_cells(&task("dbid_004"), false);
         assert_eq!(cells[STATUS], "paused");
         assert_eq!(cells[5], DASH, "no download speed");
         assert_eq!(cells[6], DASH, "no upload speed");
@@ -507,7 +538,7 @@ mod tests {
     #[test]
     fn a_task_with_no_destination_shows_a_dash_not_an_empty_cell() {
         // dbid_010 has no `additional` block at all.
-        let cells = row_cells(&task("dbid_010"));
+        let cells = row_cells(&task("dbid_010"), false);
         assert_eq!(cells[10], DASH);
         assert_eq!(cells[8], DASH, "no peers either");
     }
@@ -547,22 +578,76 @@ mod tests {
         );
     }
 
+    // ---- selection ---------------------------------------------------------
+
+    #[test]
+    fn a_selected_row_carries_the_marker_and_an_unselected_one_does_not() {
+        assert_eq!(
+            row_cells(&task("dbid_001"), true)[SELECTION],
+            SELECTED_MARKER
+        );
+        assert_eq!(row_cells(&task("dbid_001"), false)[SELECTION], "");
+    }
+
+    #[test]
+    fn the_selection_marker_is_exactly_one_cell_wide() {
+        // A two-cell glyph here would push every column to its right out of
+        // line on selected rows only — the nastiest possible layout bug.
+        assert_eq!(
+            display_width(SELECTED_MARKER),
+            COLUMNS[SELECTION].width,
+            "{SELECTED_MARKER:?}"
+        );
+    }
+
+    #[test]
+    fn selection_and_the_cursor_are_told_apart_in_every_combination() {
+        let plain = row_style(false, false);
+        let selected = row_style(true, false);
+        let cursor = row_style(false, true);
+        let both = row_style(true, true);
+        for (a, b) in [
+            (plain, selected),
+            (plain, cursor),
+            (plain, both),
+            (selected, cursor),
+            (selected, both),
+            (cursor, both),
+        ] {
+            assert_ne!(a, b, "{a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn the_cursor_highlight_survives_landing_on_a_selected_row() {
+        // Patched on last, so the reversal is never lost to the selection
+        // colour: the user must always be able to see where they are.
+        assert!(
+            row_style(true, true)
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
     // ---- padding and truncation -------------------------------------------
 
     #[test]
     fn every_cell_is_padded_to_exactly_its_column_width() {
         let widths = column_widths(120);
         for task in fixture_tasks() {
-            let cells = row_cells(&task);
-            for (index, column) in COLUMNS.iter().enumerate() {
-                let rendered = cell(&cells[index], widths[index], column.align);
-                assert_eq!(
-                    display_width(&rendered),
-                    widths[index],
-                    "column {} of {}: {rendered:?}",
-                    column.header,
-                    task.id
-                );
+            // Selected and not: the marker must not widen its column either.
+            for selected in [false, true] {
+                let cells = row_cells(&task, selected);
+                for (index, column) in COLUMNS.iter().enumerate() {
+                    let rendered = cell(&cells[index], widths[index], column.align);
+                    assert_eq!(
+                        display_width(&rendered),
+                        widths[index],
+                        "column {} of {} (selected={selected}): {rendered:?}",
+                        column.header,
+                        task.id
+                    );
+                }
             }
         }
     }

@@ -36,6 +36,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Padding, Paragraph};
 
 use crate::app::App;
+use crate::format;
 
 /// The backend this program draws on: crossterm over stdout.
 pub type Backend = CrosstermBackend<Stdout>;
@@ -221,11 +222,34 @@ fn empty_state(app: &App) -> Paragraph<'static> {
         .block(Block::new().padding(Padding::top(1)))
 }
 
-/// The footer: the last status message, or the key hints when there is none.
+/// How many tasks are selected and how much space deleting them would free.
+///
+/// `None` when nothing is selected, so the footer is not permanently carrying a
+/// `0 selected` that means nothing. The size is the *reason* the count is worth
+/// showing — reclaiming the volume is the whole point of the tool — so the two
+/// always appear together.
+fn selection_summary(app: &App) -> Option<String> {
+    let count = app.selected_count();
+    if count == 0 {
+        return None;
+    }
+    Some(format!(
+        "{count} selected · {}",
+        format::bytes(app.selected_size())
+    ))
+}
+
+/// The footer: the selection summary, then the last status message or the key
+/// hints. The selection comes first because it is the state that changes what
+/// the next `d` will do.
 fn footer_bar(app: &App) -> Paragraph<'static> {
-    let text = match &app.status_message {
-        Some(message) => format!(" {message} "),
-        None => format!(" {NORMAL_HINTS} "),
+    let tail = match &app.status_message {
+        Some(message) => message.clone(),
+        None => NORMAL_HINTS.to_string(),
+    };
+    let text = match selection_summary(app) {
+        Some(selection) => format!(" {selection} · {tail} "),
+        None => format!(" {tail} "),
     };
     Paragraph::new(Line::from(text)).style(Style::default().add_modifier(Modifier::DIM))
 }
@@ -385,6 +409,43 @@ mod tests {
             lines[7]
         );
         assert!(!lines[7].contains(NORMAL_HINTS));
+    }
+
+    #[test]
+    fn the_footer_reports_the_selection_count_and_the_space_it_would_free() {
+        let mut app = App::new(fixture_tasks());
+        // Nothing selected: no permanent "0 selected" taking up the footer.
+        assert!(!frame_text(&app, 120, 8).contains("selected"));
+
+        app.handle_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('a'),
+        ));
+        let total: u64 = app.tasks.iter().map(|task| task.size).sum();
+        let lines = frame_lines(&app, 120, 8);
+        assert!(lines[7].contains("14 selected"), "{:?}", lines[7]);
+        assert!(
+            lines[7].contains(&crate::format::bytes(total)),
+            "{:?}",
+            lines[7]
+        );
+        // The hints are still there — the summary is a prefix, not a takeover.
+        assert!(lines[7].contains(NORMAL_HINTS), "{:?}", lines[7]);
+    }
+
+    #[test]
+    fn a_selected_row_is_marked_in_the_table() {
+        let mut app = App::new(fixture_tasks());
+        app.toggle_selection();
+        let lines = frame_lines(&app, 140, 20);
+        assert_eq!(
+            lines[2..]
+                .iter()
+                .filter(|line| line.contains(table::SELECTED_MARKER))
+                .count(),
+            1,
+            "exactly the one selected row is marked:\n{}",
+            lines.join("\n")
+        );
     }
 
     #[test]

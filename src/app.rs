@@ -141,6 +141,83 @@ impl App {
         self.page_size
     }
 
+    // ---- selection ---------------------------------------------------------
+    //
+    // The set holds **task IDs**, never row indices. A refresh that reorders
+    // the list, or a filter that hides half of it, therefore cannot silently
+    // reassign what the user selected — the ID either still names a task or it
+    // does not.
+
+    /// Whether `id` is in the selection set.
+    pub fn is_selected(&self, id: &str) -> bool {
+        self.selected.contains(id)
+    }
+
+    /// The selected tasks that still exist, in [`App::tasks`] order.
+    ///
+    /// Selections are dropped when a refresh removes their task (Task 11), but
+    /// the footer must not over-report in the window before that happens, so
+    /// both the count and the size sum are derived from the *tasks*, not from
+    /// the raw set — they can never disagree with each other.
+    pub fn selected_tasks(&self) -> impl Iterator<Item = &Task> {
+        self.tasks
+            .iter()
+            .filter(|task| self.selected.contains(&task.id))
+    }
+
+    /// How many existing tasks are selected.
+    pub fn selected_count(&self) -> usize {
+        self.selected_tasks().count()
+    }
+
+    /// Total size of the selected tasks — the space a delete would free.
+    pub fn selected_size(&self) -> u64 {
+        self.selected_tasks().map(|task| task.size).sum()
+    }
+
+    /// Toggle the row under the cursor (`Space`). A no-op when nothing is
+    /// visible.
+    pub fn toggle_selection(&mut self) {
+        let Some(id) = self.cursor_task().map(|task| task.id.clone()) else {
+            return;
+        };
+        // `remove` reports whether it was there, so this is one lookup, not two.
+        if !self.selected.remove(&id) {
+            self.selected.insert(id);
+        }
+    }
+
+    /// Toggle select-all over the **currently visible rows only** (`a`).
+    ///
+    /// Hidden tasks are never touched in either direction: with a filter or a
+    /// search active, `a` must not quietly arm a delete against rows the user
+    /// cannot see. Selecting is the default; the whole visible set already
+    /// being selected is what turns the key into a deselect.
+    pub fn toggle_select_all_visible(&mut self) {
+        let ids: Vec<String> = self
+            .visible()
+            .into_iter()
+            .map(|index| self.tasks[index].id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+
+        if ids.iter().all(|id| self.selected.contains(id)) {
+            for id in &ids {
+                self.selected.remove(id);
+            }
+        } else {
+            self.selected.extend(ids);
+        }
+    }
+
+    /// Drop the whole selection (`Esc`) — including anything currently hidden,
+    /// which is the point: `Esc` is the "I am not sure what is armed" key.
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+    }
+
     /// Tell the app how tall the table body is, so `PageUp`/`PageDown` move by
     /// a screenful. Clamped to at least one row — a zero-row page would make
     /// the key silently dead.
@@ -239,8 +316,8 @@ impl App {
         }
     }
 
-    /// Keys while browsing the table. Selection lands in Task 10, sort/filter
-    /// and search in Task 12, the operations in Tasks 14-16.
+    /// Keys while browsing the table. Sort/filter and search land in Task 12,
+    /// the operations in Tasks 14-16.
     fn handle_normal_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.quit(),
@@ -250,6 +327,11 @@ impl App {
             KeyCode::PageDown => self.page_down(),
             KeyCode::Home | KeyCode::Char('g') => self.cursor_to_first(),
             KeyCode::End | KeyCode::Char('G') => self.cursor_to_last(),
+            KeyCode::Char(' ') => self.toggle_selection(),
+            KeyCode::Char('a') => self.toggle_select_all_visible(),
+            // Task 12 gives `Esc` its other jobs (leave search, dismiss a
+            // dialog); in Normal mode it is the panic button for a selection.
+            KeyCode::Esc => self.clear_selection(),
             _ => {}
         }
     }
@@ -568,6 +650,154 @@ mod tests {
         app.clamp_cursor();
         assert_eq!(app.cursor, 0);
         assert_eq!(app.cursor_task().map(|t| t.id.as_str()), Some("dbid_004"));
+    }
+
+    // ---- selection ---------------------------------------------------------
+
+    /// The IDs currently selected, sorted so assertions are deterministic.
+    fn selected_ids(app: &App) -> Vec<String> {
+        let mut ids: Vec<String> = app.selected.iter().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn space_toggles_the_row_under_the_cursor_on_and_off() {
+        let mut app = app_with(3);
+        app.handle_key(press(KeyCode::Down));
+
+        app.handle_key(press(KeyCode::Char(' ')));
+        assert_eq!(selected_ids(&app), ["id_001"]);
+        assert!(app.is_selected("id_001"));
+        assert_eq!(app.selected_count(), 1);
+
+        app.handle_key(press(KeyCode::Char(' ')));
+        assert!(app.selected.is_empty());
+        assert!(!app.is_selected("id_001"));
+    }
+
+    #[test]
+    fn space_selects_the_task_not_the_row_number() {
+        // The set holds IDs, so a re-sort that moves the row cannot reassign
+        // the selection to whatever landed in that position.
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char(' ')));
+        let picked = app.tasks[app.visible()[0]].id.clone();
+
+        app.view.toggle_dir();
+        assert_ne!(app.tasks[app.visible()[0]].id, picked, "the sort must move");
+        assert_eq!(selected_ids(&app), [picked]);
+    }
+
+    #[test]
+    fn space_on_an_empty_list_selects_nothing() {
+        let mut app = App::default();
+        app.handle_key(press(KeyCode::Char(' ')));
+        assert!(app.selected.is_empty());
+    }
+
+    #[test]
+    fn a_selects_every_visible_row_and_a_second_press_deselects_them() {
+        let mut app = app_with(4);
+        app.handle_key(press(KeyCode::Char('a')));
+        assert_eq!(app.selected_count(), 4);
+
+        app.handle_key(press(KeyCode::Char('a')));
+        assert_eq!(app.selected_count(), 0);
+    }
+
+    #[test]
+    fn select_all_never_touches_a_task_the_filter_hides() {
+        // The heart of Task 10: with a filter on, `a` must not arm a delete
+        // against rows that are not on screen — in either direction.
+        let mut app = App::new(fixture_tasks());
+        app.view.filter = StatusFilter::Seeding;
+        let visible: Vec<String> = app
+            .visible()
+            .into_iter()
+            .map(|index| app.tasks[index].id.clone())
+            .collect();
+        assert_eq!(visible.len(), 2, "the fixture must have hidden tasks too");
+
+        app.handle_key(press(KeyCode::Char('a')));
+        assert_eq!(selected_ids(&app), visible);
+        assert_eq!(app.selected.len(), 2, "no hidden task was selected");
+
+        // A hidden task selected earlier must survive a visible-set deselect.
+        let hidden = app
+            .tasks
+            .iter()
+            .find(|task| !visible.contains(&task.id))
+            .expect("a hidden task")
+            .id
+            .clone();
+        app.selected.insert(hidden.clone());
+        app.handle_key(press(KeyCode::Char('a')));
+        assert_eq!(
+            selected_ids(&app),
+            [hidden],
+            "deselecting the visible rows must leave the hidden one alone"
+        );
+    }
+
+    #[test]
+    fn select_all_over_a_partial_selection_selects_the_rest_rather_than_clearing() {
+        let mut app = app_with(4);
+        app.handle_key(press(KeyCode::Char(' ')));
+        assert_eq!(app.selected_count(), 1);
+        app.handle_key(press(KeyCode::Char('a')));
+        assert_eq!(app.selected_count(), 4, "a partial set fills up first");
+    }
+
+    #[test]
+    fn select_all_on_an_empty_visible_set_is_a_no_op() {
+        let mut app = App::new(fixture_tasks());
+        app.view.search = "no-such-task".to_string();
+        assert_eq!(app.visible_count(), 0);
+        app.handle_key(press(KeyCode::Char('a')));
+        assert!(app.selected.is_empty());
+    }
+
+    #[test]
+    fn esc_clears_the_whole_selection_including_hidden_tasks() {
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('a')));
+        assert_eq!(app.selected_count(), 14);
+
+        app.view.filter = StatusFilter::Seeding;
+        app.handle_key(press(KeyCode::Esc));
+        assert!(
+            app.selected.is_empty(),
+            "Esc clears everything, not just the visible rows"
+        );
+        assert_eq!(app.selected_count(), 0);
+        assert_eq!(app.selected_size(), 0);
+    }
+
+    #[test]
+    fn the_selected_size_is_the_sum_of_the_selected_tasks() {
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('a')));
+        let total: u64 = app.tasks.iter().map(|task| task.size).sum();
+        assert_eq!(app.selected_size(), total);
+        assert!(total > 0, "the fixture must have sizes to sum");
+
+        // ...and drops back to just the remaining task when one is deselected.
+        let first = app.tasks[app.visible()[0]].clone();
+        app.handle_key(press(KeyCode::Char(' ')));
+        assert_eq!(app.selected_size(), total - first.size);
+        assert_eq!(app.selected_count(), 13);
+    }
+
+    #[test]
+    fn a_selected_id_with_no_task_behind_it_is_not_counted_or_summed() {
+        // Task 11 prunes these on refresh; until it does, the footer must not
+        // claim a task that is not there.
+        let mut app = app_with(2);
+        app.selected.insert("id_000".to_string());
+        app.selected.insert("ghost".to_string());
+        assert_eq!(app.selected_count(), 1);
+        assert_eq!(app.selected_size(), 0);
     }
 
     // ---- fixture mode ------------------------------------------------------

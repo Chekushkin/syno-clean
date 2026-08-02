@@ -464,12 +464,22 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 - Modify: `src/app.rs`
 - Modify: `src/ui/table.rs`
 
-- [ ] store selection as a `HashSet<String>` of **task IDs**, not row indices
-- [ ] implement `toggle_selection()` (Space), `toggle_select_all_visible()` (`a`), `clear_selection()` (Esc)
-- [ ] render a selection marker column and highlight selected rows distinctly from the cursor row
-- [ ] show selection count and the summed size of selected tasks in the footer
-- [ ] write tests for toggle on/off, select-all over a *filtered* subset (must not touch hidden tasks), clear, and the size sum
-- [ ] run `cargo test` — must pass before task 11
+- [x] store selection as a `HashSet<String>` of **task IDs**, not row indices — the field already existed from Task 8; this task added `is_selected` / `selected_tasks` / `selected_count` / `selected_size` around it
+- [x] implement `toggle_selection()` (Space), `toggle_select_all_visible()` (`a`), `clear_selection()` (Esc)
+- [x] render a selection marker column and highlight selected rows distinctly from the cursor row — `table::SELECTED_MARKER` (`✓`) in the reserved column-0, and `table::row_style(selected, cursor)`: selection is a *colour* (bold yellow), the cursor a *reversal*, so all four combinations read differently
+- [x] show selection count and the summed size of selected tasks in the footer — `ui::selection_summary`, prefixed to the status message/hints and omitted entirely when nothing is selected
+- [x] write tests for toggle on/off, select-all over a *filtered* subset (must not touch hidden tasks), clear, and the size sum
+- [x] run `cargo test` — must pass before task 11 — 240 tests pass
+
+⚠️ **Decisions taken during Task 10** (plan text above kept verbatim; actuals recorded here):
+- **`a` on a *partially* selected visible set selects the rest rather than clearing.** Only "every visible row is already selected" turns the key into a deselect. Selecting is the common intent, and a key that sometimes clears a half-built selection is the one that loses work.
+- **`a` never touches a hidden task in either direction.** Selecting is confined to the visible IDs, and so is the deselect: a task selected before a filter was applied survives an `a`/`a` on the narrowed set. Two assertions in `select_all_never_touches_a_task_the_filter_hides` cover both halves.
+- **`Esc` clears the *whole* set, hidden rows included** — the opposite of `a`, deliberately. `Esc` is the key a user reaches for when they are not sure what is armed, so leaving invisible selections behind would defeat it.
+- **The footer counts and sums `selected_tasks()`** (selected IDs that still name a real task), not `selected.len()`. Task 11 prunes vanished IDs on refresh; until it runs, the raw length would over-report while the size sum did not, and the two disagreeing in the footer is worse than either being briefly low.
+- `row_cells` and `row_line` gained a `selected: bool` parameter rather than taking `&App`: a `Task` does not know whether it is selected, and threading the flag keeps both functions assertable without constructing an app.
+- The selection marker is asserted to be **exactly one cell wide** (`the_selection_marker_is_exactly_one_cell_wide`). A two-cell glyph in a one-cell column would shear every column to its right on selected rows only — the hardest layout bug of this table to spot by eye.
+- ➕ 16 tests added (11 in `app`, 4 in `ui::table`, 2 in `ui`), and `every_cell_is_padded_to_exactly_its_column_width` now runs over both selected and unselected rows.
+- Space deliberately does **not** advance the cursor after toggling. Vim-style "select and move" is convenient for runs of adjacent rows and wrong everywhere else; with `d` acting on the selection, a cursor that drifts is how the wrong row ends up under a later un-selected `d`.
 
 ### Task 11: Async poller and live refresh
 
