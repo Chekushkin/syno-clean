@@ -285,14 +285,27 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 - Create: `src/cli.rs`
 - Modify: `src/main.rs`
 
-- [ ] define `Cli` with clap derive: `--config`, `--host`, `--user`, `--port`, `--insecure`, `--refresh-secs`, `--no-delete-files`, `--log-file`, `--dry-run`, `--logout`, `--version`
-- [ ] define `Config` with serde defaults and `load(path)` reading TOML from the XDG config dir via `etcetera`; unknown keys warn and are ignored (**no** `deny_unknown_fields` — an older binary must tolerate a newer config)
-- [ ] implement `apply_env(&mut Config)` for `SYNO_CLEAN_{HOST,PORT,HTTPS,INSECURE,USERNAME,PASSWORD,OTP,REFRESH_SECS}`
-- [ ] implement `merge(config, env, cli) -> Result<ResolvedConfig>` enforcing CLI > env > file > default **and validating that `host` and `username` are present**, so later modules can assume them; plus `resolve_password()` (env, else `rpassword` prompt)
-- [ ] implement sid cache read/write at the XDG cache dir with `0600` permissions, **keyed by `{host}:{port}/{username}`** so two NASes or accounts do not evict each other
-- [ ] initialize `tracing` to the log file (never stdout) and **hold the `tracing_appender::WorkerGuard` for the process lifetime** — dropping it early silently discards buffered log lines
-- [ ] write tests for precedence merge (CLI beats env beats file beats default), for validation failing when host/username are unresolved, and for TOML parsing (full file, minimal file, unknown key ignored not rejected)
-- [ ] run `cargo test` — must pass before task 4
+- [x] define `Cli` with clap derive: `--config`, `--host`, `--user`, `--port`, `--insecure`, `--refresh-secs`, `--no-delete-files`, `--log-file`, `--dry-run`, `--logout`, `--version`
+- [x] define `Config` with serde defaults and `load(path)` reading TOML from the XDG config dir via `etcetera`; unknown keys warn and are ignored (**no** `deny_unknown_fields` — an older binary must tolerate a newer config)
+- [x] implement `apply_env(&mut Config)` for `SYNO_CLEAN_{HOST,PORT,HTTPS,INSECURE,USERNAME,PASSWORD,OTP,REFRESH_SECS}` — as `Config::apply_env(&mut self, EnvLookup)` plus the pure `Config::from_env`; `PASSWORD`/`OTP` are not config fields and are read by `resolve_password` / `otp_from_env`
+- [x] implement `merge(config, env, cli) -> Result<ResolvedConfig>` enforcing CLI > env > file > default **and validating that `host` and `username` are present**, so later modules can assume them; plus `resolve_password()` (env, else `rpassword` prompt)
+- [x] implement sid cache read/write at the XDG cache dir with `0600` permissions, **keyed by `{host}:{port}/{username}`** so two NASes or accounts do not evict each other
+- [x] initialize `tracing` to the log file (never stdout) and **hold the `tracing_appender::WorkerGuard` for the process lifetime** — dropping it early silently discards buffered log lines
+- [x] write tests for precedence merge (CLI beats env beats file beats default), for validation failing when host/username are unresolved, and for TOML parsing (full file, minimal file, unknown key ignored not rejected)
+- [x] run `cargo test` — must pass before task 4 — 50 tests pass
+
+⚠️ **Decisions taken during Task 3** (plan text above kept verbatim; actuals recorded here):
+- **Environment reads go through an injected lookup**, `pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>`, not `std::env` directly. `main` passes `config::system_env`. Tests build a `HashMap`-backed closure, so no test mutates process-global env and the suite stays parallel-safe.
+- **Filesystem locations go through a `Paths` value** with `Paths::discover()` (etcetera XDG) in production and `Paths::with_base(dir)` in tests. No test reads or writes the real `~/.config/syno-clean` or `~/.cache/syno-clean`. Added `tempfile` as a **dev-dependency** for the temp roots.
+- `Config` fields are all `Option<T>` with a container-level `#[serde(default)]` rather than concrete serde defaults: precedence needs "absent" and "explicitly set to the default value" to stay distinguishable. Concrete defaults live as `DEFAULT_*` consts applied in `merge`.
+- `apply_env` and `from_env` return `Result`: an unparseable `SYNO_CLEAN_PORT=abc` is an error naming the variable, not a silent fall-through to the file value.
+- **Default port follows the scheme** — 5001 when https (the default), 5000 when not — rather than a single constant.
+- **`refresh_secs = 0` is rejected** in `merge` rather than clamped; a zero-second poll would hammer the NAS and is far more likely a typo than an intent.
+- Boolean CLI flags are **one-way switches**: `--insecure`/`--dry-run` can only turn a setting on and `--no-delete-files` only off, so an unset flag falls through to env/file instead of overriding with `false`. There is no `--https`/`--no-https` flag (not in the plan's flag list), so HTTPS comes from env or file only.
+- ➕ No `SYNO_CLEAN_DELETE_FILES`: it is absent from the plan's env list, and an env var that silently disables the tool's main function is a footgun. `--no-delete-files` and the config key cover it.
+- A **corrupt session cache is discarded with a warning, not an error** — a cache is an optimization and must never block startup. `SessionCache::load` therefore returns `Self`, not `Result<Self>`.
+- ➕ Added `ResolvedConfig::base_url()` and `session_key()` here (rather than in Task 4) so the host/port/scheme/key formatting has exactly one definition.
+- `main` now returns `anyhow::Result` and initializes logging **before** loading the config, so unknown-key warnings actually reach the log file.
 
 ### Task 4: HTTP client, API discovery, and authentication
 

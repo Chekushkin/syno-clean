@@ -6,4 +6,6 @@
 //! module that has landed but is not yet wired into the event loop does not
 //! trip `dead_code` while the rest of the program is still being built.
 
+pub mod cli;
+pub mod config;
 pub mod error;

@@ -104,7 +104,28 @@ switching the lint off, and lets `tests/` reach the code. Add new modules to
   the alternate screen is entered.
 - Session `sid` cache lives at `~/.cache/syno-clean/session.json`, mode `0600`,
   keyed by `{host}:{port}/{username}` so multiple NASes/accounts never evict
-  each other. Normal quit does **not** log out; only `--logout` does.
+  each other. Normal quit does **not** log out; only `--logout` does. A corrupt
+  cache is discarded with a warning — it is an optimization and must never
+  block startup.
+- Config layers are `Option`-per-field (`config::Config`) so "absent" stays
+  distinguishable from "set to the default"; the concrete defaults are the
+  `config::DEFAULT_*` consts, applied in `merge`. The default port follows the
+  scheme (5001 https / 5000 http). Boolean CLI flags are **one-way switches** —
+  an unset `--insecure` never overrides a config `insecure = true`.
+
+### Two injection seams (keep them — the tests depend on them)
+
+- **Environment**: nothing outside `config::system_env` calls `std::env::var`.
+  Config reads take `EnvLookup<'_> = &dyn Fn(&str) -> Option<String>`, so
+  precedence tests are pure and the suite stays parallel-safe. Never write a
+  test that sets a process env var.
+- **Filesystem**: paths come from a `config::Paths` value —
+  `Paths::discover()` in `main`, `Paths::with_base(tempdir)` in tests. **No test
+  may read or write the real `~/.config/syno-clean` or `~/.cache/syno-clean`.**
+  `tempfile` is a dev-dependency for exactly this.
+
+`main` initializes logging *before* loading the config, so config warnings
+reach the log file, and holds the `WorkerGuard` for the whole of `main`.
 
 ## DSM API conventions
 
