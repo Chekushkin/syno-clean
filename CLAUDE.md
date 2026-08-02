@@ -1,8 +1,30 @@
 # CLAUDE.md — syno-clean conventions
 
-Working notes for anyone (human or agent) touching this repo. Sections marked
-_(pending)_ are filled in as the corresponding task lands; see
-`docs/plans/20260802-syno-clean-tui.md` for the full plan.
+Working notes for anyone (human or agent) touching this repo: the conventions the
+code actually follows and, more importantly, **why**, so a later change does not
+undo a decision without knowing it was one.
+
+This describes the shipped v0.1.0 code. Where a rule exists because getting it
+wrong destroys data or silently lies to the user, it says so — those are the ones
+not to "simplify". The historical record of how each rule arrived (task by task,
+with the alternatives that were rejected) is in
+`docs/plans/20260802-syno-clean-tui.md`.
+
+Contents:
+
+1. [What this is](#what-this-is)
+2. [Toolchain and the validation gate](#toolchain-and-the-validation-gate)
+3. [Dependency rules](#dependency-rules)
+4. [Module layout](#module-layout)
+5. [Configuration precedence](#configuration-precedence)
+6. [Error handling](#error-handling)
+7. [DSM API conventions](#dsm-api-conventions)
+8. [The dangerous part: delete ordering and path safety](#the-dangerous-part-delete-ordering-and-path-safety)
+9. [UI and state conventions](#ui-and-state-conventions)
+10. [Formatting](#formatting)
+11. [Offline and debugging flags](#offline-and-debugging-flags)
+12. [Testing philosophy](#testing-philosophy)
+13. [Known gaps and outstanding debt](#known-gaps-and-outstanding-debt)
 
 ## What this is
 
@@ -10,14 +32,13 @@ A Rust terminal UI over the Synology DSM HTTP API for reviewing Download
 Station tasks and deleting **both** the DSM task and the files it left on the
 volume. Nothing is installed on the NAS.
 
-## Toolchain
+## Toolchain and the validation gate
 
 - Pinned in `rust-toolchain.toml` to an **explicit version** (currently
   `1.97.1`), not `stable`, so CI is reproducible. Components: `rustfmt`,
-  `clippy`.
+  `clippy`. CI reads the pin from that file rather than repeating it, so the
+  version has exactly one home.
 - Edition is set explicitly in `Cargo.toml` (`2024`).
-
-## Validation gate (every task must end here)
 
 ```sh
 cargo fmt --all
@@ -26,66 +47,65 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-All four must be clean before the next task starts. Warnings are errors.
+All four must be clean before any change is considered done. Warnings are
+errors, in CI and locally.
 
 ## Dependency rules
 
 - **Never add `crossterm` as a direct dependency.** It is consumed through
   `ratatui::crossterm` so there is exactly one crossterm in the tree and no
   version-skew type errors. ratatui 0.30 pulls crossterm 0.29 via
-  `ratatui-crossterm` with default features (`events`, `bracketed-paste`) —
-  note that crossterm's `event-stream` feature is **not** enabled, so the async
-  input source has to be built without `crossterm::event::EventStream`
-  (e.g. a `spawn_blocking` reader feeding the same mpsc channel the poller
-  uses).
+  `ratatui-crossterm` with default features (`events`, `bracketed-paste`).
+  Crossterm's **`event-stream` feature is not enabled** by that path, so
+  `crossterm::event::EventStream` does not exist here and the async input source
+  is a `spawn_blocking(event::read)` reader instead — see
+  [the event loop](#the-event-loop-and-the-poller-mainrs-eventrs).
 - `reqwest` is `default-features = false` with `rustls` (reqwest 0.13 renamed
   the old `rustls-tls` feature to `rustls`), plus `json`, `query`, `form`. No
-  OpenSSL, no system TLS.
+  OpenSSL, no system TLS. The `rustls` feature resolves to the **`aws-lc-rs`**
+  provider, which compiles C through `cmake` — that is why the aarch64 Linux
+  cross build in `release.yml` installs a C toolchain and not just a linker.
 - `tracing` writes to a **file**, never stdout — the TUI owns the terminal.
+- `tempfile` is a dev-dependency, used so no test touches a real XDG directory.
 
 ## Module layout
 
 ```
 src/
-  main.rs                  thin binary: entrypoint, runtime setup, terminal guard
+  main.rs                  thin binary: startup, event loop, op dispatch
   lib.rs                   library root, declares every module below
   cli.rs                   clap definitions
-  config.rs                TOML config, env overrides, validation, sid cache
-  error.rs                 Error enum + DSM code mapping
+  config.rs                TOML config, env overrides, validation, sid cache, paths
+  error.rs                 Error enum, DSM code mapping, startup diagnostics
   format.rs                human-readable bytes/speed/eta/percent, width-correct truncation
   model.rs                 Task, TaskFile, TaskStatus, JSON -> Task
   view.rs                  SortKey/SortDir/StatusFilter/search -> visible indices
   delete.rs                delete-path resolution, safety guards, op ordering
-  app.rs                   App state, key handling, selection
-  event.rs                 AppEvent, poller task, op tasks
-  ui/{mod,table,dialog}.rs frame layout, task table, modals
-  api/{mod,client,auth,download_station,file_station}.rs
+  app.rs                   App state, key handling, selection, event application
+  event.rs                 AppEvent, poller task, op tasks (delete / pause / resume)
+  ui/
+    mod.rs                 frame layout and dispatch, terminal guard, panic hook
+    table.rs               task table widget
+    dialog.rs              confirmation modal, help overlay
+  api/
+    mod.rs
+    client.rs              reqwest client, API discovery, envelope, sid handling, retry
+    auth.rs                login / logout
+    download_station.rs    list / delete / pause / resume
+    file_station.rs        path info lookup, delete files
 tests/fixtures/task_list.json
 ```
 
-**Why both `lib.rs` and `main.rs`:** the crate is built up module by module, and
-in a bin-only crate every `pub` item that main cannot reach yet is a `dead_code`
-warning — which `-D warnings` turns into a hard failure on every task before the
-module is wired in. Splitting the library out removes that friction without
-switching the lint off, and lets `tests/` reach the code. Add new modules to
-`lib.rs`; keep `main.rs` a thin shell that calls into `syno_clean::`.
+**Why both `lib.rs` and `main.rs`:** in a bin-only crate every `pub` item that
+`main` cannot reach yet is a `dead_code` warning — which `-D warnings` turns into
+a hard failure. Splitting the library out removes that friction without switching
+the lint off, and lets `tests/` reach the code. Add new modules to `lib.rs`; keep
+`main.rs` a thin shell that calls into `syno_clean::`.
 
-## Error handling
-
-- One crate-wide `Error` enum in `error.rs` (`thiserror`) plus a
-  `Result<T>` alias. Variants: `Http`, `Dsm { code, api }`, `Config`, `Io`,
-  `Parse`, `Auth`, `UnsafePath { path, reason }`, `ApiUnavailable { api, reason }`.
-- `anyhow` is for the top of `main` only; library code returns
-  `error::Result<T>`.
-- DSM reports failures as a bare integer, so `dsm_message(code, api) -> String`
-  owns the translation. The 100-119 codes are common to every API; the 400-range
-  is **API-specific**, and only the `SYNO.API.Auth` table is implemented — a 400
-  from Download Station must *not* render as "incorrect password", so unknown
-  (code, api) pairs fall back to a message naming the raw number.
-- `error::is_session_error(code)` is the single definition of "re-login and
-  retry once" (106 / 107 / 119). `OTP_REQUIRED_CODE` (403) drives the 2FA prompt.
-- Missing APIs are reported by DSM *package* ("File Station is not installed on
-  this NAS"), not by raw API name, via `Error::api_missing`.
+`main.rs` owns exactly four things: startup (config, first run, discovery,
+login), the `select!` event loop, dispatching what the loop drains onto
+`event::` op tasks, and the process exit code. Everything else belongs in the
+library, where it is testable.
 
 ## Configuration precedence
 
@@ -93,25 +113,52 @@ switching the lint off, and lets `tests/` reach the code. Add new modules to
 
 - XDG semantics on *all* platforms (via `etcetera`'s XDG strategy), so the
   documented paths are the real ones on macOS too: config at
-  `~/.config/syno-clean/config.toml`, cache and logs at `~/.cache/syno-clean/`.
+  `~/.config/syno-clean/config.toml`, cache and logs at `~/.cache/syno-clean/`
+  (`config::LOG_FILE` is `syno-clean.log`).
 - Unknown config keys are **warned about and ignored**, never a hard error — an
   older binary must tolerate a newer config file. Do not use
   `deny_unknown_fields`.
 - `host` and `username` are validated as present in `config::merge`, so every
   later module may assume them.
+- Config layers are `Option`-per-field (`config::Config`) with a container-level
+  `#[serde(default)]`, so "absent" stays distinguishable from "set to the
+  default"; the concrete defaults are the `config::DEFAULT_*` consts, applied in
+  `merge`. The default port follows the scheme (5001 https / 5000 http).
+- Boolean CLI flags are **one-way switches** — an unset `--insecure` never
+  overrides a config `insecure = true`. `--insecure` and `--dry-run` can only
+  turn a setting on, `--no-delete-files` only off.
+- `refresh_secs = 0` is **rejected**, not clamped: a zero-second poll would
+  hammer the NAS and is far more likely a typo than an intent.
+- An unparseable env value (`SYNO_CLEAN_PORT=abc`) is an error naming the
+  variable, not a silent fall-through to the file value.
+- There is deliberately **no `SYNO_CLEAN_DELETE_FILES`**: an environment variable
+  that silently disables the program's main function is a footgun.
 - The password is never written to the config file. It comes from
   `SYNO_CLEAN_PASSWORD` or an interactive `rpassword` prompt, taken **before**
-  the alternate screen is entered.
+  the alternate screen is entered. 2FA likewise via `SYNO_CLEAN_OTP` or a prompt
+  when DSM answers 403.
 - Session `sid` cache lives at `~/.cache/syno-clean/session.json`, mode `0600`,
   keyed by `{host}:{port}/{username}` so multiple NASes/accounts never evict
-  each other. Normal quit does **not** log out; only `--logout` does. A corrupt
-  cache is discarded with a warning — it is an optimization and must never
-  block startup.
-- Config layers are `Option`-per-field (`config::Config`) so "absent" stays
-  distinguishable from "set to the default"; the concrete defaults are the
-  `config::DEFAULT_*` consts, applied in `merge`. The default port follows the
-  scheme (5001 https / 5000 http). Boolean CLI flags are **one-way switches** —
-  an unset `--insecure` never overrides a config `insecure = true`.
+  each other. Normal quit does **not** log out — that would invalidate the cache
+  and defeat it; only `--logout` does. A corrupt cache is discarded with a
+  warning (`SessionCache::load` returns `Self`, not `Result<Self>`) — it is an
+  optimization and must never block startup.
+
+`main` initializes logging *before* loading the config, so config warnings reach
+the log file, and holds the `tracing_appender::WorkerGuard` for the whole of
+`main` — dropping it early silently discards buffered lines.
+
+### First run
+
+- **A missing config *file* is never an error.** Only values still unresolved
+  after the merge are. `config::missing_required` asks that question with the
+  very same resolution `merge` enforces (`resolved_host` / `resolved_username`),
+  never a second copy of the rule, and a test asserts the two can never
+  disagree. `main::first_run` then writes `config::CONFIG_TEMPLATE` and exits
+  non-zero without entering the TUI.
+- The template has **every key commented out** — a starter config shipping a live
+  `host = "nas.local"` would aim the next invocation at a host the user never
+  named — and `write_config_template` never overwrites an existing file.
 
 ### Two injection seams (keep them — the tests depend on them)
 
@@ -122,25 +169,61 @@ switching the lint off, and lets `tests/` reach the code. Add new modules to
 - **Filesystem**: paths come from a `config::Paths` value —
   `Paths::discover()` in `main`, `Paths::with_base(tempdir)` in tests. **No test
   may read or write the real `~/.config/syno-clean` or `~/.cache/syno-clean`.**
-  `tempfile` is a dev-dependency for exactly this.
 
-`main` initializes logging *before* loading the config, so config warnings
-reach the log file, and holds the `WorkerGuard` for the whole of `main`.
+## Error handling
+
+- One crate-wide `Error` enum in `error.rs` (`thiserror`) plus a `Result<T>`
+  alias. Variants: `Http`, `Dsm { code, api }`, `Config`, `Io`, `Parse`, `Auth`,
+  `UnsafePath { path, reason }`, `ApiUnavailable { api, reason }`.
+- **The variant list is closed in practice.** Three classes of failure
+  deliberately reuse an existing variant rather than growing it: protocol
+  violations (success with no data, failure with no code, a body that is not an
+  envelope) are `Error::Parse` built with `serde::de::Error::custom`; File
+  Station failures with no DSM code behind them (`path_err_num > 0`, a bounded
+  wait expiring) are `Error::Io`; unresolved required config is `Error::Config`.
+  Adding a variant for these is the change to argue for, not to make quietly.
+- `anyhow` is for the top of `main` only; library code returns
+  `error::Result<T>`.
+- DSM reports failures as a bare integer, so `dsm_message(code, api) -> String`
+  owns the translation. It returns `String`, not `&'static str`, because the
+  fallback has to embed the unrecognized number. The 100-119 codes are common to
+  every API; the 400-range is **API-specific**, and only the `SYNO.API.Auth`
+  table is implemented — a 400 from Download Station must *not* render as
+  "incorrect password", so unknown `(code, api)` pairs fall back to a message
+  naming the raw number.
+- `error::is_session_error(code)` is the single definition of "re-login and
+  retry once" (106 / 107 / 119). `OTP_REQUIRED_CODE` (403) drives the 2FA prompt.
+- Missing APIs are reported by DSM *package* ("File Station is not installed on
+  this NAS"), not by raw API name, via `Error::api_missing`.
+- **A startup connection or login failure exits non-zero with
+  `error::connection_diagnostic`** — host and port tried, the DSM code in words,
+  and one hint — and never enters the TUI. An empty table is exactly what a NAS
+  with no downloads looks like, so a failed login must never be able to render as
+  one. Failures *during* a session stay non-fatal (see the poller).
 
 ## DSM API conventions
 
-- **DSM 7 only**, using the documented v1 `SYNO.DownloadStation.Task` API for
-  all four operations (list / delete / pause / resume) — no mixed-API seam.
+- **DSM 7 only**, using the documented **v1** `SYNO.DownloadStation.Task` API for
+  all four operations (list / delete / pause / resume) — no mixed-API seam. DSM 7
+  also ships `SYNO.DownloadStation2.Task` (what the web UI uses), but its `list`
+  is undocumented and it returns numeric statuses and a different `additional`
+  shape; migrating is a post-v1 question. A DSM 6 NAS gets a clear error.
 - **No hardcoded API versions.** `SYNO.API.Info` is queried once at startup
   from the fixed `/webapi/query.cgi` (it is *not* served from `entry.cgi`);
   every later call picks the highest version inside the discovered
   `minVersion..maxVersion` range that this client understands.
+  **Exception, deliberate:** `DS_TASK_SUPPORTED` is pinned to `(1, 1)` even
+  though DSM 7 advertises 3. v2/v3 change the status encoding and the
+  `additional` shape `model.rs` is built around, so following the NAS upward
+  would silently break parsing. A test pins the pin.
 - On DSM error **106 / 107 / 119** the client re-logs-in once and retries
   exactly once.
 - List-valued parameters are encoded differently per API: Download Station v1
   takes **comma-separated** strings, File Station takes **JSON arrays**. All
   encoding lives in pure `build_*_params() -> Vec<(&str, String)>` functions so
-  it is unit-testable and changeable in one place.
+  it is unit-testable and changeable in one place. A cross-API test pins the
+  difference, using a path containing a comma — the reason one builder cannot
+  serve both.
 
 ### Using the client (`api::client`)
 
@@ -149,17 +232,33 @@ reach the log file, and holds the `WorkerGuard` for the whole of `main`.
   endpoint from the discovery map, attaches `_sid`, and owns the re-login
   retry. `call_no_data` is the variant for methods that answer with a bare
   `{"success": true}`. `SynoClient::send` is the no-retry escape hatch and
-  exists for `auth::login`, which must not recurse into the retry.
+  exists for `auth::login`, which must not recurse into the retry that called
+  it.
 - Each API module declares its own `SUPPORTED: VersionRange` const (inclusive
   `(min, max)`); `pick_version_in` takes the top of the overlap with what the
   NAS advertises and errors naming both ranges when there is none.
 - Three envelope readers: `parse_envelope` (payload required),
   `parse_envelope_optional` (payload may be absent), `check_envelope` (success
-  only). A protocol violation — success with no data, failure with no code, a
-  body that is not an envelope — is an `Error::Parse` built with
-  `serde::de::Error::custom`; do not add error variants for these.
-- Credentials are redacted in `Debug`. Keep it that way: `SynoClient` derives
-  `Debug` and holds them.
+  only, payload ignored). Logout, pause and resume answer with a bare
+  `{"success": true}`, and the retry path has to classify a response before
+  committing to a payload type — hence three, not one.
+- Credentials are redacted in a hand-written `Debug`. Keep it that way:
+  `SynoClient` derives `Debug` and holds them, so one `{:?}` would otherwise put
+  a password in the log file.
+
+### Two DSM shapes that are easy to get wrong
+
+- **`delete` / `pause` / `resume` report failure per task, not in the
+  envelope**: `{"success": true, "data": [{"id": …, "error": 544}]}`. Always run
+  the result array through `download_station::check_task_results`; reading only
+  `success` reports a failed delete as a success, and the delete ordering depends
+  on knowing whether a pause actually happened.
+- **`getinfo` distinguishes three answers, and so does `PathInfo`**: `Missing`
+  (skip the file phase, still delete the task), `Found`, and `Error(code)` —
+  a permission problem is *not* absence, and collapsing the two would delete the
+  task and strand the files. `Missing` arrives as a per-entry code 408, as a bare
+  entry with no `isdir`, or at the envelope level depending on the DSM build;
+  `classify_getinfo` is pure and covers all three.
 
 ### Task model (`model.rs`)
 
@@ -175,145 +274,39 @@ reach the log file, and holds the `WorkerGuard` for the whole of `main`.
   deserializers. Do not add a plain `u64` field.
 - `TaskStatus::Unknown(String)` keeps an unrecognized status verbatim so a row
   is never dropped; `from_dsm_str` trims and case-folds. `TaskStatus::KNOWN`
-  lists the ten documented variants.
+  lists the ten documented variants, and `Ord` follows declaration order (that
+  is the status sort).
+- `TaskFile` is an **object** (`filename`, `size`, `priority`, `selected`), not a
+  string — the file list is what the delete-path resolver reads.
 - `progress()` / `ratio()` / `eta()` all guard their denominators — a zero-size
   task is ordinary, not an error.
-
-### Formatting (`format.rs`)
-
-- Sizes are **binary** (1 KiB = 1024 B) because that is what DSM reports.
-  `B`/`KiB` print as whole numbers, `MiB` and up get one decimal. The unit is
-  picked *after* rounding, so nothing ever renders as `1024 KiB`.
-- **Zero and unknown are different sentinels.** `speed(0)` is `DASH` (`—`) — the
-  task is idle, not unknown; an ETA that cannot be computed is `INFINITY` (`∞`).
-  Do not collapse them into `0`.
-- `percent` takes a **fraction** (`0.0..=1.0`), matching `Task::progress()`, not
-  an already-multiplied percentage.
-- **Never size or pad a column with `str::len` or `chars().count()`.** Use
-  `format::display_width` and `format::truncate_ellipsis`, which measure
-  terminal cells via `unicode-width`; the fixture's CJK and emoji titles are
-  there to keep that honest. `truncate_ellipsis` never exceeds the requested
-  width and may stop one cell short rather than clip a double-width character
-  in half.
+- `list_tasks` always requests `limit = -1`. The poller reconciles the whole list
+  each tick; paging would make the cursor/selection reconciliation lie.
 
 ### The task-list fixture
 
 `tests/fixtures/task_list.json` is a full `list` envelope covering every known
-status plus an unknown one, missing/partial `additional` blocks, an empty file
-list, a non-BT download, a zero-size task, a CJK title, an emoji title, a file
-list with **no common root** (the `delete.rs` refusal case) and a
-`/volume1/...` destination. It drives the `model.rs` parser tests and the
-offline `--fixture` mode.
+status plus an unknown one (`captcha_needed`), missing/partial `additional`
+blocks, an empty file list, a non-BT download, a zero-size task, a CJK title, an
+emoji title, a file list with **no common root** (the `delete.rs` refusal case)
+and a `/volume1/...` destination. Numbers appear in both the JSON-number and
+string forms on purpose. It drives the `model.rs` parser tests, the layout tests
+and the offline `--fixture` mode.
 
-⚠️ It is currently **hand-written and marked `PROVISIONAL`** in a top-level
-`_comment` key — no NAS was reachable when it was written. Re-capture with
-`syno-clean --dump-tasks-json > tests/fixtures/task_list.json` and drop the
-marker (and the test asserting it) once it comes from a real DSM 7 NAS.
+⚠️ It is **hand-written and marked `PROVISIONAL`** in a top-level `_comment` key —
+no NAS was reachable when it was written, and none has been since. Re-capture
+with `syno-clean --dump-tasks-json > tests/fixtures/task_list.json`, then drop
+the marker *and* `model.rs`'s `the_fixture_is_still_marked_provisional…` test
+together. Until then, every assertion about the DSM wire shape is only as good as
+that file.
 
-### Hidden debugging flags
+## The dangerous part: delete ordering and path safety
 
-`--dump-api-info` and `--dump-tasks-json` print a raw DSM response verbatim and
-exit. They are `hide = true` — debugging aids, not advertised interface.
-`--dump-api-info` deliberately does **not** log in, since discovery needs no
-session and that is exactly the case where a login is what is broken.
+Deriving "which directory holds this torrent" is the one place this tool can
+destroy the wrong data. Everything here is built to **refuse rather than guess**,
+and the bulk of the test suite lives in `delete.rs` for that reason.
 
-`--fixture <path>` runs the whole TUI over a captured `list` response with no
-network call and — deliberately — **no configuration at all**: it short-circuits
-`main` before the config merge, so it works on a machine with no config file,
-no host and no password. The file is a full DSM envelope, read through the same
-`parse_envelope::<TaskList>` the live path uses (`app::parse_fixture`), never a
-second, laxer parser: a fixture only the fixture loader can read would prove
-nothing about what the NAS sends.
-
-## Delete ordering (three phases, ordered for recoverability)
-
-| Task status | Ordering |
-|---|---|
-| Downloading, Seeding, Waiting, Finishing, HashChecking, Extracting | pause → confirm paused → delete files → delete task |
-| Paused, Finished, Error | delete files → delete task |
-
-- Any phase failing **skips all later phases**. The task then survives still
-  pointing at its data — nothing is orphaned.
-- The DS API removes the task but never the payload; files go via
-  `SYNO.FileStation.Delete` `start` + `status` polling (a recursive delete of a
-  big torrent directory can outlive the HTTP timeout).
-- For **incomplete** tasks, "path not found" during the file phase counts as
-  success — Download Station cleans up its own partial data.
-
-### How the ordering is expressed (`delete.rs` + `event.rs`)
-
-- The **rules are pure**: `delete::plan_delete_ops(item, options) -> Vec<Op>`
-  is the table above as data, and `delete::ops_cancelled_by(ops, failed_at)` is
-  the "a failed phase cancels every later phase" half. Both are unit-tested with
-  no network. `event::spawn_delete` is the I/O and the accounting around them —
-  keep new ordering logic in `delete.rs`, not in the executor.
-- `delete::requires_pause` treats **everything except Paused / Finished / Error
-  as active**. The plan's table names only nine of the ten statuses, so
-  `filehosting_waiting` and any `Unknown(_)` fall here: pausing an idle task
-  costs a round trip, not pausing a live one risks DS writing into the directory
-  mid-delete.
-- **`delete_files = false` drops the file phase *and* the pause.** The pause
-  exists only to keep DS out of the way of the file delete; with no file delete
-  a failed pause would block a task-only removal for nothing.
-- **A refused item (`Target::Refused`) gets an empty op list** — not even the
-  DSM task goes. The dialog already showed the row as SKIPPED, and removing the
-  task would orphan precisely the data whose location is in doubt.
-- **`validate_path` is re-run immediately before every File Station call**, on
-  top of having run when the snapshot was taken. The value crossed a task
-  boundary in between and the next call has no undo.
-- **`--dry-run` issues no call at all** — not even the `getinfo` existence
-  check. Every phase logs what it would do and the item is reported as a *skip*,
-  so the footer can never read "3 succeeded" for a run that deleted nothing.
-
-### Two DSM shapes that are easy to get wrong
-
-- **`delete` / `pause` / `resume` report failure per task, not in the
-  envelope**: `{"success": true, "data": [{"id": …, "error": 544}]}`. Always run
-  the result array through `download_station::check_task_results`; reading only
-  `success` reports a failed delete as a success.
-- **`getinfo` distinguishes three answers, and so does `PathInfo`**: `Missing`
-  (skip the file phase, still delete the task), `Found`, and `Error(code)` —
-  a permission problem is *not* absence, and collapsing the two would delete the
-  task and strand the files. A pause is likewise confirmed by re-reading the
-  task (`download_station::task_info`), because DSM accepting a `pause` is not
-  the same as the task having stopped.
-- A File Station failure with no DSM code behind it (a `status` poll reporting
-  `path_err_num > 0`, or the bounded wait running out) reuses `Error::Io`,
-  the same way protocol violations reuse `Error::Parse`. Do not add variants.
-
-### Op tasks (`event::OpContext`)
-
-Anything long-running gets an `OpContext { client, tx, refresh }`, runs off the
-loop, reports per item with `AppEvent::OpProgress` and once at the end with
-`OpDone`, and then pokes `refresh` — one refresh per batch, not per item. `App`
-renders the report through `app::op_summary`, which names only the non-zero
-categories and marks any batch containing a failure. **The report goes in
-`status_message`, never the error banner**: the batch's own refresh would clear
-the banner a moment after it appeared.
-
-### Pause and resume (`p` / `u`)
-
-- **One definition of "the current target"**: `App::target_tasks` — the
-  selection when there is one, the row under the cursor otherwise, nothing at
-  all when the table is empty. `d`, `p` and `u` all go through it, and a
-  selected task a filter is hiding is still included (the selection is what is
-  armed, not what is on screen).
-- `p`/`u` perform no I/O either. They park an `app::TaskOpRequest { op, ids }`
-  that the loop drains with `take_requested_op` — the same handshake as `r` and
-  the confirmed delete. Neither is confirmed: each is undone by the other key.
-- **One round trip for the whole batch.** `event::spawn_task_op` sends the
-  comma-separated id list once and derives per-item outcomes from the per-task
-  result array (`task_op_outcome`, which runs each entry through
-  `check_task_results`). An id DSM reported nothing for counts as a **failure** —
-  the refresh that follows shows the truth, and a false "paused" cannot be
-  corrected.
-- **`--dry-run` covers pause and resume too**, reported as skipped. Pausing
-  somebody's whole download list is a change however reversible it is, and a dry
-  run promises the NAS is not touched.
-
-## Path-safety invariants (the dangerous part)
-
-Resolution order in `delete.rs`, and it **refuses rather than guesses**:
+### Path resolution (`delete::resolve_delete_path`)
 
 1. File list present with a single common top-level component → use it. That is
    the authoritative on-disk name, even when the display title differs.
@@ -324,224 +317,453 @@ Resolution order in `delete.rs`, and it **refuses rather than guesses**:
 4. Normalize `destination`: strip a leading `/volumeN`, trim surrounding
    slashes. Join as `/{destination}/{name}`.
 
-Syntactic guards (`delete::validate_path`) — a resolved path is refused if it is
-empty, `/`, has fewer than two components, contains a `..` or `.` component
-(anywhere, not just at the end), has an empty component, or lacks a leading `/`.
-Two further guards are **not** in the plan and exist because each turns a merely
-wrong path into a *share-destroying* one if anything downstream normalizes it:
+Supporting rules, each of which exists because the alternative is a guess:
+
+- `common_root` compares components **exactly** — the NAS filesystem is
+  case-sensitive, so `Some.Release/` and `some.release/` are two directories.
+- An entry with an **empty or absolute `filename` makes the whole list
+  unresolvable**, rather than being skipped: splitting
+  `/volume1/downloads/X/a.mkv` naively would report `volume1` as the shared root.
+- **A deselected file still counts towards the common root.** `selected`
+  describes what was downloaded, not what is on disk, and filtering to selected
+  entries would *resolve* some of the ambiguous cases rule 2 exists to refuse.
+- **Only the absolute `/volumeN` form is stripped.** A relative
+  `volume1/downloads` passes through untouched — a share may legally be named
+  `volume1`. Unrecognized forms (`/volumeUSB1/…`) also pass through and simply
+  fail the existence check later.
+- **An empty normalized destination is refused with its own reason**, because
+  `/{name}` names a *share*, and "the task reports no destination" is the message
+  the user can act on.
+
+### Syntactic guards (`delete::validate_path`, `delete::validate_name`)
+
+A resolved path is refused — leaving the task **entirely** untouched — if it is
+empty, not absolute, `/`, has fewer than two components, contains a `..` or `.`
+component anywhere, or has an empty component. Two further guards were not in the
+original plan and exist because each turns a merely wrong path into a
+*share-destroying* one if anything downstream normalizes it:
 
 - **no control characters** — a NUL truncates the path in any C-based consumer,
   so `/downloads\0/Some.Torrent` arrives as `/downloads`, the share root;
 - **no blank (whitespace-only) components** — if any layer trims,
   `/   /Some.Torrent` collapses to `/Some.Torrent`, again a share root.
-  Incidental leading/trailing spaces *inside* a real name are left alone.
+  Incidental leading/trailing spaces *inside* a real name are left alone: those
+  are legitimate on the NAS, and refusing them would skip real torrents.
 
-The on-disk name is guarded separately before it is joined
-(`delete::validate_name`): it must be a single component, so the `title`
-fallback cannot smuggle a `/` in and delete one level deeper than the task's own
-directory. `common_root` compares components **exactly** — the NAS filesystem is
-case-sensitive, and an entry with an empty or absolute `filename` makes the whole
-list unresolvable rather than letting a leading `/` report the volume as the
-shared root. A deselected file still counts towards the common root: `selected`
-describes what was downloaded, not what is on disk.
+There is deliberately **no glob guard**. File Station's `path` is a literal path
+(searching is a separate API), while scene release names contain brackets
+constantly — the guard would refuse most real torrents to defend against a
+behaviour DSM does not have.
 
-Semantic guard — `SYNO.FileStation.List` `getinfo` runs against the resolved
-path before any recursive delete. Not found ⇒ report *skipped* (the files were
-probably already removed by hand) and still delete the DSM task, which is the
-harmless half.
+The on-disk name is guarded **separately, before it is joined**
+(`validate_name`): it must be a single non-blank component that is not `.`/`..`
+and holds no control characters. `validate_path` would catch most of it
+afterwards, but a `title` fallback of `Some/Release` passes every path guard
+while aiming one level deeper than the task's own directory.
 
-Snapshot semantics — the `DeletePlan` is an owned snapshot taken when the
-confirmation dialog opens. Refreshes are suspended while `Mode::Confirm` is
-active, and `validate_path` is re-run immediately before each File Station
-call, so what the user read on screen is exactly what gets deleted.
+### Semantic guard
 
-## State conventions
+`SYNO.FileStation.List` `getinfo` runs against the resolved path before any
+recursive delete. Not found ⇒ report *skipped* (the files were probably already
+removed by hand) and still delete the DSM task, which is the harmless half. An
+error is not absence — see `PathInfo` above.
 
-- `App` holds all state; rendering is a pure function of `&App`.
+### Snapshot semantics
+
+The `DeletePlan` is an **owned** snapshot taken when the confirmation dialog
+opens. Task-list refreshes are suspended while `Mode::Confirm` is active, and
+**`validate_path` is re-run immediately before every File Station call** on top
+of having run at snapshot time — the value crossed a task boundary in between and
+the next call has no undo. What the user read on screen is exactly what gets
+deleted.
+
+### Three phases, ordered for recoverability
+
+| Task status | Ordering |
+|---|---|
+| Downloading, Seeding, Waiting, Finishing, HashChecking, Extracting, FilehostingWaiting, `Unknown(_)` | pause → confirm paused → delete files → delete task |
+| Paused, Finished, Error | delete files → delete task |
+
+- Any phase failing **skips all later phases**. The task then survives still
+  pointing at its data — nothing is orphaned.
+- The DS API removes the task but never the payload; files go via
+  `SYNO.FileStation.Delete` `start` + `status` polling (a recursive delete of a
+  big torrent directory can outlive the HTTP timeout). `finished: true` is not on
+  its own success — `classify_delete_status` fails the phase when
+  `path_err_num > 0`.
+- For **incomplete** tasks, "path not found" during the file phase counts as
+  success — Download Station cleans up its own partial data.
+- **"Confirm paused" is a real re-read** (`download_station::task_info`, polled
+  until the task reports itself paused, bounded at 15 s). DSM accepting a `pause`
+  says the request was queued, not that the task stopped writing.
+
+### How the ordering is expressed (`delete.rs` + `event.rs`)
+
+- The **rules are pure**: `delete::plan_delete_ops(&DeleteItem, DeleteOptions)`
+  is the table above as data, and `delete::ops_cancelled_by(ops, failed_at)` is
+  the "a failed phase cancels every later phase" half. Both are unit-tested with
+  no network. `event::spawn_delete` is the I/O and the accounting around them —
+  **keep new ordering logic in `delete.rs`, not in the executor.**
+  `DeleteOptions` is a *parameter* rather than a field of `DeletePlan` because
+  `delete_files` / `dry_run` are session state with a different lifetime from the
+  snapshot; the status the ordering keys on already lives on `DeleteItem`.
+- `delete::requires_pause` treats **everything except Paused / Finished / Error
+  as active**, which is where `filehosting_waiting` and any `Unknown(_)` land:
+  pausing an idle task costs a round trip, not pausing a live one risks DS
+  writing into the directory mid-delete. The cost is that an unrecognized status
+  whose pause DSM rejects can never be deleted by this tool — the fail-closed
+  direction.
+- **`delete_files = false` drops the file phase *and* the pause.** The pause
+  exists only to keep DS out of the way of the file delete; with no file delete a
+  failed pause would block a task-only removal for nothing.
+- **A refused item (`Target::Refused`) gets an empty op list** — not even the
+  DSM task goes. The dialog already showed the row as SKIPPED, and removing the
+  task would orphan precisely the data whose location is in doubt. This holds
+  under `--no-delete-files` too.
+- **`--dry-run` issues no call at all** — not even the read-only `getinfo`
+  existence check — and covers **pause and resume as well as delete**. Every
+  phase logs what it would do and the item is reported as a *skip*, never a
+  success, so the footer can never read "3 succeeded" for a run that changed
+  nothing. A flag that promises the NAS is untouched has to mean it.
+
+## UI and state conventions
+
+- `App` holds all state; **rendering is a pure function of `&App`**. That is what
+  makes every frame assertable with `ratatui::backend::TestBackend`, which draws
+  into an in-memory buffer with no TTY.
 - Sorting/filtering produce a `Vec<usize>` of indices into the task list rather
   than cloning or reordering the source data.
 - **Cursor and selection are keyed by task ID, not row index**, so a refresh
   that reorders or removes rows never silently reassigns what is selected.
-  `App::cursor` is a position in the *visible* list; the reconciliation that
-  keeps it on the same task lives in Task 11's `apply_tasks`.
-- **`a` (`toggle_select_all_visible`) touches only the visible rows**, in both
-  directions — a filtered-out task is never armed for deletion by a key press
-  the user aimed at what was on screen, and never quietly *un*armed either.
-  `Esc` (`clear_selection`) is the opposite and clears everything, hidden rows
-  included; it is the "I do not know what is armed" key.
-- The selection footer counts and sums **`App::selected_tasks()`** — the
-  selected IDs that still name a real task — not `selected.len()`. Between a
-  task vanishing on the NAS and Task 11's refresh pruning the set, the raw
-  length would over-report while the size sum did not.
+  `App::cursor` is a position in the *visible* list; `App::apply_tasks` and
+  `App::change_view` do the reconciliation.
+- **`App` holds no runtime handle and performs no I/O.** Every key press is a
+  pure state transition. Anything needing the network is *parked* for the event
+  loop to drain — `take_refresh_request`, `take_confirmed_delete`,
+  `take_requested_op` — which is the single reason the whole keymap and the whole
+  delete flow are testable without a tokio runtime or a NAS.
 - `App::handle_key` ignores anything that is not `KeyEventKind::Press` —
   Windows and the kitty protocol report releases too, and acting on both halves
   runs every binding twice. `Ctrl-C` is handled before the mode dispatch so it
   works from inside a modal.
+- **`App::error` is not `App::status_message`.** The error banner is cleared
+  automatically by the next successful refresh and rendered red with `⚠`; the
+  status message survives underneath and returns when the banner clears.
 
-### Sort, filter and search (`App::change_view`)
+### Selection
+
+- **`a` (`toggle_select_all_visible`) touches only the visible rows**, in both
+  directions — a filtered-out task is never armed for deletion by a key press
+  the user aimed at what was on screen, and never quietly *un*armed either. On a
+  partially selected visible set it selects the rest rather than clearing: a key
+  that sometimes discards a half-built selection is the one that loses work.
+- `Esc` (`clear_selection`) is the opposite and clears everything, hidden rows
+  included; it is the "I do not know what is armed" key.
+- **Space does not advance the cursor.** With `d` acting on the selection, a
+  cursor that drifts is how the wrong row ends up under a later un-selected `d`.
+- The selection footer counts and sums **`App::selected_tasks()`** — the selected
+  IDs that still name a real task — not `selected.len()`. Between a task
+  vanishing on the NAS and the next refresh pruning the set, the raw length would
+  over-report while the size sum did not.
+- **One definition of "the current target"**: `App::target_tasks` — the selection
+  when there is one, the row under the cursor otherwise, nothing at all when the
+  table is empty. `d`, `p` and `u` all go through it, and a selected task a filter
+  is hiding is still included (the selection is what is armed, not what is on
+  screen).
+
+### Sort, filter and search (`view.rs`, `App::change_view`)
 
 - **Every view change goes through `App::change_view`** (`s`, `S`, `f`, and
   every keystroke in the search box). It follows the cursor's task by **ID**
-  through the re-sort or the re-filter, falls back to holding the row number
-  when the change hides that task, and then clamps — the same rules
-  `apply_tasks` uses for a refresh, for the same reason: a cursor that lands on
-  a different torrent is how the wrong thing gets deleted.
+  through the re-sort or re-filter, falls back to holding the row number when
+  the change hides that task, and then clamps — the same rules `apply_tasks`
+  uses, for the same reason: a cursor that lands on a different torrent is how
+  the wrong thing gets deleted.
 - **A view change never touches the selection.** A filter is a question about
   what to look at, not an instruction to disarm rows that scrolled off screen.
+- **Descending reverses the `Ordering`, never the result `Vec`.** `sort_by` is
+  stable, so reversing the comparison preserves the incoming order of ties in
+  *both* directions; reversing the vector would shuffle ties on every `S`.
+- `f64` keys use **`total_cmp`**, never `partial_cmp().unwrap()` — a `NaN` must
+  not panic mid-frame. Name comparison and search fold case over **iterators**,
+  not with `to_lowercase()` per comparison, because the comparator runs
+  O(n log n) times per re-sort.
+- **`StatusFilter::Downloading` means "in progress"**, covering `downloading`,
+  `waiting`, `finishing`, `hash_checking`, `extracting` and
+  `filehosting_waiting`. Five filters exist against ten statuses; exact matching
+  would leave five statuses reachable only under `All`, silently hiding rows from
+  someone who believes they are filtering. The other four filters are exact.
+- **An `Unknown(_)` task is visible only under `All`** — it cannot be classified
+  without guessing, and filing it under `Error` would mislabel a healthy task.
 - **Search matches live, on every keystroke**, so `Enter` *commits* rather than
   applies. The query being edited is `view.search` itself; `App::search_backup`
   holds what it was when `/` was pressed and is the only way `Esc` can undo an
   abandoned edit. `/` deliberately keeps the committed query so a search can be
-  refined.
+  refined rather than retyped.
+- **In `Mode::Search` every printable key is text**, never a binding — a box that
+  cannot type `q` cannot search. Only `Enter`, `Esc`, `Backspace` and the global
+  `Ctrl-C` are commands; `Ctrl`/`Alt` chords are dropped rather than typed, and
+  `Shift` is not (it is how a capital arrives). Backspacing past the start is
+  inert, not an exit.
 - **`Esc` is mode-specific**: cancel-and-restore in `Mode::Search`, clear the
   selection in `Mode::Normal`. Keep both halves correct when adding modes.
-- **In `Mode::Search` every printable key is text**, never a binding — a box
-  that cannot type `q` cannot search. Only `Enter`, `Esc`, `Backspace` and the
-  global `Ctrl-C` are commands; `Ctrl`/`Alt` chords are dropped rather than
-  typed, and `Shift` is not (it is how a capital letter arrives).
+
+### The task table (`ui::table`)
+
+- The table is laid out **by hand**, not with ratatui's `Table` widget: every
+  cell is truncated and padded through `format::truncate_ellipsis` /
+  `display_width` so a CJK or emoji title cannot shear the columns to its right,
+  and each row is emitted as one pre-composed `Line`. A widget that measures
+  differently cannot be made to agree.
+- `COLUMNS` is the single definition of the column order, headers, fixed widths
+  and alignment. **Name is the only flexible column** — it absorbs all the slack
+  down to `MIN_NAME_WIDTH`; on a terminal narrower than `ideal_width()` the
+  rightmost columns are clipped by the buffer, because responsive column
+  *dropping* is deferred past v1.
+- Column headers are spelled exactly like `view::SortKey::label()`, and the sort
+  marker is placed by comparing the two. Do not introduce a second key→column
+  mapping. `SortKey::Added` has no column and so shows no marker.
+- The selection marker (`SELECTED_MARKER`) is asserted to be **exactly one cell
+  wide**; a two-cell glyph there would shear every column to its right on
+  selected rows only — the hardest layout bug in this table to spot by eye.
+  Selection is a *colour*, the cursor a *reversal*, so all four combinations read
+  differently.
+- Long statuses are shortened to fit the column (`hash_checking` → `checking`,
+  `filehosting_waiting` → `hosting`); an **unknown status is rendered verbatim**
+  and coloured magenta, never renamed.
+- **The scroll offset is derived, never stored** (`table::scroll_offset`): a pure
+  function of cursor, row count and viewport height, so no second piece of state
+  can disagree with a cursor a refresh moved. `App` holds only the cursor; the
+  event loop pushes the body height in via `App::set_page_size` after each draw
+  so `PageUp`/`PageDown` move a real screenful.
+- Cursor movement **clamps and never wraps** — a `j` held at the bottom of a long
+  list wrapping to the top is how the wrong row gets deleted.
 
 ### The delete confirmation (`ui::dialog`, `App::begin_delete`)
 
-- **`d` never deletes.** It snapshots (`DeletePlan::snapshot`) the selection —
-  or, when nothing is selected, the row under the cursor — and opens
-  `Mode::Confirm`. An empty plan opens no dialog at all.
+- **`d` never deletes.** It snapshots (`DeletePlan::snapshot`) the target and
+  opens `Mode::Confirm`. An empty plan opens no dialog at all.
 - **Cancel is the default focus** (`ConfirmFocus::default() == Cancel`), so
   `Enter` on an untouched dialog *cancels*. `y` is the deliberate one-key
   confirm; `n` / `Esc` / `q` cancel; `q` closes the dialog rather than the
   program (`Ctrl-C` still quits). Every unrecognized key does nothing — never
   "defaults to confirming".
-- **The dialog performs no I/O.** `App::confirm_delete` parks the snapshot for
-  `App::take_confirmed_delete`, which the event loop drains — the same
-  request/take shape as `r`. Task 15 hangs the three-phase execution off that
-  hook; keep the state machine free of the network so it stays testable without
-  a runtime.
 - **Refused items are rendered, never dropped**: `Target::Refused` shows as
-  `SKIPPED` with its reason and its bytes are excluded from the total. The modal
-  also states whether the files go with the task (`delete_files`) and is
-  labelled `DRY RUN` when `--dry-run` is active — both come from
-  `delete::DeleteOptions`, which is session state and therefore a *parameter* of
-  `build_confirmation`, not a field of the plan.
+  `SKIPPED` with its reason, in snapshot order (so a dialog row maps to the row
+  the user selected), carries **no size** — a number beside a skip reads as bytes
+  about to be freed — and is excluded from the total.
+- **The totals line changes wording with `delete_files`**: "to free" when the
+  files go, "left on disk" when only the task does. Reporting "to free" for a
+  task-only delete would be the single most misleading number the program could
+  print. `--dry-run` is stated in the border title *and* the effect line, with a
+  yellow border instead of red.
 - `build_confirmation(&DeletePlan, DeleteOptions) -> ConfirmSummary` produces
   plain strings and counts and is where the wording and the arithmetic are
   tested; `render_confirm` only draws. Modal scroll is clamped in `App` against
-  the line count and again at render against the height, the same split as
+  the line count and again at render against the height — the same split as
   `ui::table`'s derived scroll offset.
-- `--fixture` mode forces `DeleteOptions::dry_run()`: there is no client
-  offline, so a modal promising a real recursive delete would be lying.
+
+### The help overlay (`dialog::HELP_SECTIONS`)
+
+- It is the keymap's public face, and it is **data, not formatted text**: a test
+  tokenizes every `keys` field and asserts each key `App` binds appears there —
+  add a binding, add a row, or the suite names the one you forgot.
+- The *implementation* is the source of truth for what it says (notably: `Enter`
+  presses the focused button in the confirmation, and commits an already-live
+  query in the search box). The README transcribes the overlay and says so, so
+  there is no second copy to drift.
+- The overlay binds nothing itself: **any key closes it and does nothing else**,
+  so dismissing with `d` cannot also open a delete confirmation. It lays out in
+  two columns and drops its inter-section blank lines rather than clipping — the
+  whole card has to fit **80x24**, and two tests pin that.
+
+### Empty states
+
+Chosen by `App::tasks` being empty, **not** by `View::is_narrowed`: with zero
+tasks and a filter set both are true, and blaming the filter sends the user
+pressing `f` at a NAS that has nothing to show. The narrowed state names how many
+rows are hidden and by what, so the fix is on screen rather than guessed at.
 
 ### Terminal lifecycle (`ui`)
 
 - `ui::TerminalGuard::new()` is the **only** place raw mode and the alternate
   screen are entered, and its `Drop` the only place they are left. It owns the
   `Terminal`, so a drawable terminal cannot outlive the restoration, and every
-  exit path — clean quit, `?` out of the loop, unwinding panic — restores.
+  exit path — clean quit, error out of the loop, unwinding panic — restores.
   Errors in `Drop` go to the log; there is nowhere else to put them.
+  `new()` also unwinds its own partial setup, so a half-failed startup never
+  hands back a raw-mode terminal with no program left to read keys.
 - `ui::install_panic_hook()` **chains** to the previous hook rather than
   replacing it (the backtrace must still print) and is `Once`-guarded so a
   double install cannot nest. Install it *before* constructing the guard.
 - Non-TTY stdout is a clean failure, not a corrupted terminal:
   `TerminalGuard::new()` returns the `enable_raw_mode` error and `main` prints
-  an actionable message and exits non-zero.
-- `ui::render(&mut Frame, &App)` is pure and takes `&App`. That is what makes
-  the frame testable with `ratatui::backend::TestBackend`, which renders into
-  an in-memory `Buffer` with **no TTY** — the right tool for layout regressions
-  even though the terminal lifecycle itself stays "verified by running".
-- The input source is a `spawn_blocking(event::read)` awaited one at a time,
-  because crossterm's `event-stream` feature is unavailable through ratatui's
-  re-export. Exactly one read is ever in flight, so nothing lingers on the
-  blocking pool at shutdown.
+  an actionable message and exits non-zero, having written nothing to stdout.
+- The caret in the search box is a **glyph** (`ui::SEARCH_CARET`), not the
+  terminal cursor, so `render` stays pure and the cursor stays hidden for the
+  whole session instead of being shown and hidden per mode.
 
 ### The event loop and the poller (`main.rs`, `event.rs`)
 
-- The loop is `draw → select!(terminal event, AppEvent) → apply`. **The pending
-  terminal read lives in a variable outside the loop** (`pending_read:
-  Option<JoinHandle<_>>`) and is only cleared when it resolves. A blocking read
+- The loop is `draw → select!(terminal event, AppEvent) → apply`.
+- The input source is a `spawn_blocking(event::read)` reader, because crossterm's
+  `event-stream` feature is unavailable through ratatui's re-export. **The
+  pending read lives in a variable outside the loop** (`pending_read:
+  Option<JoinHandle<_>>`) and is only cleared when it resolves: a blocking read
   cannot be cancelled, so re-creating it per iteration would spawn one orphaned
   stdin reader per poller tick and they would then take turns eating the user's
-  keystrokes. The `select!` yields a `Next` enum rather than acting in its
-  branch bodies, so the borrow ends with the expression.
+  keystrokes. Exactly one read is ever in flight. The `select!` yields a `Next`
+  enum rather than acting in its branch bodies, so the mutable borrow ends with
+  the expression.
 - **Everything that touches the network runs off the loop** and reports through
   the single `mpsc` channel of `event::AppEvent`. There is no `Tick` variant:
   the poller drives data, and data drives redraws.
 - **The poller is non-fatal.** A failed tick becomes `AppEvent::Error` and the
   interval keeps running; the next successful tick clears the banner. Never
   `return` out of the poller on a poll failure — a NAS that vanishes for a
-  minute is ordinary. It ends only when the channel closes or `main` aborts it.
-- **`r` is a request, not an action.** `App::request_refresh` sets a flag the
-  loop drains with `take_refresh_request` and forwards to an
-  `event::RefreshHandle` (an `Arc<Notify>`, so repeated presses coalesce into
-  one poll). `App` holds no runtime handle and every key press stays a pure
-  state transition.
+  minute is ordinary. It ends only when the channel closes or `main` aborts it,
+  which `main` does after the loop so an in-flight 30 s HTTP timeout cannot delay
+  exit.
+- **`r` is a request, not an action.** The loop drains it and pokes an
+  `event::RefreshHandle` (an `Arc<Notify>`, so repeated presses coalesce into one
+  poll); the poller `reset()`s its interval after a manual tick.
 - `App::apply_event` is the `AppEvent` counterpart of `App::handle_key` — same
-  shape, same testability. Keep the reconciliation logic there, not in `main`.
-- **`App::error` is not `App::status_message`.** The error banner is cleared
-  automatically by the next successful refresh and rendered red with `⚠`; the
-  status message survives underneath and returns when the banner clears.
+  shape, same testability. Keep reconciliation there, not in `main`.
 - `App::apply_tasks` invariants: the cursor follows its **task ID** through a
   reorder; a cursor task that vanished holds its *row number* and clamps; stale
   IDs are pruned from the selection; and a `Tasks` event arriving in
-  `Mode::Confirm` is **dropped entirely**, so the delete plan on screen cannot
-  go stale while the user reads it.
+  `Mode::Confirm` is **dropped entirely** — before touching anything, banner
+  included — so the delete plan on screen cannot go stale while it is being read.
 
-### The task table (`ui::table`)
+### Op tasks (`event::OpContext`)
 
-- The table is laid out **by hand**, not with ratatui's `Table` widget: every
-  cell is truncated and padded through `format::truncate_ellipsis` /
-  `display_width` so a CJK or emoji title cannot shear the columns to its
-  right, and each row is emitted as one pre-composed `Line`.
-- `COLUMNS` is the single definition of the column order, headers, fixed widths
-  and alignment. **Name is the only flexible column** — it absorbs all the
-  slack down to `MIN_NAME_WIDTH`; on a terminal narrower than `ideal_width()`
-  the rightmost columns are clipped by the buffer, because responsive column
-  *dropping* is deferred past v1.
-- Column headers are spelled exactly like `view::SortKey::label()`, and the
-  sort marker is placed by comparing the two. Do not introduce a second
-  key→column mapping. `SortKey::Added` has no column and so shows no marker.
-- **The scroll offset is derived, never stored** (`table::scroll_offset`): a
-  pure function of cursor, row count and viewport height, so no second piece of
-  state can disagree with a cursor that a refresh moved. `App` holds only the
-  cursor; the event loop pushes the body height in via `App::set_page_size`
-  after each draw so `PageUp`/`PageDown` move a real screenful.
-- Cursor movement **clamps and never wraps** — a `j` held at the bottom of a
-  long list wrapping to the top is how the wrong row gets deleted.
+Anything long-running gets an `OpContext { client, tx, refresh }`, runs off the
+loop, reports per item with `AppEvent::OpProgress` and once at the end with
+`OpDone`, and then pokes `refresh` — **one refresh per batch, not per item**.
+`App` renders the report through `app::op_summary`, which names only the non-zero
+categories and prefixes `⚠` when anything failed. **The report goes in
+`status_message`, never the error banner**: the batch's own refresh would clear
+the banner a moment after it appeared.
 
-### Help overlay and first run (`ui::dialog`, `config`, `main`)
+- Delete runs **per item**, because its *ordering* is per item.
+- Pause and resume are **one round trip for the whole batch**:
+  `event::spawn_task_op` sends the comma-separated id list once and derives
+  per-item outcomes from the per-task result array (`task_op_outcome`, which runs
+  each entry through `check_task_results`). An id DSM reported nothing for counts
+  as a **failure** — the refresh that follows shows the truth, and a false
+  "paused" is the answer the user cannot correct.
+- Neither pause nor resume is confirmed by a modal: each is undone by the other
+  key, and a modal in front of a reversible operation only trains the user to
+  dismiss modals.
+- `spawn_task_op` given `OpKind::Delete` logs an error and does nothing rather
+  than panicking — the three-phase ordering belongs to `spawn_delete`, and a
+  panic in an op task would take the terminal down with it.
 
-- **`dialog::HELP_SECTIONS` is the keymap's public face.** It is data, not
-  formatted text, and a test in `ui::dialog` tokenizes every `keys` field and
-  asserts each key `App` binds appears there — add a binding, add a row, or the
-  suite tells you which one you forgot. The *implementation* is the source of
-  truth for what the overlay says (notably: `Enter` presses the focused button
-  in the confirmation, and commits an already-live query in the search box).
-- The overlay binds nothing itself: **any key closes it and does nothing else**,
-  so dismissing with `d` cannot also open a delete confirmation. It lays out in
-  two columns and drops its inter-section blank lines rather than clipping when
-  the terminal is short — the whole card has to fit 80x24.
-- **A missing config *file* is never an error.** Only values still unresolved
-  after the CLI > env > file merge are, and `config::missing_required` asks that
-  question with the very same resolution `merge` enforces (`resolved_host` /
-  `resolved_username`) — never a second copy of the rule. `main::first_run` then
-  writes `config::CONFIG_TEMPLATE` and exits non-zero without entering the TUI.
-  The template has **every key commented out** (it must change nothing) and
-  `write_config_template` never overwrites an existing file.
-- **A startup connection or login failure exits non-zero with
-  `error::connection_diagnostic`** — host and port tried, the DSM code in words,
-  and one hint — rather than entering the TUI. An empty table is what a NAS with
-  no downloads looks like, so a failed login must never be able to render as
-  one. Poll failures *during* a session stay non-fatal (the footer banner).
-- The two empty states are chosen by `App::tasks` being empty, **not** by
-  `View::is_narrowed`: with zero tasks and a filter set both are true, and only
-  "there is nothing on the NAS" is the user's real problem. The narrowed state
-  names how many rows are hidden and what is hiding them.
+## Formatting
+
+- Sizes are **binary** (1 KiB = 1024 B) because that is what DSM reports.
+  `B`/`KiB` print as whole numbers, `MiB` and up get one decimal. The unit is
+  picked *after* rounding, so nothing ever renders as `1024 KiB`.
+- **Zero and unknown are different sentinels.** `speed(0)` is `DASH` (`—`) — the
+  task is idle, not unknown; an ETA that cannot be computed is `INFINITY` (`∞`).
+  Do not collapse them into `0`: rendering both as `0` tells the user a paused
+  task is about to finish.
+- `duration` renders **at most two units** (`45s`, `1m 5s`, `2h 14m`, `1d 1h`).
+  Seconds of precision on a four-hour download is false detail and costs column
+  width. `Some(0)` is a *known* `0s` and deliberately differs from `None`.
+- `percent` takes a **fraction** (`0.0..=1.0`), matching `Task::progress()`, not
+  an already-multiplied percentage. Out-of-range and non-finite inputs clamp
+  rather than surfacing a `NaN` in the table.
+- **Never size or pad a column with `str::len` or `chars().count()`.** Use
+  `format::display_width` and `format::truncate_ellipsis`, which measure
+  terminal cells via `unicode-width`; the fixture's CJK and emoji titles are
+  there to keep that honest. `truncate_ellipsis` never exceeds the requested
+  width and may stop one cell short rather than clip a double-width character
+  in half. Truncation is per `char`, not per grapheme cluster — correct
+  segmentation would mean another dependency for a title that was being elided
+  anyway.
+
+## Offline and debugging flags
+
+`--dump-api-info` and `--dump-tasks-json` print a raw DSM response verbatim and
+exit. They are `hide = true` — debugging aids, not advertised interface.
+`--dump-api-info` deliberately does **not** log in, since discovery needs no
+session and that is exactly the case where a login is what is broken.
+
+`--fixture <path>` runs the whole TUI over a captured `list` response with no
+network call and — deliberately — **no configuration at all**: it short-circuits
+`main` before the config merge, so it works on a machine with no config file, no
+host and no password. The file is a full DSM envelope, read through the same
+`parse_envelope::<TaskList>` the live path uses (`app::parse_fixture`), never a
+second, laxer parser: a fixture only the fixture loader can read would prove
+nothing about what the NAS sends. It **forces `DeleteOptions::dry_run()`** —
+there is no client offline, so a modal promising a real recursive delete would be
+lying.
+
+`--fixture` is hidden like the dump flags but is not one of them: `Cli::is_dump()`
+stays false, because it enters the TUI rather than printing and exiting.
 
 ## Testing philosophy
 
-Deliberately narrow. Pure logic where bugs are silent and expensive is tested:
-`format`, `model`, `view`, `error`, `api::client` envelope parsing, `app`
-selection/reconciliation, and above all **`delete`** — path resolution, guards
-and op ordering, which is the highest-value test in the project.
+Deliberately narrow, and that is a decision rather than an omission: TUI
+rendering and HTTP plumbing are obvious when broken, while a wrong sort
+comparator, a misparsed byte count or a mis-resolved delete path fails quietly
+and destroys data.
 
-Not tested (verified by running the binary): ratatui rendering, key wiring,
-live HTTP against DSM. No mocking framework and no trait abstraction over the
-HTTP client — one implementation does not warrant one. Offline verification
-uses the hidden `--fixture <path>` flag.
+**Tested:** `format`, `model`, `view`, `error`, `api::client` envelope parsing,
+`app` selection/reconciliation and the whole key state machine, and above all
+**`delete`** — path resolution, guards and op ordering, the highest-value tests in
+the project. Rendering is also covered far beyond the original intent, because
+`TestBackend` makes it free.
+
+**Not tested (verified by running the binary):** the terminal lifecycle (raw
+mode, alternate screen, panic hook), live HTTP against DSM.
+
+Rules that keep the suite honest:
+
+- **No test touches the network, a real timer, the real `$HOME`, or a process env
+  var.** Request construction is extracted into pure `build_*_params` functions
+  and ordering into pure `plan_delete_ops` / `ops_cancelled_by` precisely so the
+  interesting half needs no I/O. The whole suite runs in well under a second.
+- **No mocking framework and no trait abstraction over the HTTP client.** One
+  implementation does not warrant one. Where an executor has to be exercised end
+  to end, it is pointed at a host that does not resolve — which is also what makes
+  "`--dry-run` issued no call" a *positive* assertion rather than an inspection.
+- The panic hook is deliberately **not** unit-tested: it is process-global, and a
+  test installing one would swallow the output of any test panicking
+  concurrently.
+- `ui::tests::frame_lines` keeps the space ratatui parks in the continuation cell
+  of a double-width glyph (that is what makes its one-symbol-per-cell width check
+  correct), so a CJK title read back out of it has a space after every character.
+  Use `frame_text_narrow` when asserting that *text* reached the screen — a first
+  draft that did not looked exactly like a real bug.
+
+## Known gaps and outstanding debt
+
+Real, deliberate, and none of them a regression:
+
+- ⚠️ **The task-list fixture is `PROVISIONAL`** (see above). Re-capture from a
+  real DSM 7 NAS before release and confirm the discovered version ranges for
+  `SYNO.API.Auth`, `SYNO.DownloadStation.Task`, `SYNO.FileStation.List` and
+  `SYNO.FileStation.Delete` against the `SUPPORTED` consts.
+- ⚠️ **No live NAS and no TTY has ever exercised this.** Everything is verified by
+  unit tests, `TestBackend` frames and non-interactive runs of the binary. The
+  manual checks that remain are listed under Post-Completion in the plan.
+- ⚠️ **The README's terminal frame is a `TestBackend` rendering of the fixture,
+  not a screenshot.** A real capture is still owed before publishing.
+- ⚠️ **`https://github.com/emacarov/syno-clean` is a placeholder.** It appears in
+  `Cargo.toml`, `README.md`, `CONTRIBUTING.md` and `CHANGELOG.md`; confirm the
+  real org before publishing and update all four together. `publish = false`
+  guards against an accidental crates.io release.
+- **Eight sort keys against eleven columns.** Seeds/Peers, ETA and Destination
+  are not sortable, and `SortKey::Added` sorts by a value with no column. Post-v1
+  if it is missed.
+- **Responsive column *dropping* is deferred past v1** — a narrow terminal clips
+  the rightmost columns rather than rearranging.
+- **A share with the DSM Recycle Bin enabled may reclaim no space.** Documented in
+  the README; whether to surface a warning in the UI is unresolved and needs a
+  real NAS to answer.
+- **`--logout` is not suppressed by `--dry-run`.** Deliberate — ending a session
+  destroys no data and the flag is explicit.
+- **`SYNO.DownloadStation2.Task`** is a possible future migration, not a v1
+  concern.
