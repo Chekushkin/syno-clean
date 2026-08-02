@@ -291,6 +291,26 @@ categories and marks any batch containing a failure. **The report goes in
 `status_message`, never the error banner**: the batch's own refresh would clear
 the banner a moment after it appeared.
 
+### Pause and resume (`p` / `u`)
+
+- **One definition of "the current target"**: `App::target_tasks` — the
+  selection when there is one, the row under the cursor otherwise, nothing at
+  all when the table is empty. `d`, `p` and `u` all go through it, and a
+  selected task a filter is hiding is still included (the selection is what is
+  armed, not what is on screen).
+- `p`/`u` perform no I/O either. They park an `app::TaskOpRequest { op, ids }`
+  that the loop drains with `take_requested_op` — the same handshake as `r` and
+  the confirmed delete. Neither is confirmed: each is undone by the other key.
+- **One round trip for the whole batch.** `event::spawn_task_op` sends the
+  comma-separated id list once and derives per-item outcomes from the per-task
+  result array (`task_op_outcome`, which runs each entry through
+  `check_task_results`). An id DSM reported nothing for counts as a **failure** —
+  the refresh that follows shows the truth, and a false "paused" cannot be
+  corrected.
+- **`--dry-run` covers pause and resume too**, reported as skipped. Pausing
+  somebody's whole download list is a change however reversible it is, and a dry
+  run promises the NAS is not touched.
+
 ## Path-safety invariants (the dangerous part)
 
 Resolution order in `delete.rs`, and it **refuses rather than guesses**:

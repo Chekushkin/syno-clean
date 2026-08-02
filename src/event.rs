@@ -81,6 +81,16 @@ impl OpKind {
             OpKind::Resume => "resume",
         }
     }
+
+    /// How one *finished* item of the operation reads — the past tense of
+    /// [`OpKind::label`], for the per-item progress line.
+    pub fn past_tense(self) -> &'static str {
+        match self {
+            OpKind::Delete => "deleted",
+            OpKind::Pause => "paused",
+            OpKind::Resume => "resumed",
+        }
+    }
 }
 
 /// Anything that happens to the application other than a key press.
@@ -241,11 +251,12 @@ pub fn spawn_delete(ops: OpContext, plan: DeletePlan, options: DeleteOptions) ->
     tokio::spawn(async move { run_delete(ops, plan, options).await })
 }
 
-/// What happened to one item of a delete batch.
+/// What happened to one item of a batch — a delete, a pause or a resume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ItemOutcome {
-    /// Everything the plan asked for was done.
-    Deleted,
+    /// Everything the operation asked for was done. Carries the past tense of
+    /// the operation ([`OpKind::past_tense`]) so one enum serves all three.
+    Done(&'static str),
     /// Deliberately not acted on — a refused path, a directory that was already
     /// gone, or a dry run.
     Skipped(String),
@@ -257,7 +268,7 @@ impl ItemOutcome {
     /// How the outcome reads in the footer.
     fn detail(&self) -> String {
         match self {
-            ItemOutcome::Deleted => "deleted".to_string(),
+            ItemOutcome::Done(verb) => (*verb).to_string(),
             ItemOutcome::Skipped(why) => format!("skipped — {why}"),
             ItemOutcome::Failed(why) => format!("FAILED — {why}"),
         }
@@ -278,7 +289,7 @@ async fn run_delete(ops: OpContext, plan: DeletePlan, options: DeleteOptions) {
     for (index, item) in plan.items.iter().enumerate() {
         let outcome = delete_one(&ops.client, item, options).await;
         match outcome {
-            ItemOutcome::Deleted => succeeded += 1,
+            ItemOutcome::Done(_) => succeeded += 1,
             ItemOutcome::Skipped(_) => skipped += 1,
             ItemOutcome::Failed(_) => failed += 1,
         }
@@ -352,7 +363,7 @@ async fn delete_one(client: &SynoClient, item: &DeleteItem, options: DeleteOptio
     } else if files_were_already_gone {
         ItemOutcome::Skipped("the files were already gone; the task was removed".to_string())
     } else {
-        ItemOutcome::Deleted
+        ItemOutcome::Done(OpKind::Delete.past_tense())
     }
 }
 
@@ -476,6 +487,154 @@ async fn pause_and_confirm(client: &SynoClient, id: &str) -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pause and resume
+// ---------------------------------------------------------------------------
+
+/// Pause (`p`) or resume (`u`) a set of tasks in the background.
+///
+/// Same shape as [`spawn_delete`] — an [`OpContext`], per-item
+/// [`AppEvent::OpProgress`], one [`AppEvent::OpDone`], then a single refresh —
+/// but a single operation rather than an ordered sequence of phases, so there
+/// is nothing to cancel and nothing that can half-happen.
+///
+/// **One round trip for the whole batch.** Download Station takes a
+/// comma-separated id list and answers with a result *per task*, which is where
+/// the per-item outcomes come from; see [`task_op_outcome`].
+///
+/// `op` must be [`OpKind::Pause`] or [`OpKind::Resume`] — a delete carries an
+/// ordering and belongs to [`spawn_delete`].
+pub fn spawn_task_op(
+    ops: OpContext,
+    op: OpKind,
+    ids: Vec<String>,
+    dry_run: bool,
+) -> JoinHandle<()> {
+    tokio::spawn(async move { run_task_op(ops, op, ids, dry_run).await })
+}
+
+async fn run_task_op(ops: OpContext, op: OpKind, ids: Vec<String>, dry_run: bool) {
+    let total = ids.len();
+    if total == 0 {
+        return;
+    }
+
+    tracing::info!(op = op.label(), tasks = total, dry_run, "starting a batch");
+
+    let outcomes = if dry_run {
+        // `--dry-run` promises the NAS is not touched, and pausing somebody's
+        // whole download list is a change however reversible it is. Reported as
+        // *skipped*, never as a success — the same rule the delete executor
+        // follows.
+        ids.iter()
+            .map(|_| ItemOutcome::Skipped(format!("dry run — would {} this task", op.label())))
+            .collect()
+    } else {
+        match call_task_op(&ops.client, op, &ids).await {
+            Ok(results) => {
+                tracing::debug!(op = op.label(), results = ?results, "per-task results");
+                ids.iter()
+                    .map(|id| task_op_outcome(op, id, &results))
+                    .collect()
+            }
+            // The call itself failed, so nothing moved: every item of the batch
+            // is a failure, with the one reason repeated.
+            Err(err) => {
+                tracing::warn!(op = op.label(), %err, "the batch call failed");
+                let why = err.to_string();
+                ids.iter()
+                    .map(|_| ItemOutcome::Failed(why.clone()))
+                    .collect::<Vec<_>>()
+            }
+        }
+    };
+
+    let (mut succeeded, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+    for (index, (id, outcome)) in ids.iter().zip(&outcomes).enumerate() {
+        match outcome {
+            ItemOutcome::Done(_) => succeeded += 1,
+            ItemOutcome::Skipped(_) => skipped += 1,
+            ItemOutcome::Failed(_) => failed += 1,
+        }
+        let progress = AppEvent::OpProgress {
+            op,
+            done: index + 1,
+            total,
+            detail: format!("{id}: {}", outcome.detail()),
+        };
+        if ops.tx.send(progress).await.is_err() {
+            tracing::debug!("the event channel closed mid-batch; stopping");
+            return;
+        }
+    }
+
+    tracing::info!(
+        op = op.label(),
+        succeeded,
+        skipped,
+        failed,
+        "batch finished"
+    );
+    let _ = ops
+        .tx
+        .send(AppEvent::OpDone {
+            op,
+            succeeded,
+            skipped,
+            failed,
+        })
+        .await;
+
+    // Every status on screen for these rows is now stale, and a pause the user
+    // cannot see take effect is a pause they will press again.
+    ops.refresh.request();
+}
+
+/// Issue the one call the operation needs.
+///
+/// A [`OpKind::Delete`] here is a programming error rather than something the
+/// user can provoke: the three-phase ordering lives in [`spawn_delete`]. It is
+/// reported and dropped rather than panicking, since a panic would take the
+/// terminal down with it.
+async fn call_task_op(
+    client: &SynoClient,
+    op: OpKind,
+    ids: &[String],
+) -> Result<Vec<download_station::TaskOpResult>> {
+    match op {
+        OpKind::Pause => download_station::pause_tasks(client, ids).await,
+        OpKind::Resume => download_station::resume_tasks(client, ids).await,
+        OpKind::Delete => {
+            tracing::error!("a delete batch must go through spawn_delete");
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// What one task's entry in a `pause` / `resume` result array means.
+///
+/// ⚠️ The failure is **inside** a `success: true` envelope, so the entry has to
+/// be read: [`check_task_results`] over the single matching entry is that
+/// reading, and is the same helper the delete executor uses. An id the NAS
+/// reported nothing for is a failure rather than a success — the task list
+/// refresh that follows shows what really happened, and a silent "3 paused" for
+/// a task that did not pause is the answer that cannot be corrected.
+///
+/// [`check_task_results`]: crate::api::download_station::check_task_results
+fn task_op_outcome(
+    op: OpKind,
+    id: &str,
+    results: &[download_station::TaskOpResult],
+) -> ItemOutcome {
+    let Some(result) = results.iter().find(|result| result.id == id) else {
+        return ItemOutcome::Failed("DSM reported no result for this task".to_string());
+    };
+    match download_station::check_task_results(std::slice::from_ref(result)) {
+        Ok(()) => ItemOutcome::Done(op.past_tense()),
+        Err(err) => ItemOutcome::Failed(err.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The poller itself needs a NAS and a clock, so what is tested here is the
@@ -560,7 +719,7 @@ mod tests {
     fn each_outcome_reads_differently_in_the_footer() {
         // A skip and a failure must not be mistakable for one another, and
         // neither may be mistakable for a delete that happened.
-        assert_eq!(ItemOutcome::Deleted.detail(), "deleted");
+        assert_eq!(ItemOutcome::Done("deleted").detail(), "deleted");
         assert_eq!(
             ItemOutcome::Skipped("the files were already gone".into()).detail(),
             "skipped — the files were already gone"
@@ -574,5 +733,129 @@ mod tests {
     #[test]
     fn the_pause_confirmation_is_bounded_and_polls_more_than_once() {
         assert!(PAUSE_CONFIRM_TIMEOUT > PAUSE_CONFIRM_INTERVAL * 2);
+    }
+
+    // ---- pause and resume ---------------------------------------------------
+    //
+    // The call is one round trip and needs a NAS; what is pure — and what would
+    // silently report a failed pause as a success if it were wrong — is reading
+    // the per-task result array.
+
+    use crate::api::download_station::TaskOpResult;
+    use crate::config::ResolvedConfig;
+
+    /// A client nothing ever calls.
+    ///
+    /// Both batch tests below short-circuit before any request — an empty batch
+    /// returns immediately and a dry run issues nothing — so this only has to
+    /// exist. Constructing it makes no connection.
+    fn uncalled_client() -> Arc<SynoClient> {
+        let config = ResolvedConfig {
+            host: "nas.invalid".to_string(),
+            port: 5001,
+            https: true,
+            insecure: false,
+            username: "tester".to_string(),
+            refresh_secs: 3,
+            delete_files: true,
+            dry_run: true,
+            logout: false,
+        };
+        Arc::new(SynoClient::new(&config).expect("building a client issues no request"))
+    }
+
+    fn result(id: &str, error: i32) -> TaskOpResult {
+        TaskOpResult {
+            id: id.to_string(),
+            error,
+        }
+    }
+
+    #[test]
+    fn an_operation_names_itself_in_the_past_tense_for_a_finished_item() {
+        assert_eq!(OpKind::Delete.past_tense(), "deleted");
+        assert_eq!(OpKind::Pause.past_tense(), "paused");
+        assert_eq!(OpKind::Resume.past_tense(), "resumed");
+    }
+
+    #[test]
+    fn a_zero_result_is_the_task_actually_having_been_paused() {
+        let results = [result("dbid_001", 0), result("dbid_002", 0)];
+        assert_eq!(
+            task_op_outcome(OpKind::Pause, "dbid_002", &results),
+            ItemOutcome::Done("paused")
+        );
+        assert_eq!(
+            task_op_outcome(OpKind::Resume, "dbid_001", &results),
+            ItemOutcome::Done("resumed")
+        );
+    }
+
+    #[test]
+    fn a_per_task_error_code_is_a_failure_even_inside_a_successful_envelope() {
+        // The trap: DSM answers `{"success": true, "data": [{"error": 544}]}`
+        // for a task it did not touch. Reading only the envelope would report
+        // this as a pause that happened.
+        let results = [result("dbid_001", 0), result("dbid_002", 544)];
+        let outcome = task_op_outcome(OpKind::Pause, "dbid_002", &results);
+        assert!(
+            matches!(&outcome, ItemOutcome::Failed(why) if why.contains("544")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            task_op_outcome(OpKind::Pause, "dbid_001", &results),
+            ItemOutcome::Done("paused"),
+            "one failing task must not condemn the rest of the batch"
+        );
+    }
+
+    #[test]
+    fn a_task_the_nas_said_nothing_about_is_a_failure_not_a_success() {
+        let outcome = task_op_outcome(OpKind::Resume, "dbid_009", &[result("dbid_001", 0)]);
+        assert!(
+            matches!(&outcome, ItemOutcome::Failed(why) if why.contains("no result")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_batch_makes_no_call_and_reports_nothing() {
+        // `p` on an empty table must not produce a phantom "0 succeeded" line.
+        let (tx, mut rx) = channel();
+        let ops = OpContext::new(uncalled_client(), tx, RefreshHandle::new());
+        run_task_op(ops, OpKind::Pause, Vec::new(), false).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_issues_no_call_and_counts_every_item_as_skipped() {
+        let (tx, mut rx) = channel();
+        let ops = OpContext::new(uncalled_client(), tx, RefreshHandle::new());
+        let ids = vec!["dbid_001".to_string(), "dbid_002".to_string()];
+        run_task_op(ops, OpKind::Pause, ids, true).await;
+
+        // Two progress lines naming the dry run, then a summary with no
+        // successes — a dry run must never read as "2 succeeded".
+        for expected in 1..=2 {
+            match rx.recv().await {
+                Some(AppEvent::OpProgress {
+                    op, done, detail, ..
+                }) => {
+                    assert_eq!(op, OpKind::Pause);
+                    assert_eq!(done, expected);
+                    assert!(detail.contains("dry run"), "{detail}");
+                }
+                other => panic!("expected progress, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            rx.recv().await,
+            Some(AppEvent::OpDone {
+                op: OpKind::Pause,
+                succeeded: 0,
+                skipped: 2,
+                failed: 0,
+            })
+        );
     }
 }

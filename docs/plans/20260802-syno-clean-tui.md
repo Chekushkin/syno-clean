@@ -626,11 +626,22 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 - Modify: `src/app.rs`
 - Modify: `src/event.rs`
 
-- [ ] implement `pause_tasks(ids)` / `resume_tasks(ids)` reusing `build_ds_id_params`
-- [ ] wire `p` and `u` to run them as op tasks over the selection (or the cursor row)
-- [ ] report per-item results in the status bar and refresh immediately after completion
-- [ ] write a test for target-ID selection (selection when non-empty, else cursor row, empty list is a no-op)
-- [ ] run `cargo test` — must pass before task 17
+- [x] implement `pause_tasks(ids)` / `resume_tasks(ids)` reusing `build_ds_id_params` — `pause_tasks` landed in Task 15 (the delete ordering needed it); this task added `resume_tasks` as its exact mirror
+- [x] wire `p` and `u` to run them as op tasks over the selection (or the cursor row) — `App::pause_target` / `resume_target` park an `app::TaskOpRequest`, `event::spawn_task_op` runs it off the loop through `OpContext`
+- [x] report per-item results in the status bar and refresh immediately after completion — per-item `OpProgress`, one `OpDone` through `app::op_summary`, then a single `refresh.request()` for the batch
+- [x] write a test for target-ID selection (selection when non-empty, else cursor row, empty list is a no-op) — plus a hidden-but-selected task, a stale selection, take-once, and `p`/`u` being Normal-mode-only
+- [x] run `cargo test` — must pass before task 17 — 452 tests pass (16 new), none touching a network or a real timer
+
+⚠️ **Decisions taken during Task 16** (plan text above kept verbatim; actuals recorded here):
+- ➕ **`App::target_tasks` is now the single definition of "what the current key acts on"** — the selection when non-empty, the cursor row otherwise, nothing when the table is empty. `d`'s `delete_target` was rewritten on top of it rather than `p`/`u` getting a second copy of the rule: three keys that disagreed about the target is how a user who armed a selection ends up pausing whatever the cursor was resting on. A selected task the filter is hiding is included, exactly as it already was for `d`.
+- **Neither key is confirmed.** `d` gets a modal because it destroys data; pause and resume are each undone by the other key, and a modal in front of a reversible operation only trains the user to dismiss modals.
+- **One round trip for the whole batch, not one per task.** Download Station takes the comma-separated id list and answers with a result *per task*, so per-item outcomes come from ➕ the pure `event::task_op_outcome`, which runs each entry through Task 15's `check_task_results` (`{"success": true, "data": [{"error": 544}]}` is still the trap). The delete executor stays per item because its *ordering* is per item.
+- **An id DSM returned no result for is reported as a failure**, not a success. The refresh that follows shows what really happened either way, and a false "3 paused" is the answer the user cannot correct.
+- 🔺 **`--dry-run` suppresses pause and resume too**, reporting every item as *skipped*. The plan only ever discusses dry-run in terms of the destructive delete, but a flag that promises the NAS is untouched and then pauses somebody's whole download list is a trap; `spawn_task_op` therefore takes a plain `dry_run: bool` (not `DeleteOptions`, which is delete-specific state).
+- ➕ **`ItemOutcome::Deleted` became `ItemOutcome::Done(&'static str)`** carrying ➕ `OpKind::past_tense()` ("deleted"/"paused"/"resumed"), so one outcome enum and one footer wording serve all three operations instead of the delete executor and the new one drifting apart.
+- `spawn_task_op` given `OpKind::Delete` logs an error and does nothing rather than panicking — the three-phase ordering belongs to `spawn_delete`, and a panic in an op task would take the terminal down with it.
+- ➕ `NORMAL_HINTS` now names `p/u pause/resume`; the footer test that asserts on the hint text renders 90 cells wide instead of 60 to fit it (the footer is clipped, never wrapped).
+- ➕ 16 tests: the target rule in every shape the plan asks for, the per-result outcome mapping (success, a per-task code inside a success envelope, a missing entry), the dry-run accounting and an empty batch making no call. `CLAUDE.md` gained a "Pause and resume" section.
 
 ### Task 17: Help overlay and first-run experience
 
