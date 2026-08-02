@@ -38,8 +38,8 @@ pub const DEFAULT_PAGE_SIZE: usize = 20;
 
 /// What the UI is currently doing, and therefore which keys mean what.
 ///
-/// Only [`Mode::Normal`] is reachable so far: search lands in Task 12, the
-/// confirmation modal in Task 14 and the help overlay in Task 17.
+/// [`Mode::Normal`] and [`Mode::Search`] are reachable; the confirmation modal
+/// lands in Task 14 and the help overlay in Task 17.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Mode {
     /// Browsing the table.
@@ -83,6 +83,11 @@ pub struct App {
     /// the poller. A flag rather than a channel handle so `App` stays free of
     /// the runtime and every key press stays a pure state transition.
     refresh_requested: bool,
+    /// The query [`View::search`] held when `/` was pressed, so `Esc` can put
+    /// it back. `Some` exactly while [`Mode::Search`] is active: the search box
+    /// edits the live query (the table narrows as the user types), so the only
+    /// way to undo an abandoned edit is to have kept the original.
+    search_backup: Option<String>,
     /// Set by `q` / `Ctrl-C`; the event loop owns the actual exit.
     quit: bool,
 }
@@ -101,6 +106,7 @@ impl Default for App {
             error: None,
             page_size: DEFAULT_PAGE_SIZE,
             refresh_requested: false,
+            search_backup: None,
             quit: false,
         }
     }
@@ -244,6 +250,102 @@ impl App {
     /// Rows a page jump moves.
     pub fn page_size(&self) -> usize {
         self.page_size
+    }
+
+    // ---- sort, filter and search -------------------------------------------
+    //
+    // Every one of these changes *which rows are on screen and in what order*,
+    // and none of them may change **what is armed for deletion**. So they all
+    // go through [`App::change_view`], which puts the cursor back on the task
+    // it was on and leaves [`App::selected`] strictly alone.
+
+    /// Advance to the next sort column (`s`).
+    pub fn cycle_sort(&mut self) {
+        self.change_view(View::cycle_sort);
+    }
+
+    /// Reverse the sort direction (`S`).
+    pub fn toggle_sort_dir(&mut self) {
+        self.change_view(View::toggle_dir);
+    }
+
+    /// Advance to the next status filter (`f`).
+    pub fn cycle_filter(&mut self) {
+        self.change_view(View::cycle_filter);
+    }
+
+    /// Apply a change to the view and put the cursor back where it belongs.
+    ///
+    /// The cursor is a row number in the *visible* list, so re-sorting or
+    /// re-filtering underneath it would otherwise silently move it onto a
+    /// different task — the same hazard [`App::apply_tasks`] guards against for
+    /// a refresh, and it is resolved the same way: follow the task by **ID**,
+    /// and when the change hides that task altogether keep the row number and
+    /// clamp it into whatever is left.
+    ///
+    /// The selection is deliberately untouched. A filter is a question about
+    /// what to *look* at; it is never an instruction to disarm rows that
+    /// scrolled out of sight.
+    fn change_view(&mut self, change: impl FnOnce(&mut View)) {
+        let cursor_id = self.cursor_task().map(|task| task.id.clone());
+
+        change(&mut self.view);
+
+        if let Some(id) = cursor_id
+            && let Some(row) = self
+                .visible()
+                .iter()
+                .position(|&index| self.tasks[index].id == id)
+        {
+            self.cursor = row;
+        }
+        self.clamp_cursor();
+    }
+
+    /// Start editing the search query (`/`).
+    ///
+    /// The current query is kept — `/` refines a search rather than throwing it
+    /// away — and stashed, so `Esc` can restore it.
+    pub fn begin_search(&mut self) {
+        self.search_backup = Some(self.view.search.clone());
+        self.mode = Mode::Search;
+    }
+
+    /// Accept the query as typed and leave search mode (`Enter`).
+    ///
+    /// The table is already showing the result: matching happens on every
+    /// keystroke, so `Enter` commits rather than applies. Dropping the backup
+    /// is the commit.
+    pub fn commit_search(&mut self) {
+        self.search_backup = None;
+        self.mode = Mode::Normal;
+    }
+
+    /// Abandon the edit and restore the query `/` was pressed on (`Esc`).
+    ///
+    /// Note this is `Esc` in [`Mode::Search`] only — in [`Mode::Normal`] the
+    /// same key clears the selection.
+    pub fn cancel_search(&mut self) {
+        if let Some(previous) = self.search_backup.take() {
+            self.change_view(|view| view.search = previous);
+        }
+        self.mode = Mode::Normal;
+    }
+
+    /// Append one typed character to the query.
+    pub fn search_push(&mut self, c: char) {
+        self.change_view(|view| view.search.push(c));
+    }
+
+    /// Delete the last character of the query (`Backspace`).
+    ///
+    /// Backspacing past the start is a no-op rather than an exit: leaving the
+    /// mode on an empty query would make the key that widens a search
+    /// occasionally cancel it instead.
+    pub fn search_pop(&mut self) {
+        self.change_view(|view| {
+            view.search.pop();
+        });
     }
 
     // ---- selection ---------------------------------------------------------
@@ -413,16 +515,16 @@ impl App {
 
         match self.mode {
             Mode::Normal => self.handle_normal_key(key),
-            // Search input (Task 12), the confirmation modal (Task 14) and the
-            // help overlay (Task 17) each own their keys. Until they land,
-            // nothing can put the app into these modes; falling back to Normal
-            // means a stray mode can never trap the user.
-            Mode::Search | Mode::Confirm | Mode::Help => self.mode = Mode::Normal,
+            Mode::Search => self.handle_search_key(key),
+            // The confirmation modal (Task 14) and the help overlay (Task 17)
+            // each own their keys. Until they land, nothing can put the app
+            // into these modes; falling back to Normal means a stray mode can
+            // never trap the user.
+            Mode::Confirm | Mode::Help => self.mode = Mode::Normal,
         }
     }
 
-    /// Keys while browsing the table. Sort/filter and search land in Task 12,
-    /// the operations in Tasks 14-16.
+    /// Keys while browsing the table. The operations land in Tasks 14-16.
     fn handle_normal_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.quit(),
@@ -435,9 +537,38 @@ impl App {
             KeyCode::Char(' ') => self.toggle_selection(),
             KeyCode::Char('a') => self.toggle_select_all_visible(),
             KeyCode::Char('r') => self.request_refresh(),
-            // Task 12 gives `Esc` its other jobs (leave search, dismiss a
-            // dialog); in Normal mode it is the panic button for a selection.
+            KeyCode::Char('s') => self.cycle_sort(),
+            KeyCode::Char('S') => self.toggle_sort_dir(),
+            KeyCode::Char('f') => self.cycle_filter(),
+            KeyCode::Char('/') => self.begin_search(),
+            // `Esc` is mode-specific: here it is the panic button for a
+            // selection, in `Mode::Search` it cancels the edit.
             KeyCode::Esc => self.clear_selection(),
+            _ => {}
+        }
+    }
+
+    /// Keys while the search box has focus.
+    ///
+    /// Everything printable is **text**, not a command: `q` types a `q` rather
+    /// than quitting, and the only way out is `Enter`, `Esc` or the global
+    /// `Ctrl-C`. A search box where half the alphabet still triggers bindings
+    /// is a search box that cannot search for those letters.
+    fn handle_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => self.commit_search(),
+            KeyCode::Esc => self.cancel_search(),
+            KeyCode::Backspace => self.search_pop(),
+            // A modified character is a command someone aimed elsewhere, not
+            // something to type. `Shift` is excluded from that: it is how a
+            // capital letter arrives.
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.search_push(c);
+            }
             _ => {}
         }
     }
@@ -767,6 +898,360 @@ mod tests {
         app.clamp_cursor();
         assert_eq!(app.cursor, 0);
         assert_eq!(app.cursor_task().map(|t| t.id.as_str()), Some("dbid_004"));
+    }
+
+    // ---- sort, filter and search keys --------------------------------------
+
+    #[test]
+    fn s_cycles_the_sort_column_and_leaves_the_direction_alone() {
+        let mut app = App::new(fixture_tasks());
+        assert_eq!(app.view.sort_key, view::SortKey::Name);
+
+        app.handle_key(press(KeyCode::Char('s')));
+        assert_eq!(app.view.sort_key, view::SortKey::Status);
+        assert_eq!(app.view.sort_dir, view::SortDir::Asc);
+
+        // All the way round and back to where it started.
+        for _ in 1..view::SortKey::ALL.len() {
+            app.handle_key(press(KeyCode::Char('s')));
+        }
+        assert_eq!(app.view.sort_key, view::SortKey::Name);
+    }
+
+    #[test]
+    fn capital_s_reverses_the_sort_without_changing_the_column() {
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('s')));
+        let key = app.view.sort_key;
+
+        app.handle_key(press(KeyCode::Char('S')));
+        assert_eq!(app.view.sort_dir, view::SortDir::Desc);
+        assert_eq!(app.view.sort_key, key);
+
+        app.handle_key(press(KeyCode::Char('S')));
+        assert_eq!(app.view.sort_dir, view::SortDir::Asc);
+    }
+
+    #[test]
+    fn f_cycles_the_status_filter_and_wraps() {
+        let mut app = App::new(fixture_tasks());
+        let mut seen = vec![app.view.filter];
+        for _ in 1..StatusFilter::ALL.len() {
+            app.handle_key(press(KeyCode::Char('f')));
+            seen.push(app.view.filter);
+        }
+        assert_eq!(seen, StatusFilter::ALL.to_vec());
+
+        app.handle_key(press(KeyCode::Char('f')));
+        assert_eq!(app.view.filter, StatusFilter::All);
+        assert_eq!(app.visible_count(), 14);
+    }
+
+    #[test]
+    fn a_sort_change_keeps_the_cursor_on_the_same_task() {
+        // Pressing `s` must not hand the cursor — and therefore the next `d` —
+        // to whatever task happens to land on that row number.
+        let mut app = App::new(fixture_tasks());
+        app.cursor = 3;
+        let before = cursor_id(&app).expect("a row under the cursor").to_string();
+
+        app.handle_key(press(KeyCode::Char('s')));
+        assert_eq!(cursor_id(&app), Some(before.as_str()));
+        app.handle_key(press(KeyCode::Char('S')));
+        assert_eq!(cursor_id(&app), Some(before.as_str()));
+    }
+
+    #[test]
+    fn a_filter_change_clamps_the_cursor_into_the_new_visible_set() {
+        let mut app = App::new(fixture_tasks());
+        app.cursor_to_last();
+        assert_eq!(app.cursor, 13);
+
+        // All -> Downloading -> Seeding -> Finished -> Paused, which leaves
+        // exactly one row: a cursor of 13 cannot survive it.
+        for _ in 0..4 {
+            app.handle_key(press(KeyCode::Char('f')));
+        }
+        assert_eq!(app.view.filter, StatusFilter::Paused);
+        assert_eq!(app.visible_count(), 1);
+        assert_eq!(app.cursor, 0);
+        assert_eq!(cursor_id(&app), Some("dbid_004"));
+    }
+
+    #[test]
+    fn a_filter_that_hides_everything_leaves_a_valid_cursor() {
+        let mut app = App::new(fixture_tasks());
+        app.cursor_to_last();
+        app.search_push('z');
+        app.search_push('z');
+        app.search_push('z');
+        assert_eq!(app.visible_count(), 0);
+        assert_eq!(app.cursor, 0);
+        assert!(app.cursor_task().is_none());
+    }
+
+    #[test]
+    fn a_filter_change_leaves_the_selection_untouched() {
+        // A filter is a question about what to look at, never an instruction to
+        // disarm rows that scrolled out of sight.
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('a')));
+        assert_eq!(app.selected_count(), 14);
+        let armed = selected_ids(&app);
+
+        for _ in 0..StatusFilter::ALL.len() {
+            app.handle_key(press(KeyCode::Char('f')));
+            assert_eq!(selected_ids(&app), armed, "{:?}", app.view.filter);
+        }
+        app.handle_key(press(KeyCode::Char('s')));
+        app.handle_key(press(KeyCode::Char('S')));
+        assert_eq!(selected_ids(&app), armed);
+    }
+
+    #[test]
+    fn a_filter_change_keeps_the_cursor_on_a_task_that_survives_it() {
+        // The cursor is a row number, and narrowing the list renumbers every
+        // row. It has to follow the *task*.
+        let mut app = App::new(fixture_tasks());
+        app.cursor = app
+            .visible()
+            .iter()
+            .position(|&index| app.tasks[index].id == "dbid_001")
+            .expect("the downloading task");
+        let row_before = app.cursor;
+
+        // All -> Downloading, which dbid_001 is part of.
+        app.handle_key(press(KeyCode::Char('f')));
+        assert_eq!(app.view.filter, StatusFilter::Downloading);
+        assert_ne!(app.cursor, row_before, "the rows were renumbered");
+        assert_eq!(cursor_id(&app), Some("dbid_001"));
+    }
+
+    // ---- the search-mode state machine -------------------------------------
+
+    /// Type a whole query, one key event at a time.
+    fn type_query(app: &mut App, query: &str) {
+        for c in query.chars() {
+            app.handle_key(press(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn slash_enters_search_mode_without_disturbing_the_table() {
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('/')));
+        assert_eq!(app.mode, Mode::Search);
+        assert!(app.view.search.is_empty());
+        assert_eq!(app.visible_count(), 14);
+    }
+
+    #[test]
+    fn typing_narrows_the_table_as_the_query_grows() {
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('/')));
+        type_query(&mut app, "1080p");
+        assert_eq!(app.view.search, "1080p");
+        assert_eq!(app.visible_count(), 3, "matching is live, not on Enter");
+        assert_eq!(app.mode, Mode::Search);
+    }
+
+    #[test]
+    fn backspace_widens_the_search_again_and_stops_at_an_empty_query() {
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('/')));
+        type_query(&mut app, "ubuntu");
+        assert_eq!(app.visible_count(), 1);
+
+        for _ in 0..10 {
+            app.handle_key(press(KeyCode::Backspace));
+        }
+        assert_eq!(app.view.search, "");
+        assert_eq!(app.visible_count(), 14);
+        assert_eq!(
+            app.mode,
+            Mode::Search,
+            "backspacing past the start is inert"
+        );
+    }
+
+    #[test]
+    fn enter_commits_the_query_and_returns_to_normal_mode() {
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('/')));
+        type_query(&mut app, "1080p");
+        app.handle_key(press(KeyCode::Enter));
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.view.search, "1080p");
+        assert_eq!(app.visible_count(), 3);
+
+        // ...and a committed query cannot be un-done by a later Esc.
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.view.search, "1080p");
+    }
+
+    #[test]
+    fn esc_cancels_the_edit_and_restores_the_previous_query() {
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('/')));
+        type_query(&mut app, "1080p");
+        app.handle_key(press(KeyCode::Enter));
+
+        // A second search, abandoned half typed.
+        app.handle_key(press(KeyCode::Char('/')));
+        type_query(&mut app, "-nope");
+        assert_eq!(app.view.search, "1080p-nope");
+        assert_eq!(app.visible_count(), 0);
+
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.view.search, "1080p", "the prior query comes back");
+        assert_eq!(app.visible_count(), 3);
+    }
+
+    #[test]
+    fn esc_out_of_a_first_search_restores_the_empty_query() {
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('/')));
+        type_query(&mut app, "ubuntu");
+        assert_eq!(app.visible_count(), 1);
+
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.view.search, "");
+        assert_eq!(app.visible_count(), 14);
+    }
+
+    #[test]
+    fn slash_refines_the_committed_query_rather_than_clearing_it() {
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('/')));
+        type_query(&mut app, "ubuntu");
+        app.handle_key(press(KeyCode::Enter));
+
+        app.handle_key(press(KeyCode::Char('/')));
+        assert_eq!(app.view.search, "ubuntu", "reopening keeps what was typed");
+        app.handle_key(press(KeyCode::Backspace));
+        assert_eq!(app.view.search, "ubunt");
+    }
+
+    #[test]
+    fn every_printable_key_is_text_in_search_mode() {
+        // `q` must not quit, `a` must not select all, `g`/`G` must not jump and
+        // `/` is just a slash — a search box that cannot type the alphabet is
+        // not a search box.
+        let mut app = App::new(fixture_tasks());
+        app.cursor = 5;
+        app.handle_key(press(KeyCode::Char('/')));
+        type_query(&mut app, "qagGsSfr/ ");
+
+        assert_eq!(app.view.search, "qagGsSfr/ ");
+        assert!(!app.should_quit());
+        assert!(app.selected.is_empty());
+        assert_eq!(app.view.sort_key, view::SortKey::Name);
+        assert_eq!(app.view.filter, StatusFilter::All);
+        assert!(!app.take_refresh_request());
+    }
+
+    #[test]
+    fn a_control_chord_is_not_typed_into_the_query() {
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('/')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+        assert!(app.view.search.is_empty());
+        assert_eq!(app.mode, Mode::Search);
+
+        // ...but a shifted character is how a capital letter arrives.
+        app.handle_key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT));
+        assert_eq!(app.view.search, "U");
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_out_of_the_search_box() {
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('/')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn a_search_leaves_the_selection_alone_and_moves_the_cursor_only_to_stay_valid() {
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('a')));
+        let armed = selected_ids(&app);
+        app.cursor_to_last();
+
+        app.handle_key(press(KeyCode::Char('/')));
+        type_query(&mut app, "1080p");
+        assert_eq!(
+            selected_ids(&app),
+            armed,
+            "a search arms and disarms nothing"
+        );
+        assert_eq!(app.visible_count(), 3);
+        assert!(
+            app.cursor < 3 && app.cursor_task().is_some(),
+            "the cursor was pulled into the matching rows: {}",
+            app.cursor
+        );
+
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(selected_ids(&app), armed);
+    }
+
+    #[test]
+    fn a_search_keeps_the_cursor_on_a_task_that_still_matches() {
+        let mut app = App::new(fixture_tasks());
+        app.view.sort_key = view::SortKey::Size;
+        app.cursor = 0;
+        let kept = app
+            .visible()
+            .iter()
+            .map(|&index| app.tasks[index].clone())
+            .find(|task| task.title.contains("1080p"))
+            .expect("a matching task");
+        app.cursor = app
+            .visible()
+            .iter()
+            .position(|&index| app.tasks[index].id == kept.id)
+            .expect("its row");
+
+        app.handle_key(press(KeyCode::Char('/')));
+        type_query(&mut app, "1080p");
+        assert_eq!(cursor_id(&app), Some(kept.id.as_str()));
+    }
+
+    #[test]
+    fn esc_in_normal_mode_still_clears_the_selection() {
+        // The two jobs of `Esc` must stay mode-correct: cancelling a search in
+        // `Mode::Search`, clearing the selection in `Mode::Normal`.
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('/')));
+        type_query(&mut app, "1080p");
+        app.handle_key(press(KeyCode::Enter));
+        app.handle_key(press(KeyCode::Char('a')));
+        assert_eq!(app.selected_count(), 3);
+
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.selected.is_empty(), "Esc cleared the selection");
+        assert_eq!(app.view.search, "1080p", "...and not the search");
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn a_refresh_arriving_mid_search_does_not_close_the_box() {
+        // The poller keeps running while the user types; the query, the mode
+        // and the reconciled cursor all have to survive it.
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('/')));
+        type_query(&mut app, "ubuntu");
+        let kept = cursor_id(&app).expect("the one match").to_string();
+
+        app.apply_event(AppEvent::Tasks(fixture_tasks()));
+
+        assert_eq!(app.mode, Mode::Search);
+        assert_eq!(app.view.search, "ubuntu");
+        assert_eq!(cursor_id(&app), Some(kept.as_str()));
     }
 
     // ---- selection ---------------------------------------------------------

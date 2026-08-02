@@ -290,6 +290,28 @@ call, so what the user read on screen is exactly what gets deleted.
   runs every binding twice. `Ctrl-C` is handled before the mode dispatch so it
   works from inside a modal.
 
+### Sort, filter and search (`App::change_view`)
+
+- **Every view change goes through `App::change_view`** (`s`, `S`, `f`, and
+  every keystroke in the search box). It follows the cursor's task by **ID**
+  through the re-sort or the re-filter, falls back to holding the row number
+  when the change hides that task, and then clamps — the same rules
+  `apply_tasks` uses for a refresh, for the same reason: a cursor that lands on
+  a different torrent is how the wrong thing gets deleted.
+- **A view change never touches the selection.** A filter is a question about
+  what to look at, not an instruction to disarm rows that scrolled off screen.
+- **Search matches live, on every keystroke**, so `Enter` *commits* rather than
+  applies. The query being edited is `view.search` itself; `App::search_backup`
+  holds what it was when `/` was pressed and is the only way `Esc` can undo an
+  abandoned edit. `/` deliberately keeps the committed query so a search can be
+  refined.
+- **`Esc` is mode-specific**: cancel-and-restore in `Mode::Search`, clear the
+  selection in `Mode::Normal`. Keep both halves correct when adding modes.
+- **In `Mode::Search` every printable key is text**, never a binding — a box
+  that cannot type `q` cannot search. Only `Enter`, `Esc`, `Backspace` and the
+  global `Ctrl-C` are commands; `Ctrl`/`Alt` chords are dropped rather than
+  typed, and `Shift` is not (it is how a capital letter arrives).
+
 ### Terminal lifecycle (`ui`)
 
 - `ui::TerminalGuard::new()` is the **only** place raw mode and the alternate

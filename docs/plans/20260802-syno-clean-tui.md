@@ -515,12 +515,23 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 - Modify: `src/app.rs`
 - Modify: `src/ui/mod.rs`
 
-- [ ] wire `s` (cycle sort column), `S` (reverse direction), `f` (cycle status filter)
-- [ ] implement search mode: `/` enters it, characters/backspace edit the query, `Enter` applies, `Esc` restores the previous query
-- [ ] render the search input line and show the active sort/filter state in the status bar
-- [ ] ensure cursor and selection survive a filter change (cursor clamps into the new visible set; selection is untouched)
-- [ ] write tests for the search-mode state machine (enter, type, backspace, cancel restores prior query, apply commits)
-- [ ] run `cargo test` — must pass before task 13
+- [x] wire `s` (cycle sort column), `S` (reverse direction), `f` (cycle status filter) — `App::cycle_sort` / `toggle_sort_dir` / `cycle_filter`, all three through the private `App::change_view`
+- [x] implement search mode: `/` enters it, characters/backspace edit the query, `Enter` applies, `Esc` restores the previous query — `App::begin_search` / `search_push` / `search_pop` / `commit_search` / `cancel_search` plus `App::handle_search_key`; matching is **live**, so `Enter` commits rather than applies
+- [x] render the search input line and show the active sort/filter state in the status bar — `ui::search_bar` takes over the footer in `Mode::Search`; `ui::view_summary` adds `sort Name▲` (always) and `filter …` / `search "…"` (only while they hide rows)
+- [x] ensure cursor and selection survive a filter change (cursor clamps into the new visible set; selection is untouched) — `change_view` follows the cursor's task by ID, else holds the row number, then clamps; the selection is never read or written
+- [x] write tests for the search-mode state machine (enter, type, backspace, cancel restores prior query, apply commits)
+- [x] run `cargo test` — must pass before task 13 — 290 tests pass
+
+⚠️ **Decisions taken during Task 12** (plan text above kept verbatim; actuals recorded here):
+- **Search matches on every keystroke, not on `Enter`.** The plan says "`Enter` applies"; with a live-narrowing table there is nothing left for it to apply, so it *commits* — it drops the backup that `Esc` would have restored. The visible behaviour of both keys is exactly as specified; what changed is that the table updates while typing, which is also what makes `Esc`'s restore meaningful.
+- **`/` keeps the committed query rather than clearing it**, so a search can be refined (`/`, backspace, retype) instead of retyped from scratch. `Esc` still restores whatever it was on entry, so nothing is lost either way.
+- ➕ **All five view mutations share one private `App::change_view`**, which reproduces `apply_tasks`' cursor rules: follow the task by **ID**, else hold the row number, then clamp. The plan only requires the cursor to clamp on a filter change, but a `s` that silently slides the cursor onto a different torrent is the same hazard `apply_tasks` was careful about, and one helper is cheaper than four copies of the rule. Selection is untouched by construction — `change_view` never reads it.
+- **In `Mode::Search` every printable key is text.** `q` types a `q`; only `Enter`, `Esc`, `Backspace` and the global `Ctrl-C` are commands, and `Ctrl`/`Alt` chords are dropped rather than typed (`Shift` is not — it is how a capital arrives). Backspacing past the start of an empty query is inert rather than an exit: the key that widens a search must not occasionally cancel it.
+- **`Esc` is dispatched per mode** — `cancel_search` in `Mode::Search`, `clear_selection` in `Mode::Normal` — and both halves have their own test so a later mode cannot quietly break one.
+- **The search box takes over the footer** rather than claiming a fourth layout row. A dedicated row would shrink the table only while typing and put `ui::table_page_size` (which does not know the mode) out of step with the real body height. The sort/filter summary is displaced for those few seconds; the query itself is the state being edited.
+- The caret is a **glyph** (`ui::SEARCH_CARET`), not the terminal cursor: `render` stays a pure function of `&App` that `TestBackend` can assert on, and the cursor stays hidden for the whole session instead of being shown and hidden per mode.
+- `filter …` and `search "…"` appear in the footer **only when they are hiding rows** — a permanent `filter All` is noise, and the segment disappearing is precisely the feedback that `f` has wrapped back round to showing everything. The sort segment is always shown, since the header marker alone cannot say which way an off-screen column points.
+- ➕ 26 tests added (21 in `app`, 5 in `ui`), and ➕ `CLAUDE.md` gained a "Sort, filter and search" section recording these invariants.
 
 ### Task 13: Delete-path resolution and safety guards
 

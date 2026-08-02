@@ -35,8 +35,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Padding, Paragraph};
 
-use crate::app::App;
+use crate::app::{App, Mode};
 use crate::format;
+use crate::view::{StatusFilter, View};
 
 /// The backend this program draws on: crossterm over stdout.
 pub type Backend = CrosstermBackend<Stdout>;
@@ -45,9 +46,23 @@ pub type Backend = CrosstermBackend<Stdout>;
 /// overlay (Task 17); this is the reminder that it exists.
 const NORMAL_HINTS: &str = "q quit · r refresh · ? help";
 
+/// Footer hints while the search box has focus.
+const SEARCH_HINTS: &str = "Enter apply · Esc cancel";
+
 /// Prefix on the non-fatal error banner, so a failure is recognizable as one
 /// even where colour is unavailable.
 pub const ERROR_MARKER: &str = "⚠";
+
+/// What the search input line opens with — the key that opened it.
+pub const SEARCH_PROMPT: &str = "/";
+
+/// The caret drawn at the end of the query.
+///
+/// A glyph rather than the terminal's own cursor: [`render`] stays a pure
+/// function of `&App` that a `TestBackend` can assert on, and the cursor is
+/// hidden for the whole session (see [`TerminalGuard::new`]) rather than being
+/// shown and hidden per mode.
+pub const SEARCH_CARET: &str = "█";
 
 /// Rows the frame spends on chrome: the title bar, the table header and the
 /// footer.
@@ -243,14 +258,44 @@ fn selection_summary(app: &App) -> Option<String> {
     ))
 }
 
-/// The footer: the selection summary, then the error banner if there is one,
-/// otherwise the last status message or the key hints.
+/// How the table is currently sorted, and what is narrowing it.
+///
+/// The sort is always shown: there is always one, and the header marker alone
+/// does not say which way an off-screen column points. The filter and the
+/// search appear **only when they are hiding rows** — a permanent `filter All`
+/// is noise, and its disappearing is exactly the feedback that `f` wrapped back
+/// round to showing everything.
+fn view_summary(view: &View) -> String {
+    let mut parts = vec![format!(
+        "sort {}{}",
+        view.sort_key.label(),
+        view.sort_dir.arrow()
+    )];
+    if view.filter != StatusFilter::All {
+        parts.push(format!("filter {}", view.filter.label()));
+    }
+    if !view.search.is_empty() {
+        parts.push(format!("search \"{}\"", view.search));
+    }
+    parts.join(" · ")
+}
+
+/// The footer: the selection summary, the sort/filter state, then the error
+/// banner if there is one, otherwise the last status message or the key hints.
 ///
 /// The selection comes first because it is the state that changes what the next
 /// `d` will do. An error outranks the status message and is *not* dimmed — a
 /// poll failure is non-fatal, so the only way the user learns the numbers on
 /// screen have stopped moving is by reading it.
+///
+/// While the search box has focus the whole line becomes the input
+/// ([`search_bar`]): the query is the only state the user is manipulating, and
+/// it must be legible with a long one typed.
 fn footer_bar(app: &App) -> Paragraph<'static> {
+    if app.mode == Mode::Search {
+        return search_bar(&app.view.search);
+    }
+
     let (tail, style) = match &app.error {
         Some(error) => (
             format!("{ERROR_MARKER} {error}"),
@@ -263,11 +308,23 @@ fn footer_bar(app: &App) -> Paragraph<'static> {
             Style::default().add_modifier(Modifier::DIM),
         ),
     };
-    let text = match selection_summary(app) {
-        Some(selection) => format!(" {selection} · {tail} "),
-        None => format!(" {tail} "),
-    };
-    Paragraph::new(Line::from(text)).style(style)
+
+    let mut segments: Vec<String> = Vec::new();
+    segments.extend(selection_summary(app));
+    segments.push(view_summary(&app.view));
+    segments.push(tail);
+    Paragraph::new(Line::from(format!(" {} ", segments.join(" · ")))).style(style)
+}
+
+/// The search input line, drawn in place of the footer while typing.
+///
+/// Undimmed and prompt-led, so the mode is obvious at a glance: the one thing
+/// worse than a search box is a search box the user does not know they are in.
+fn search_bar(query: &str) -> Paragraph<'static> {
+    Paragraph::new(Line::from(format!(
+        " {SEARCH_PROMPT}{query}{SEARCH_CARET} · {SEARCH_HINTS} "
+    )))
+    .style(Style::default().fg(Color::Yellow))
 }
 
 #[cfg(test)]
@@ -497,6 +554,76 @@ mod tests {
             "exactly the one selected row is marked:\n{}",
             lines.join("\n")
         );
+    }
+
+    #[test]
+    fn the_footer_names_the_active_sort_column_and_direction() {
+        let mut app = App::new(fixture_tasks());
+        assert!(frame_lines(&app, 120, 8)[7].contains("sort Name▲"));
+
+        app.cycle_sort();
+        app.toggle_sort_dir();
+        let footer = frame_lines(&app, 120, 8)[7].clone();
+        assert!(footer.contains("sort Status▼"), "{footer:?}");
+    }
+
+    #[test]
+    fn the_footer_names_a_filter_and_a_search_only_while_they_hide_rows() {
+        // A permanent "filter All" is noise; the segment appearing is the
+        // feedback that `f` did something, and its going away is the feedback
+        // that the cycle wrapped back round.
+        let mut app = App::new(fixture_tasks());
+        assert!(!frame_lines(&app, 120, 8)[7].contains("filter"));
+
+        app.cycle_filter();
+        let footer = frame_lines(&app, 120, 8)[7].clone();
+        assert!(footer.contains("filter Downloading"), "{footer:?}");
+
+        app.view.search = "1080p".to_string();
+        let footer = frame_lines(&app, 120, 8)[7].clone();
+        assert!(footer.contains("search \"1080p\""), "{footer:?}");
+
+        // ...and back to All with the query cleared, both segments are gone.
+        for _ in 1..StatusFilter::ALL.len() {
+            app.cycle_filter();
+        }
+        app.view.search.clear();
+        let footer = frame_lines(&app, 120, 8)[7].clone();
+        assert!(!footer.contains("filter"), "{footer:?}");
+        assert!(!footer.contains("search"), "{footer:?}");
+    }
+
+    #[test]
+    fn the_search_box_takes_over_the_footer_while_typing() {
+        let mut app = App::new(fixture_tasks());
+        app.begin_search();
+        for c in "108".chars() {
+            app.search_push(c);
+        }
+
+        let lines = frame_lines(&app, 120, 8);
+        let footer = &lines[7];
+        assert!(footer.contains("/108"), "{footer:?}");
+        assert!(footer.contains(SEARCH_CARET), "{footer:?}");
+        assert!(footer.contains(SEARCH_HINTS), "{footer:?}");
+        assert!(!footer.contains(NORMAL_HINTS), "{footer:?}");
+        // The table keeps rendering underneath, already narrowed.
+        assert!(lines[1].contains("Name"), "{:?}", lines[1]);
+        assert!(lines[0].contains("3 / 14 tasks"), "{:?}", lines[0]);
+    }
+
+    #[test]
+    fn leaving_the_search_box_gives_the_footer_back() {
+        let mut app = App::new(fixture_tasks());
+        app.set_status("nas.local as eduard");
+        app.begin_search();
+        app.search_push('x');
+        assert!(!frame_lines(&app, 120, 8)[7].contains("nas.local as eduard"));
+
+        app.cancel_search();
+        let footer = frame_lines(&app, 120, 8)[7].clone();
+        assert!(footer.contains("nas.local as eduard"), "{footer:?}");
+        assert!(!footer.contains(SEARCH_CARET), "{footer:?}");
     }
 
     #[test]
