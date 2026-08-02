@@ -1,5 +1,9 @@
-//! Modal overlays. Today that is the delete confirmation; the `?` help overlay
-//! lands here too in Task 17.
+//! Modal overlays: the delete confirmation and the `?` help.
+//!
+//! The help overlay ([`HELP_SECTIONS`], [`render_help`]) is **the** reference
+//! for what the keyboard does, so it is data rather than a formatted blob — a
+//! test walks the entries and asserts every key `App` binds appears in it, which
+//! is the only thing that stops a new binding from being invisible.
 //!
 //! The confirmation is the last thing standing between a keystroke and an
 //! irreversible recursive delete, so it is built in two halves that can be
@@ -424,6 +428,384 @@ fn button(label: &str, focused: bool, colour: Color) -> Span<'static> {
     Span::styled(format!("[ {label} ]"), style)
 }
 
+// ---- the help overlay ------------------------------------------------------
+
+/// Border title of the `?` overlay.
+pub const HELP_TITLE: &str = "Keybindings";
+
+/// Footer of the `?` overlay. The overlay binds nothing itself — **any** key
+/// closes it — so this is the only instruction it needs.
+pub const HELP_DISMISS: &str = "any key closes this help";
+
+/// Cells between the two columns when both fit.
+const HELP_COLUMN_GAP: u16 = 2;
+
+/// Cells the border and its padding cost on either side.
+const HELP_CHROME: u16 = 4;
+
+/// Cells between a key and what it does.
+const HELP_KEY_GAP: usize = 2;
+
+/// One binding in the help overlay.
+///
+/// `keys` is a space-separated list of the keys that do the same thing (`↑ k`),
+/// which is also how the cross-check test tokenizes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelpEntry {
+    pub keys: &'static str,
+    pub action: &'static str,
+}
+
+/// A titled group of bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelpSection {
+    pub title: &'static str,
+    pub entries: &'static [HelpEntry],
+}
+
+impl HelpSection {
+    /// Rows this section occupies: its title plus one row per binding.
+    pub fn height(&self) -> usize {
+        self.entries.len() + 1
+    }
+}
+
+/// Every keybinding the program has, grouped as a user would look for them.
+///
+/// **The implementation is the source of truth**, so this table follows
+/// `App::handle_normal_key`, `handle_search_key` and `handle_confirm_key`
+/// rather than any prose — including the two places where the shipped
+/// behaviour is deliberately not what the original plan sketched: `Enter` in
+/// the confirmation presses the *focused* button (which starts on Cancel), and
+/// `Enter` in the search box commits a query that has been matching live since
+/// the first keystroke.
+pub const HELP_SECTIONS: &[HelpSection] = &[
+    HelpSection {
+        title: "Navigation",
+        entries: &[
+            HelpEntry {
+                keys: "↑ k",
+                action: "move up",
+            },
+            HelpEntry {
+                keys: "↓ j",
+                action: "move down",
+            },
+            HelpEntry {
+                keys: "PgUp PgDn",
+                action: "move a screenful",
+            },
+            HelpEntry {
+                keys: "Home g",
+                action: "first row",
+            },
+            HelpEntry {
+                keys: "End G",
+                action: "last row",
+            },
+        ],
+    },
+    HelpSection {
+        title: "Selection",
+        entries: &[
+            HelpEntry {
+                keys: "Space",
+                action: "toggle this row",
+            },
+            HelpEntry {
+                keys: "a",
+                action: "(de)select visible rows",
+            },
+            HelpEntry {
+                keys: "Esc",
+                action: "clear the selection",
+            },
+        ],
+    },
+    HelpSection {
+        title: "Actions",
+        entries: &[
+            HelpEntry {
+                keys: "d",
+                action: "delete (asks first)",
+            },
+            HelpEntry {
+                keys: "p",
+                action: "pause selection or row",
+            },
+            HelpEntry {
+                keys: "u",
+                action: "resume selection or row",
+            },
+            HelpEntry {
+                keys: "r",
+                action: "refresh now",
+            },
+        ],
+    },
+    HelpSection {
+        title: "Sort, filter, search",
+        entries: &[
+            HelpEntry {
+                keys: "s",
+                action: "next sort column",
+            },
+            HelpEntry {
+                keys: "S",
+                action: "reverse the direction",
+            },
+            HelpEntry {
+                keys: "f",
+                action: "next status filter",
+            },
+            HelpEntry {
+                keys: "/",
+                action: "search titles",
+            },
+        ],
+    },
+    HelpSection {
+        title: "Search box",
+        entries: &[
+            HelpEntry {
+                keys: "Enter",
+                action: "apply and close the box",
+            },
+            HelpEntry {
+                keys: "Esc",
+                action: "cancel, restore query",
+            },
+            HelpEntry {
+                keys: "Backspace",
+                action: "delete a character",
+            },
+        ],
+    },
+    HelpSection {
+        title: "Confirmation dialog",
+        entries: &[
+            HelpEntry {
+                keys: "y",
+                action: "delete",
+            },
+            HelpEntry {
+                keys: "n Esc q",
+                action: "cancel",
+            },
+            HelpEntry {
+                keys: "Enter",
+                action: "press focused button",
+            },
+            HelpEntry {
+                keys: "Tab ← → h l",
+                action: "switch button",
+            },
+            HelpEntry {
+                keys: "↑ ↓ k j",
+                action: "scroll the list",
+            },
+        ],
+    },
+    HelpSection {
+        title: "General",
+        entries: &[
+            HelpEntry {
+                keys: "?",
+                action: "this help",
+            },
+            HelpEntry {
+                keys: "q",
+                action: "quit",
+            },
+            HelpEntry {
+                keys: "Ctrl-C",
+                action: "quit from anywhere",
+            },
+        ],
+    },
+];
+
+/// Split the sections into two columns of as near the same height as possible.
+///
+/// Pure, so the balance is testable without a frame: the whole table is far too
+/// tall for one column on an ordinary terminal, and a lopsided split wastes the
+/// height it was supposed to save.
+pub fn split_columns(sections: &[HelpSection]) -> (&[HelpSection], &[HelpSection]) {
+    if sections.len() < 2 {
+        return (sections, &[]);
+    }
+
+    let mut best = (usize::MAX, 1);
+    for split in 1..sections.len() {
+        // The overlay is as tall as its *taller* column, so that — not the
+        // difference between them — is what a split has to minimize.
+        let tallest =
+            column_rows(&sections[..split], true).max(column_rows(&sections[split..], true));
+        if tallest < best.0 {
+            best = (tallest, split);
+        }
+    }
+    sections.split_at(best.1)
+}
+
+/// Rows a column of `sections` needs, with or without a blank line between
+/// them.
+///
+/// The blank lines are the first thing dropped on a terminal too short for the
+/// whole card: losing the last two bindings off the bottom is a worse trade
+/// than a denser list, and 24 rows is an extremely ordinary terminal.
+fn column_rows(sections: &[HelpSection], spaced: bool) -> usize {
+    let content: usize = sections.iter().map(HelpSection::height).sum();
+    if spaced {
+        content + sections.len().saturating_sub(1)
+    } else {
+        content
+    }
+}
+
+/// Cells a column of `sections` needs: the widest key, the gap, and the widest
+/// action — measured at **display width**, since the key column holds arrows.
+fn column_width(sections: &[HelpSection]) -> u16 {
+    let keys = sections
+        .iter()
+        .flat_map(|section| section.entries)
+        .map(|entry| display_width(entry.keys))
+        .max()
+        .unwrap_or(0);
+    let body = sections
+        .iter()
+        .flat_map(|section| {
+            section
+                .entries
+                .iter()
+                .map(move |entry| keys + HELP_KEY_GAP + display_width(entry.action))
+        })
+        .chain(sections.iter().map(|section| display_width(section.title)))
+        .max()
+        .unwrap_or(0);
+    u16::try_from(body).unwrap_or(u16::MAX)
+}
+
+/// The rendered lines of one column: a styled title, then `keys  action` rows,
+/// with a blank line between sections.
+fn column_lines(sections: &[HelpSection], spaced: bool) -> Vec<Line<'static>> {
+    let key_width = sections
+        .iter()
+        .flat_map(|section| section.entries)
+        .map(|entry| display_width(entry.keys))
+        .max()
+        .unwrap_or(0);
+
+    let mut lines = Vec::with_capacity(column_rows(sections, spaced));
+    for (index, section) in sections.iter().enumerate() {
+        if spaced && index > 0 {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(Span::styled(
+            section.title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for entry in section.entries {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    pad(entry.keys, key_width),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" ".repeat(HELP_KEY_GAP)),
+                Span::raw(entry.action),
+            ]));
+        }
+    }
+    lines
+}
+
+/// Pad `text` to `width` terminal cells. `str`'s own `{:width$}` counts
+/// characters, which is not the same thing the moment an arrow shows up.
+fn pad(text: &str, width: usize) -> String {
+    format!(
+        "{text}{}",
+        " ".repeat(width.saturating_sub(display_width(text)))
+    )
+}
+
+/// Draw the `?` overlay over whatever is on screen.
+///
+/// Two columns when the terminal is wide enough for both, one otherwise. Either
+/// way the content is **clipped, never scrolled**: the overlay is dismissed by
+/// any key, so there is no key left over to scroll it with, and a two-column
+/// layout is what keeps it inside an ordinary terminal in the first place.
+pub fn render_help(frame: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let (left, right) = split_columns(HELP_SECTIONS);
+    let two_up = !right.is_empty()
+        && area.width >= column_width(left) + HELP_COLUMN_GAP + column_width(right) + HELP_CHROME;
+
+    let content_width = if two_up {
+        column_width(left) + HELP_COLUMN_GAP + column_width(right)
+    } else {
+        column_width(HELP_SECTIONS)
+    };
+    // Rows the body needs, with the blank lines between sections and without.
+    let rows = |spaced: bool| -> u16 {
+        let rows = if two_up {
+            column_rows(left, spaced).max(column_rows(right, spaced))
+        } else {
+            column_rows(HELP_SECTIONS, spaced)
+        };
+        u16::try_from(rows).unwrap_or(u16::MAX)
+    };
+    // The body, the dismissal footer and the two border rows. A card that would
+    // be clipped is tightened up first — every binding on screen beats an airy
+    // layout with the last two scrolled into nowhere.
+    let spaced = rows(true).saturating_add(3) <= area.height;
+    let content_rows = rows(spaced);
+
+    let width = content_width.saturating_add(HELP_CHROME).min(area.width);
+    let height = content_rows.saturating_add(3).min(area.height);
+
+    let modal = centred(area, width, height);
+    frame.render_widget(Clear, modal);
+
+    let block = Block::bordered()
+        .title(format!(" {HELP_TITLE} "))
+        .border_style(Style::default().fg(Color::Cyan))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let [body, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+
+    if two_up {
+        let [left_area, _, right_area] = Layout::horizontal([
+            Constraint::Length(column_width(left)),
+            Constraint::Length(HELP_COLUMN_GAP),
+            Constraint::Min(0),
+        ])
+        .areas(body);
+        frame.render_widget(Paragraph::new(column_lines(left, spaced)), left_area);
+        frame.render_widget(Paragraph::new(column_lines(right, spaced)), right_area);
+    } else {
+        frame.render_widget(Paragraph::new(column_lines(HELP_SECTIONS, spaced)), body);
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            HELP_DISMISS,
+            Style::default().add_modifier(Modifier::DIM),
+        )))
+        .centered(),
+        footer,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,5 +1060,146 @@ mod tests {
         assert_eq!(wrapped_height("short", 40), 1);
         assert_eq!(wrapped_height(&"x".repeat(41), 40), 2);
         assert_eq!(wrapped_height("anything", 0), 1);
+    }
+
+    // ---- the help overlay --------------------------------------------------
+
+    /// Every key token the overlay documents, `keys` split on whitespace.
+    fn documented_keys() -> Vec<&'static str> {
+        HELP_SECTIONS
+            .iter()
+            .flat_map(|section| section.entries)
+            .flat_map(|entry| entry.keys.split_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn the_overlay_documents_every_key_the_app_binds() {
+        // The overlay is the only place a user can learn the keymap, so a
+        // binding missing from it is a binding that does not exist as far as
+        // they are concerned. This list mirrors `App::handle_normal_key`,
+        // `handle_search_key` and `handle_confirm_key` — add a key there,
+        // add it here, and this test tells you which one you forgot.
+        let documented = documented_keys();
+        for key in [
+            // Normal mode.
+            "↑",
+            "↓",
+            "k",
+            "j",
+            "PgUp",
+            "PgDn",
+            "Home",
+            "End",
+            "g",
+            "G",
+            "Space",
+            "a",
+            "Esc",
+            "d",
+            "p",
+            "u",
+            "r",
+            "s",
+            "S",
+            "f",
+            "/",
+            "?",
+            "q",
+            "Ctrl-C",
+            // The search box.
+            "Enter",
+            "Backspace", // The confirmation.
+            "y",
+            "n",
+            "Tab",
+            "←",
+            "→",
+            "h",
+            "l",
+        ] {
+            assert!(
+                documented.contains(&key),
+                "the help overlay never mentions {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_entry_is_populated_and_narrow_enough_to_lay_out() {
+        // Two columns are what keep the overlay inside an ordinary terminal;
+        // an over-long action silently forces the single-column fallback.
+        for section in HELP_SECTIONS {
+            assert!(!section.title.is_empty());
+            assert!(!section.entries.is_empty(), "{}", section.title);
+            for entry in section.entries {
+                assert!(!entry.keys.is_empty(), "{}", section.title);
+                assert!(!entry.action.is_empty(), "{}", entry.keys);
+                assert!(
+                    display_width(entry.action) <= 25,
+                    "{:?} is too wide for a column",
+                    entry.action
+                );
+            }
+        }
+
+        let (left, right) = split_columns(HELP_SECTIONS);
+        let total = column_width(left) + HELP_COLUMN_GAP + column_width(right) + HELP_CHROME;
+        assert!(total <= 80, "two columns need {total} cells");
+    }
+
+    #[test]
+    fn the_columns_are_split_to_keep_the_card_short() {
+        let (left, right) = split_columns(HELP_SECTIONS);
+        assert!(!left.is_empty() && !right.is_empty());
+        assert_eq!(left.len() + right.len(), HELP_SECTIONS.len());
+
+        // No other contiguous split produces a shorter overlay.
+        let tallest = column_rows(left, true).max(column_rows(right, true));
+        for split in 1..HELP_SECTIONS.len() {
+            let other = column_rows(&HELP_SECTIONS[..split], true)
+                .max(column_rows(&HELP_SECTIONS[split..], true));
+            assert!(tallest <= other, "split at {split} is shorter");
+        }
+
+        // Dropping the blank lines is what makes it fit a 24-row terminal.
+        let tight = column_rows(left, false).max(column_rows(right, false));
+        assert!(tight + 3 <= 24, "{tight} rows plus chrome");
+
+        // Degenerate inputs must not panic or lose a section.
+        assert_eq!(split_columns(&[]).0.len(), 0);
+        assert_eq!(split_columns(&HELP_SECTIONS[..1]).0.len(), 1);
+        assert!(split_columns(&HELP_SECTIONS[..1]).1.is_empty());
+    }
+
+    #[test]
+    fn a_column_renders_one_row_per_binding_plus_its_title() {
+        let (left, _) = split_columns(HELP_SECTIONS);
+        for spaced in [true, false] {
+            assert_eq!(
+                column_lines(left, spaced).len(),
+                column_rows(left, spaced),
+                "spaced: {spaced}"
+            );
+        }
+
+        // Keys are padded to a common width so the actions line up, and the
+        // padding is measured in cells rather than characters.
+        let lines = column_lines(&HELP_SECTIONS[..1], true);
+        let widths: Vec<usize> = lines[1..]
+            .iter()
+            .map(|line| display_width(&line.spans[0].content))
+            .collect();
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "{widths:?}"
+        );
+    }
+
+    #[test]
+    fn padding_counts_cells_not_characters() {
+        assert_eq!(pad("ab", 5), "ab   ");
+        assert_eq!(pad("↑ k", 5), "↑ k  ");
+        assert_eq!(pad("too long", 3), "too long");
     }
 }

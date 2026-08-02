@@ -39,9 +39,6 @@ use crate::view::{self, View};
 pub const DEFAULT_PAGE_SIZE: usize = 20;
 
 /// What the UI is currently doing, and therefore which keys mean what.
-///
-/// [`Mode::Normal`], [`Mode::Search`] and [`Mode::Confirm`] are reachable; the
-/// help overlay lands in Task 17.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Mode {
     /// Browsing the table.
@@ -52,7 +49,7 @@ pub enum Mode {
     /// The delete confirmation modal is open. Refreshes are suspended in this
     /// mode so the plan on screen cannot go stale under the user.
     Confirm,
-    /// The help overlay is open.
+    /// The `?` help overlay is open. It binds nothing: **any** key closes it.
     Help,
 }
 
@@ -810,11 +807,23 @@ impl App {
             Mode::Normal => self.handle_normal_key(key),
             Mode::Search => self.handle_search_key(key),
             Mode::Confirm => self.handle_confirm_key(key),
-            // The help overlay (Task 17) owns its keys. Until it lands nothing
-            // can put the app into that mode; falling back to Normal means a
-            // stray mode can never trap the user.
-            Mode::Help => self.mode = Mode::Normal,
+            // The overlay is a reference card, not a mode with bindings: every
+            // key closes it, including the one the user reached for next.
+            // Nothing else happens on that key — a `d` that dismissed the help
+            // *and* opened a delete confirmation would be a surprise on the
+            // screen that exists to remove surprises.
+            Mode::Help => self.close_help(),
         }
+    }
+
+    /// Open the `?` overlay.
+    pub fn show_help(&mut self) {
+        self.mode = Mode::Help;
+    }
+
+    /// Close the `?` overlay (any key).
+    pub fn close_help(&mut self) {
+        self.mode = Mode::Normal;
     }
 
     /// Keys while browsing the table. The operations land in Tasks 14-16.
@@ -838,6 +847,7 @@ impl App {
             KeyCode::Char('p') => self.pause_target(),
             KeyCode::Char('u') => self.resume_target(),
             KeyCode::Char('/') => self.begin_search(),
+            KeyCode::Char('?') => self.show_help(),
             // `Esc` is mode-specific: here it is the panic button for a
             // selection, in `Mode::Search` it cancels the edit.
             KeyCode::Esc => self.clear_selection(),
@@ -1083,16 +1093,69 @@ mod tests {
         assert!(app.should_quit());
     }
 
+    // ---- the help overlay --------------------------------------------------
+
     #[test]
-    fn any_key_leaves_a_mode_that_has_no_handler_yet() {
-        // Placeholder behaviour until Tasks 12/14/17: a mode with no key
-        // handling must never trap the user in it.
-        let mut app = App {
-            mode: Mode::Help,
-            ..App::default()
-        };
-        app.handle_key(press(KeyCode::Char('x')));
+    fn question_mark_opens_the_help_overlay() {
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('?')));
+        assert_eq!(app.mode, Mode::Help);
+    }
+
+    #[test]
+    fn any_key_closes_the_help_overlay() {
+        // A reference card must never be a mode the user has to work out how
+        // to leave, so every key is the way out — including `?` itself.
+        for key in [
+            KeyCode::Char('x'),
+            KeyCode::Char('?'),
+            KeyCode::Char('d'),
+            KeyCode::Esc,
+            KeyCode::Enter,
+            KeyCode::Down,
+        ] {
+            let mut app = App::new(fixture_tasks());
+            app.handle_key(press(KeyCode::Char('?')));
+            assert_eq!(app.mode, Mode::Help, "{key:?}");
+            app.handle_key(press(key));
+            assert_eq!(app.mode, Mode::Normal, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_key_that_closes_the_help_does_nothing_else() {
+        // Dismissing the help with `d` must not also open a delete
+        // confirmation: the overlay exists to remove surprises.
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('?')));
+        app.handle_key(press(KeyCode::Char('d')));
         assert_eq!(app.mode, Mode::Normal);
+        assert!(app.pending_delete().is_none());
+
+        // ...and nor does it move the cursor or touch the selection.
+        let mut app = App::new(fixture_tasks());
+        app.cursor = 3;
+        app.handle_key(press(KeyCode::Char('?')));
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(app.cursor, 3);
+        assert!(app.selected.is_empty());
+    }
+
+    #[test]
+    fn the_help_key_is_normal_mode_only() {
+        // In the search box `?` is a character to search for; in the
+        // confirmation it is an unbound key and must change nothing.
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('/')));
+        app.handle_key(press(KeyCode::Char('?')));
+        assert_eq!(app.mode, Mode::Search);
+        assert_eq!(app.view.search, "?");
+
+        let mut app = App::new(fixture_tasks());
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.mode, Mode::Confirm);
+        app.handle_key(press(KeyCode::Char('?')));
+        assert_eq!(app.mode, Mode::Confirm);
     }
 
     #[test]
