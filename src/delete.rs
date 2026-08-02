@@ -29,8 +29,18 @@
 //!    the title is precisely the value the file list just contradicted, and a
 //!    guessed directory name can easily match an unrelated folder that already
 //!    exists next to it — which is then recursively deleted.
-//! 3. **No file list at all** (HTTP/FTP/NZB tasks, which have no `file` block) —
-//!    the `title`, which for those task types *is* the on-disk name.
+//! 3. **No file list at all, on a task type that has none** (HTTP/FTP/NZB/eMule,
+//!    which carry no `file` block) — the `title`, which for those task types
+//!    *is* the on-disk name.
+//! 4. **No file list on a BitTorrent task** — **REFUSE**. Rule 3 was written for
+//!    the types that legitimately have no list; for a torrent the list is
+//!    metadata DSM had before it wrote a byte, so its absence is an anomaly and
+//!    the title is exactly the value rule 2 already refuses to trust. See
+//!    [`crate::model::TaskType::file_list_is_mandatory`].
+//!
+//! Resolution also records what *kind* of object it expects to find
+//! ([`ExpectedKind`]), because a path is only the right path if the thing at it
+//! is the thing that was resolved — see [`crate::event::decide_file_phase`].
 //!
 //! The destination is then normalized ([`normalize_destination`]) and joined as
 //! `/{destination}/{name}`.
@@ -83,8 +93,16 @@ use crate::model::{Task, TaskFile, TaskStatus};
 /// materially different questions, and a dry run is not a question at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeleteOptions {
-    /// Delete the payload on the volume as well as the DSM task. `false` leaves
-    /// the files exactly where they are — the task is all that goes.
+    /// Delete the payload on the volume as well as the DSM task.
+    ///
+    /// `false` issues no File Station call at all, so this program removes
+    /// nothing from the volume — but it is **not** a promise that the files
+    /// survive. The task delete sends `force_complete=false`, DSM's "do not
+    /// keep the uncompleted download files", so DSM itself discards the partial
+    /// data of a task it does not consider complete. A completed task's payload
+    /// stays exactly where it is; an unfinished one's goes with the task. See
+    /// [`payload_survives_task_delete`], which is what the confirmation dialog
+    /// words each row from.
     pub delete_files: bool,
     /// Log the intended operations and issue **no** destructive call.
     pub dry_run: bool,
@@ -241,6 +259,91 @@ pub enum NameSource {
     Title,
 }
 
+/// What kind of object the resolution expects to find at the path.
+///
+/// The existence check answers "is there something here"; this is what makes
+/// "…and is it the thing we resolved" answerable too. A `FileList` root derived
+/// from a multi-file torrent names a **directory**; a single flat entry names
+/// the downloaded **file** itself. If the path is a file where a directory was
+/// expected — or a directory where a file was — the path is not this task's
+/// payload, and `recursive=true` would then remove whatever *is* there.
+///
+/// See [`crate::event::decide_file_phase`], which turns a mismatch into a
+/// failed item rather than a delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedKind {
+    /// The task wrote a directory: the file list has more than one entry, or a
+    /// single entry with a path separator in it.
+    Dir,
+    /// The task wrote one file with no enclosing directory: exactly one flat
+    /// file-list entry.
+    File,
+    /// **Not knowable from what DSM said.** The name came from the title
+    /// (rule 3), so there is no file list to describe the shape: an HTTP
+    /// download writes a file, an NZB task's destination is usually a
+    /// directory, and DSM's `list` response distinguishes neither.
+    ///
+    /// Deliberately permissive — either kind is accepted — because the
+    /// alternative is refusing every task rule 3 exists for on a guess about
+    /// DSM's unpack behaviour. The mismatch check is not the only guard on this
+    /// route: a title-named path that is *absent* already fails hard
+    /// (`event::decide_file_phase`), and both routes name `--no-delete-files`.
+    /// The kind that was found is logged so a surprise is visible.
+    Unknown,
+}
+
+impl ExpectedKind {
+    /// Whether an object of the kind the NAS reported can be this task's
+    /// payload. [`ExpectedKind::Unknown`] accepts both — see the variant docs.
+    pub fn accepts(self, is_dir: bool) -> bool {
+        match self {
+            ExpectedKind::Dir => is_dir,
+            ExpectedKind::File => !is_dir,
+            ExpectedKind::Unknown => true,
+        }
+    }
+
+    /// How the expectation reads in a refusal message.
+    pub fn label(self) -> &'static str {
+        match self {
+            ExpectedKind::Dir => "a directory",
+            ExpectedKind::File => "a file",
+            ExpectedKind::Unknown => "either a file or a directory",
+        }
+    }
+}
+
+/// What a task's file list says the on-disk root must be.
+///
+/// Any entry with a separator means the root encloses something, so it is a
+/// directory. Exactly one flat entry is the downloaded file itself. Several
+/// entries that are all flat can only happen when they share one *identical*
+/// filename — a shape DSM should never send — and that is left
+/// [`ExpectedKind::Unknown`] rather than guessed at in either direction.
+fn expected_kind_of(files: &[TaskFile]) -> ExpectedKind {
+    if files.iter().any(|file| file.filename.contains('/')) {
+        return ExpectedKind::Dir;
+    }
+    match files {
+        [_] => ExpectedKind::File,
+        _ => ExpectedKind::Unknown,
+    }
+}
+
+/// A resolved delete target: where the payload is, how that was worked out,
+/// and what should be found there.
+///
+/// The three travel together because the executor needs all three to read the
+/// existence check: the path to look up, [`NameSource`] to know whether an
+/// *absent* answer is benign, and [`ExpectedKind`] to know whether a *present*
+/// one is even the right object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTarget {
+    pub path: String,
+    pub name_source: NameSource,
+    pub expected_kind: ExpectedKind,
+}
+
 /// The absolute File Station path holding a task's data, and the rule that
 /// named it.
 ///
@@ -254,8 +357,8 @@ pub enum NameSource {
 /// The returned path has already been through [`validate_path`]. It is
 /// re-validated immediately before the File Station call anyway — the check is
 /// free and the value crosses a task boundary in between.
-pub fn resolve_delete_target(task: &Task) -> Result<(String, NameSource)> {
-    let (name, source) = resolve_name(task)?;
+pub fn resolve_delete_target(task: &Task) -> Result<ResolvedTarget> {
+    let (name, name_source) = resolve_name(task)?;
 
     let destination = normalize_destination(&task.destination);
     if destination.is_empty() {
@@ -269,12 +372,38 @@ pub fn resolve_delete_target(task: &Task) -> Result<(String, NameSource)> {
 
     let path = format!("/{destination}/{name}");
     validate_path(&path)?;
-    Ok((path, source))
+    let expected_kind = match name_source {
+        NameSource::FileList => expected_kind_of(&task.files),
+        NameSource::Title => ExpectedKind::Unknown,
+    };
+    Ok(ResolvedTarget {
+        path,
+        name_source,
+        expected_kind,
+    })
 }
 
-/// The on-disk name of a task's payload — rules 1 to 3 of the resolution order.
+/// The on-disk name of a task's payload — rules 1 to 4 of the resolution order.
 fn resolve_name(task: &Task) -> Result<(String, NameSource)> {
     let (name, source) = if task.files.is_empty() {
+        // Rule 4 before rule 3: a torrent always has a file list, so one that
+        // arrives without it is not the "no list to have" case rule 3 was
+        // written for. It is a task whose on-disk name is unknown, and the
+        // title is the value rule 2 already refuses to trust — a guessed
+        // directory name that happens to match an unrelated folder is
+        // recursively deleted.
+        if task.task_type.file_list_is_mandatory() {
+            return Err(Error::unsafe_path(
+                &task.title,
+                format!(
+                    "this {} task reports no files, though a torrent always has a file list, \
+                     so its on-disk name cannot be determined; refusing to guess it from the \
+                     title (use --no-delete-files to remove the task without touching the \
+                     volume)",
+                    task.task_type
+                ),
+            ));
+        }
         // Rule 3: no file list to be authoritative, so the title is all there
         // is. Non-BT tasks are named after the file they fetch.
         (task.title.clone(), NameSource::Title)
@@ -418,6 +547,10 @@ pub struct DeleteItem {
     pub title: String,
     /// Task size as DSM reported it — what the user is told they will reclaim.
     pub size: u64,
+    /// Bytes DSM says have been written, at snapshot time. Carried beside
+    /// [`Self::status`] because status alone is a poor proxy for "did this task
+    /// write a payload" — see [`payload_should_exist`].
+    pub downloaded: u64,
     /// Status **at snapshot time**.
     ///
     /// It is deliberately *not* what decides whether the task is paused before
@@ -427,39 +560,68 @@ pub struct DeleteItem {
     /// written into mid-delete. The live check lives in
     /// `event::pause_and_confirm`.
     ///
-    /// It *is* what decides whether an **absent** path is benign
-    /// ([`payload_should_exist`], `event::decide_file_phase`), and staleness is
-    /// harmless there in the direction that matters: a status can go stale by
-    /// completing, and a task this snapshot calls finished is one that finished
-    /// before the dialog opened — the strict answer. The reverse (a task that
-    /// finished while the dialog was up) at worst reads a genuinely absent
-    /// payload as cleaned-up partial data, which is what the pre-fix code did
-    /// for every task.
+    /// It is not what decides whether an **absent** path is benign either,
+    /// whenever a live read is available: the pause phase fetches the task's
+    /// current state one instant earlier, and `event::decide_file_phase` uses
+    /// *that* ([`PayloadState`]). Staleness bites in a direction that matters
+    /// here — a task that finished while the dialog was up still reads as
+    /// `Downloading` in this snapshot, and an absent payload would then be
+    /// waved through as cleaned-up partial data. This value is the **fallback**
+    /// for the one case with no live read: `delete_files = false`, where no
+    /// path is looked at at all.
     pub status: TaskStatus,
     pub target: Target,
     /// Which resolution rule produced the on-disk name, or `None` for a refused
     /// item. Decides how an *absent* path is read; see [`NameSource`].
     pub name_source: Option<NameSource>,
+    /// What should be found at the path. [`ExpectedKind::Unknown`] for a refused
+    /// item, which has no path to find anything at.
+    pub expected_kind: ExpectedKind,
 }
 
 impl DeleteItem {
     /// Resolve one task into a snapshot item. A refusal is recorded on the
     /// item rather than returned, so one bad torrent never aborts the batch.
     fn for_task(task: &Task) -> Self {
-        let (target, name_source) = match resolve_delete_target(task) {
-            Ok((path, source)) => (Target::Path(path), Some(source)),
-            Err(Error::UnsafePath { reason, .. }) => (Target::Refused(reason), None),
+        let (target, name_source, expected_kind) = match resolve_delete_target(task) {
+            Ok(resolved) => (
+                Target::Path(resolved.path),
+                Some(resolved.name_source),
+                resolved.expected_kind,
+            ),
+            Err(Error::UnsafePath { reason, .. }) => {
+                (Target::Refused(reason), None, ExpectedKind::Unknown)
+            }
             // `resolve_delete_target` only produces `UnsafePath` today; anything
             // else is still a refusal, never a fallthrough to deletion.
-            Err(other) => (Target::Refused(other.to_string()), None),
+            Err(other) => (
+                Target::Refused(other.to_string()),
+                None,
+                ExpectedKind::Unknown,
+            ),
         };
         DeleteItem {
             id: task.id.clone(),
             title: task.title.clone(),
             size: task.size,
+            downloaded: task.downloaded,
             status: task.status.clone(),
             target,
             name_source,
+            expected_kind,
+        }
+    }
+
+    /// What this item's snapshot says about whether its payload was written.
+    ///
+    /// The **fallback** input to [`payload_should_exist`]: the executor prefers
+    /// the live read from the pause phase, and only falls back to this when
+    /// there was none. See [`Self::status`].
+    pub fn payload_state(&self) -> PayloadState {
+        PayloadState {
+            status: self.status.clone(),
+            downloaded: self.downloaded,
+            size: self.size,
         }
     }
 
@@ -590,6 +752,46 @@ pub fn requires_pause(status: &TaskStatus) -> bool {
     )
 }
 
+/// What a task says about whether its payload was ever written — status *and*
+/// the transfer counters, from whichever read is freshest.
+///
+/// A separate type because there are two sources for it and the executor must
+/// prefer the right one: a **live** `getinfo` from the pause phase, or
+/// [`DeleteItem::payload_state`] (the confirmation snapshot) when no live read
+/// happened. Passing the two fields around loose is how the stale one gets
+/// used by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadState {
+    pub status: TaskStatus,
+    /// Bytes written, as DSM's `transfer` block reports them.
+    pub downloaded: u64,
+    /// Total size, as DSM reports it.
+    pub size: u64,
+}
+
+impl PayloadState {
+    /// Read a live task — what `event::pause_and_confirm` hands back.
+    pub fn of_task(task: &Task) -> Self {
+        PayloadState {
+            status: task.status.clone(),
+            downloaded: task.downloaded,
+            size: task.size,
+        }
+    }
+
+    /// Whether DSM's counters say the whole payload was written.
+    ///
+    /// `downloaded >= size` rather than `==`: a BT task that re-downloads
+    /// pieces reports more than its own size, which [`Task::progress`] already
+    /// has to clamp. `size > 0` guards the other end — a task DSM reports as
+    /// zero-sized (an unparseable `size`, or one it has not learned yet) has
+    /// `0 >= 0` true for free, and that must not be read as evidence of
+    /// anything.
+    pub fn fully_downloaded(&self) -> bool {
+        self.size > 0 && self.downloaded >= self.size
+    }
+}
+
 /// Whether a task in this state **must** have its payload on the volume.
 ///
 /// This is what makes an *absent* resolved path readable. Download Station
@@ -605,11 +807,22 @@ pub fn requires_pause(status: &TaskStatus) -> bool {
 /// `Extracting` counts as finished: DSM unpacks into the destination, so the
 /// payload is there. `Finishing` does not — the data may still be in a temp
 /// location being moved into place.
-pub fn payload_should_exist(status: &TaskStatus) -> bool {
+///
+/// **Status is not the only evidence.** A task paused at 100%, or one that
+/// errored *after* its download completed, is in none of those three states and
+/// still has a full payload on disk — status says what the task is doing, not
+/// what it has written. So a task DSM's counters call fully downloaded
+/// ([`PayloadState::fully_downloaded`]) qualifies whatever its status is. The
+/// threshold is the conservative one — the *whole* payload, not a fraction:
+/// a partially downloaded task genuinely does have partial data that Download
+/// Station cleans up after itself, and treating "most of it" as "must be there"
+/// would fail items whose absence is ordinary. Anything this refuses is still
+/// removable with `--no-delete-files`.
+pub fn payload_should_exist(state: &PayloadState) -> bool {
     matches!(
-        status,
+        state.status,
         TaskStatus::Finished | TaskStatus::Seeding | TaskStatus::Extracting
-    )
+    ) || state.fully_downloaded()
 }
 
 /// Whether removing **only the DSM task** leaves this task's data on the volume.
@@ -627,8 +840,8 @@ pub fn payload_should_exist(status: &TaskStatus) -> bool {
 /// payload must exist is a task DSM considers complete — named separately
 /// because it answers a different question and the two must be free to diverge
 /// if DSM's behaviour ever does.
-pub fn payload_survives_task_delete(status: &TaskStatus) -> bool {
-    payload_should_exist(status)
+pub fn payload_survives_task_delete(state: &PayloadState) -> bool {
+    payload_should_exist(state)
 }
 
 /// The ordered phases for one snapshotted item — the plan's ordering table,
@@ -706,21 +919,27 @@ pub fn ops_cancelled_by(ops: &[Op], failed_at: usize) -> &[Op] {
 mod tests {
     use super::*;
     use crate::config::ResolvedConfig;
+    use crate::model::TaskType;
     use crate::testutil::{fixture_task as task, fixture_tasks};
 
     /// The path half of [`resolve_delete_target`], which is all most of the
     /// resolution tests below are asking about.
     fn resolve_delete_path(task: &Task) -> Result<String> {
-        resolve_delete_target(task).map(|(path, _)| path)
+        resolve_delete_target(task).map(|resolved| resolved.path)
     }
 
     /// A minimal synthetic task; the fields each test cares about are
     /// overwritten with struct-update syntax.
+    ///
+    /// **HTTP**, not BitTorrent: it carries no file list, and for a torrent that
+    /// is itself a refusal (rule 4). The tests that hand it a `files` vector
+    /// override the type where the distinction matters.
     fn bare() -> Task {
         Task {
             id: "synthetic".to_string(),
             title: "Some.Release".to_string(),
             status: TaskStatus::Finished,
+            task_type: TaskType::Http,
             size: 1024,
             downloaded: 1024,
             uploaded: 0,
@@ -1024,13 +1243,17 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_file_list_falls_back_to_the_title() {
-        // dbid_008 has `"file": []` with a nested destination.
-        let task = task("dbid_008");
+    fn an_empty_file_list_falls_back_to_the_title_on_a_non_bt_task() {
+        // dbid_012 has an explicit `"file": []` rather than no `file` key at
+        // all — an empty list and an absent one are the same statement, and for
+        // an HTTP task both are ordinary. (For a *torrent* they are not; see
+        // `a_bt_task_with_no_file_list_is_refused_rather_than_named_from_its_title`.)
+        let task = task("dbid_012");
+        assert_eq!(task.task_type, TaskType::Http);
         assert!(task.files.is_empty());
         assert_eq!(
             resolve_delete_path(&task).unwrap(),
-            "/downloads/incoming/Sintel.2010.2160p.HDR"
+            "/downloads/empty-placeholder.bin"
         );
     }
 
@@ -1462,9 +1685,10 @@ mod tests {
         assert_eq!(plan.len(), tasks.len());
 
         let refused: Vec<&str> = plan.refused().map(|item| item.id.as_str()).collect();
-        // dbid_010 and dbid_011 have no destination; dbid_013 has no common
-        // root. Everything else is unambiguous.
-        assert_eq!(refused, ["dbid_010", "dbid_011", "dbid_013"]);
+        // dbid_008 is a torrent with an empty file list; dbid_010 and dbid_011
+        // have no destination; dbid_013 has no common root. Everything else is
+        // unambiguous.
+        assert_eq!(refused, ["dbid_008", "dbid_010", "dbid_011", "dbid_013"]);
 
         for item in plan.deletable() {
             let path = item.path().expect("deletable items have a path");
@@ -1542,6 +1766,136 @@ mod tests {
         for status in INACTIVE {
             assert!(!requires_pause(&status), "{status:?}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // payload_should_exist — status is not the only evidence
+    // -----------------------------------------------------------------------
+
+    /// A state with the counters of a task that has downloaded nothing.
+    fn empty_state(status: TaskStatus) -> PayloadState {
+        PayloadState {
+            status,
+            downloaded: 0,
+            size: 1024,
+        }
+    }
+
+    #[test]
+    fn a_completed_status_means_the_payload_must_be_there() {
+        for status in [
+            TaskStatus::Finished,
+            TaskStatus::Seeding,
+            TaskStatus::Extracting,
+        ] {
+            assert!(
+                payload_should_exist(&empty_state(status.clone())),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_incomplete_task_may_legitimately_have_nothing_on_disk() {
+        for status in [
+            TaskStatus::Downloading,
+            TaskStatus::Waiting,
+            TaskStatus::Paused,
+            TaskStatus::Error,
+            TaskStatus::Finishing,
+            TaskStatus::HashChecking,
+            TaskStatus::FilehostingWaiting,
+        ] {
+            assert!(
+                !payload_should_exist(&empty_state(status.clone())),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fully_downloaded_task_must_have_a_payload_whatever_its_status_says() {
+        // The gap status alone leaves: a task paused at 100%, and one that
+        // errored *after* its download finished, both have the whole payload on
+        // disk. Neither status is in the completed set, so reading status alone
+        // called an absent path benign and removed the task.
+        for status in [
+            TaskStatus::Paused,
+            TaskStatus::Error,
+            TaskStatus::Finishing,
+            TaskStatus::HashChecking,
+            TaskStatus::Unknown("captcha_needed".to_string()),
+        ] {
+            let state = PayloadState {
+                status: status.clone(),
+                downloaded: 4096,
+                size: 4096,
+            };
+            assert!(payload_should_exist(&state), "{status}");
+        }
+    }
+
+    #[test]
+    fn a_bt_task_that_re_downloaded_pieces_still_counts_as_complete() {
+        // `downloaded > size` is ordinary for BitTorrent; `==` alone would miss
+        // it and read an absent payload as ordinary partial data.
+        let state = PayloadState {
+            status: TaskStatus::Paused,
+            downloaded: 5000,
+            size: 4096,
+        };
+        assert!(state.fully_downloaded());
+        assert!(payload_should_exist(&state));
+    }
+
+    #[test]
+    fn a_zero_sized_task_is_not_evidence_of_anything() {
+        // `0 >= 0` is true for free, and a task whose size DSM never reported
+        // (or reported unparseably, which the model reads as 0) must not be
+        // turned into one whose payload "must" exist — that would fail items
+        // whose absence is entirely ordinary, with no way back except
+        // `--no-delete-files`.
+        let state = PayloadState {
+            status: TaskStatus::Downloading,
+            downloaded: 0,
+            size: 0,
+        };
+        assert!(!state.fully_downloaded());
+        assert!(!payload_should_exist(&state));
+    }
+
+    #[test]
+    fn most_of_a_payload_is_not_the_whole_payload() {
+        // The threshold is deliberately the conservative one. A task at 99% has
+        // partial data Download Station cleans up after itself, which is
+        // exactly the case an absent path is allowed to mean.
+        let state = PayloadState {
+            status: TaskStatus::Paused,
+            downloaded: 4095,
+            size: 4096,
+        };
+        assert!(!payload_should_exist(&state));
+    }
+
+    #[test]
+    fn a_snapshot_item_reports_the_state_it_was_taken_with() {
+        let item = DeleteItem::for_task(&Task {
+            status: TaskStatus::Paused,
+            size: 2048,
+            downloaded: 2048,
+            ..bare()
+        });
+        assert_eq!(
+            item.payload_state(),
+            PayloadState {
+                status: TaskStatus::Paused,
+                downloaded: 2048,
+                size: 2048,
+            }
+        );
+        // And the dialog's question is answered from the same evidence: a task
+        // paused at 100% keeps its files when only the DSM task is removed.
+        assert!(payload_survives_task_delete(&item.payload_state()));
     }
 
     #[test]
@@ -1757,9 +2111,9 @@ mod tests {
 
     #[test]
     fn a_path_from_the_file_list_records_that_provenance() {
-        let (path, source) = resolve_delete_target(&task("dbid_001")).expect("resolvable");
-        assert_eq!(path, "/downloads/Ubuntu.24.04.3.LTS.Desktop.amd64");
-        assert_eq!(source, NameSource::FileList);
+        let resolved = resolve_delete_target(&task("dbid_001")).expect("resolvable");
+        assert_eq!(resolved.path, "/downloads/Ubuntu.24.04.3.LTS.Desktop.amd64");
+        assert_eq!(resolved.name_source, NameSource::FileList);
         assert_eq!(
             DeleteItem::for_task(&task("dbid_001")).name_source,
             Some(NameSource::FileList)
@@ -1770,18 +2124,176 @@ mod tests {
     fn a_path_guessed_from_the_title_is_marked_as_such() {
         // dbid_007 is an HTTP task with no file block: the on-disk name is the
         // display title and nothing corroborates it.
-        let (_, source) = resolve_delete_target(&task("dbid_007")).expect("resolvable");
-        assert_eq!(source, NameSource::Title);
+        let resolved = resolve_delete_target(&task("dbid_007")).expect("resolvable");
+        assert_eq!(resolved.name_source, NameSource::Title);
         assert_eq!(
-            DeleteItem::for_task(&task("dbid_008")).name_source,
+            DeleteItem::for_task(&task("dbid_012")).name_source,
             Some(NameSource::Title),
-            "an empty file list is still a guess"
+            "an empty file list on a non-BT task is still a guess"
         );
     }
 
     #[test]
     fn a_refused_item_records_no_provenance_at_all() {
         assert_eq!(DeleteItem::for_task(&task("dbid_013")).name_source, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Rule 4 — a torrent with no file list is refused, never title-guessed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_bt_task_with_no_file_list_is_refused_rather_than_named_from_its_title() {
+        // dbid_008 is a `bt` task whose `additional` block carries detail and
+        // transfer but no `file`. Rule 3 was written for the types that have no
+        // file list to give; for a torrent an absent list is anomalous, and the
+        // title is exactly the value rule 2 refuses to trust. Guessing here
+        // aims a *recursive* delete at "/downloads/incoming/Sintel.2010.2160p.HDR"
+        // on nothing but a display string.
+        let bt = task("dbid_008");
+        assert_eq!(bt.task_type, TaskType::BitTorrent);
+        assert!(bt.files.is_empty());
+
+        let reason = refusal(resolve_delete_path(&bt));
+        assert!(reason.contains("no files"), "{reason}");
+        assert!(
+            reason.contains("--no-delete-files"),
+            "a refusal must name the way forward: {reason}"
+        );
+
+        let item = DeleteItem::for_task(&bt);
+        assert!(item.is_refused());
+        assert_eq!(item.name_source, None);
+        // …and the escape hatch really is one: with no file delete there is no
+        // path to be unsure about, so the row can still be removed.
+        assert_eq!(
+            plan_delete_ops(
+                &item,
+                DeleteOptions {
+                    delete_files: false,
+                    dry_run: false
+                }
+            ),
+            vec![Op::DeleteTask]
+        );
+    }
+
+    #[test]
+    fn a_missing_file_list_is_still_a_title_fallback_for_the_types_that_have_none() {
+        // The other half of rule 4: HTTP, FTP, NZB and eMule tasks legitimately
+        // carry no `file` block, and refusing them would strand every non-BT
+        // download this tool is asked to clean up.
+        for task_type in [
+            TaskType::Http,
+            TaskType::Https,
+            TaskType::Ftp,
+            TaskType::Ftps,
+            TaskType::Nzb,
+            TaskType::Emule,
+            // A type this client has never heard of is *not* assumed to be a
+            // torrent: refusing over an unrecognized string would strand tasks
+            // on the next DSM build to invent one.
+            TaskType::Unknown("magnet_of_the_future".to_string()),
+            TaskType::default(),
+        ] {
+            let task = Task {
+                task_type: task_type.clone(),
+                files: Vec::new(),
+                ..bare()
+            };
+            assert_eq!(
+                resolve_delete_path(&task).ok().as_deref(),
+                Some("/downloads/Some.Release"),
+                "{task_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bt_task_that_does_have_a_file_list_is_unaffected() {
+        // Rule 4 is about the *absence* of the list, not about the type.
+        let task = Task {
+            task_type: TaskType::BitTorrent,
+            files: vec![file("Some.Release/a.mkv")],
+            ..bare()
+        };
+        assert_eq!(
+            resolve_delete_path(&task).unwrap(),
+            "/downloads/Some.Release"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ExpectedKind — what should be at the resolved path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_multi_file_torrent_expects_a_directory() {
+        // dbid_001's entries all live under one root, so the root is a folder —
+        // and a *file* of that name is not this task's payload.
+        let resolved = resolve_delete_target(&task("dbid_001")).expect("resolvable");
+        assert_eq!(resolved.expected_kind, ExpectedKind::Dir);
+        assert_eq!(
+            DeleteItem::for_task(&task("dbid_001")).expected_kind,
+            ExpectedKind::Dir
+        );
+    }
+
+    #[test]
+    fn a_single_file_torrent_expects_a_file() {
+        // dbid_003 is one flat entry: the resolved name *is* the download, and
+        // a directory of that name is something else entirely.
+        let resolved = resolve_delete_target(&task("dbid_003")).expect("resolvable");
+        assert_eq!(resolved.expected_kind, ExpectedKind::File);
+    }
+
+    #[test]
+    fn a_single_entry_with_a_separator_still_expects_a_directory() {
+        let task = Task {
+            task_type: TaskType::BitTorrent,
+            files: vec![file("Some.Release/only.mkv")],
+            ..bare()
+        };
+        let resolved = resolve_delete_target(&task).expect("resolvable");
+        assert_eq!(resolved.expected_kind, ExpectedKind::Dir);
+    }
+
+    #[test]
+    fn a_title_named_path_expects_nothing_in_particular() {
+        // Rule 3 has no file list to describe the shape: an HTTP download is a
+        // file, an NZB task's destination is usually a directory, and DSM says
+        // neither. Documented as undetermined rather than guessed at.
+        let resolved = resolve_delete_target(&task("dbid_007")).expect("resolvable");
+        assert_eq!(resolved.expected_kind, ExpectedKind::Unknown);
+        assert!(ExpectedKind::Unknown.accepts(true));
+        assert!(ExpectedKind::Unknown.accepts(false));
+    }
+
+    #[test]
+    fn each_expectation_accepts_only_its_own_kind() {
+        assert!(ExpectedKind::Dir.accepts(true));
+        assert!(!ExpectedKind::Dir.accepts(false));
+        assert!(ExpectedKind::File.accepts(false));
+        assert!(!ExpectedKind::File.accepts(true));
+        // A refused item never reaches a lookup, but it must not carry an
+        // expectation that would authorize one either.
+        assert_eq!(
+            DeleteItem::for_task(&task("dbid_013")).expected_kind,
+            ExpectedKind::Unknown
+        );
+    }
+
+    #[test]
+    fn several_identically_named_flat_entries_are_left_undetermined() {
+        // A shape DSM should never send. Neither answer is defensible, so no
+        // answer is given rather than a guess that could refuse a real payload.
+        let task = Task {
+            task_type: TaskType::BitTorrent,
+            files: vec![file("Some.Release"), file("Some.Release")],
+            ..bare()
+        };
+        let resolved = resolve_delete_target(&task).expect("resolvable");
+        assert_eq!(resolved.expected_kind, ExpectedKind::Unknown);
     }
 
     // -----------------------------------------------------------------------

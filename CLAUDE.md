@@ -352,9 +352,20 @@ and the bulk of the test suite lives in `delete.rs` for that reason.
 2. File list present but entries share **no** single top-level component →
    **REFUSE**, report the item as skipped. Never fall back to `title` here; a
    guessed path could match an unrelated folder and be recursively deleted.
-3. File list absent or empty (HTTP/FTP/NZB tasks) → fall back to `title`.
-4. Normalize `destination`: strip a leading `/volumeN`, trim surrounding
+3. File list absent or empty **on a type that has none** (HTTP/FTP/NZB/eMule) →
+   fall back to `title`.
+4. File list absent or empty **on a BitTorrent task** → **REFUSE**. A torrent
+   always has a file list; its absence is an anomaly, and rule 3 was written for
+   the types that legitimately have none. `TaskType::file_list_is_mandatory`
+   draws the line, and only `bt` is on the strict side — an unrecognized type is
+   *not* assumed to be a torrent, since that would strand tasks over a string.
+5. Normalize `destination`: strip a leading `/volumeN`, trim surrounding
    slashes. Join as `/{destination}/{name}`.
+
+Resolution also records an `ExpectedKind` — `Dir` for a multi-entry file list (or
+one entry with a separator), `File` for a single flat entry, `Unknown` for the
+title fallback, where DSM says nothing about the shape. The semantic guard
+refuses a path whose `isdir` disagrees.
 
 Supporting rules, each of which exists because the alternative is a guess:
 
@@ -409,9 +420,23 @@ while aiming one level deeper than the task's own directory.
 ### Semantic guard
 
 `SYNO.FileStation.List` `getinfo` runs against the resolved path before any
-recursive delete. Not found ⇒ report *skipped* (the files were probably already
-removed by hand) and still delete the DSM task, which is the harmless half. An
-error is not absence — see `PathInfo` above.
+recursive delete, and **existence alone does not authorize it**:
+
+- **found, kind matches `ExpectedKind`** ⇒ delete;
+- **found, kind disagrees** ⇒ *fail* the item. The path is not this task's
+  payload, and the delete is recursive;
+- **not found** ⇒ report *skipped* and still delete the DSM task — but only when
+  nothing says the payload must be there. It must be there for a finished,
+  seeding or extracting task, for one whose counters say it downloaded
+  everything (`payload_should_exist`, which status alone answers wrongly for a
+  task paused at 100% or errored after completing), and for any path named from
+  the *title*. Those *fail* instead, so the row survives to point at the data;
+- **error** is not absence — see `PathInfo` above.
+
+The status those questions are asked of is the **live** read taken by the pause
+phase (`pause_and_confirm` hands it back), not `DeleteItem::status`, which is
+frozen when the dialog opens and can be minutes stale mid-batch. The snapshot is
+the fallback for the case with no live read.
 
 ### Snapshot semantics
 

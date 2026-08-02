@@ -320,9 +320,13 @@ tool could destroy the wrong data, so it is built to **refuse rather than guess*
 2. The file list has **no** single common top-level component → **the task is skipped**
    and reported as such. It does *not* fall back to the title: a guessed path could
    match an unrelated folder and be recursively deleted.
-3. The file list is absent or empty (HTTP/FTP/NZB downloads have none) → the title is
-   used.
-4. The destination is normalized (a leading volume mount stripped — `/volume1`,
+3. The file list is absent or empty **on a task type that has none** (HTTP, FTP, NZB,
+   eMule) → the title is used. It is the on-disk name for those types.
+4. The file list is absent or empty **on a BitTorrent task** → **the task is skipped**.
+   A torrent always has a file list, so one arriving without it is an anomaly, and the
+   title is exactly the value rule 2 already refuses to trust. (`--no-delete-files`
+   still removes such a row.)
+5. The destination is normalized (a leading volume mount stripped — `/volume1`,
    `/volume`, `/volumeUSB1/usbshare1-2`, `/volumeSATA1/…` — and surrounding slashes
    trimmed) and joined as `/{destination}/{name}`. A *relative* destination is never
    touched, and an absolute first component that is not a mount point (`/downloads`)
@@ -330,7 +334,7 @@ tool could destroy the wrong data, so it is built to **refuse rather than guess*
    `volume`, `volume<N>`, `volumeUSB<N>`, `volumeSATA<N>` — so a share that merely
    starts with the word (`/volumes/movies`, `/volume-media/tv`) keeps its first
    component instead of having the delete re-rooted into a different share.
-5. The normalized destination is **empty** → **the task is refused**. With no
+6. The normalized destination is **empty** → **the task is refused**. With no
    destination there is no share to root the path at, and `/{name}` would name a share
    rather than a directory inside one.
 
@@ -351,12 +355,23 @@ resolved path:
 - **not found**, for a task that never finished → the file phase is *skipped*
   (Download Station cleans up its own partial data) and only the DSM task is deleted,
   which is the harmless half;
-- **not found**, for a task that **finished, is seeding or is extracting** → its
-  payload demonstrably existed, so nothing being there says the resolved location is
-  wrong far more often than it says the files are gone. The item fails and the task
-  stays, because deleting it would leave that payload with nothing pointing at it.
-  (A path this same run already deleted is exempt — the absence is explained.)
-- **found** → proceed;
+- **not found**, for a task that **finished, is seeding or is extracting — or whose
+  counters say it downloaded its whole payload, whatever its status** → the payload
+  demonstrably existed, so nothing being there says the resolved location is wrong far
+  more often than it says the files are gone. The item fails and the task stays,
+  because deleting it would leave that payload with nothing pointing at it. (A path
+  this same run already deleted is exempt — the absence is explained.) The status this
+  is judged from is the **live** one read by the pause phase, not the one frozen when
+  the dialog opened, which can be minutes old by the twentieth item of a batch;
+- **not found**, for a path named from the **title** rather than the file list → the
+  item fails whatever the status: a guess that found nothing is at least as likely to
+  have missed as to have been tidied up;
+- **found, but the wrong kind of object** → the item fails. A multi-file torrent wrote
+  a *directory* and a single-file one wrote a *file*; if `isdir` disagrees with what
+  the task resolved to, the path is some other object and `recursive=true` would remove
+  it. (A title-named path expects neither kind, so both are accepted and the kind found
+  is logged.)
+- **found**, of the expected kind → proceed;
 - **an error** (a permission problem, say) → that is not absence: the item fails and
   the task is left alone rather than being deleted while its files stay behind.
 
@@ -416,8 +431,8 @@ one.
   (`force_complete=false`, which is deliberate — the alternative marks the task
   complete and keeps a half-downloaded file). The dialog says that too, per row and in
   the totals, so those bytes are never counted as staying. This is also the way to remove a task
-  whose on-disk location cannot be worked out — no destination, or a file list with
-  several top-level directories. Those rows are `SKIPPED` in the normal flow, because
+  whose on-disk location cannot be worked out — no destination, a file list with
+  several top-level directories, or a torrent with no file list at all. Those rows are `SKIPPED` in the normal flow, because
   a recursive delete that cannot be aimed must not be followed by removing the only
   pointer to the data; with the files out of scope there is nothing left to be unsure
   about, so they are listed as ordinary deletable rows.

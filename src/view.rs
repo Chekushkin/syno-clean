@@ -347,6 +347,7 @@ mod tests {
             id: id.to_string(),
             title: title.to_string(),
             status,
+            task_type: crate::model::TaskType::BitTorrent,
             size,
             downloaded: 0,
             uploaded: 0,
