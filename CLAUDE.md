@@ -329,6 +329,35 @@ call, so what the user read on screen is exactly what gets deleted.
   global `Ctrl-C` are commands; `Ctrl`/`Alt` chords are dropped rather than
   typed, and `Shift` is not (it is how a capital letter arrives).
 
+### The delete confirmation (`ui::dialog`, `App::begin_delete`)
+
+- **`d` never deletes.** It snapshots (`DeletePlan::snapshot`) the selection —
+  or, when nothing is selected, the row under the cursor — and opens
+  `Mode::Confirm`. An empty plan opens no dialog at all.
+- **Cancel is the default focus** (`ConfirmFocus::default() == Cancel`), so
+  `Enter` on an untouched dialog *cancels*. `y` is the deliberate one-key
+  confirm; `n` / `Esc` / `q` cancel; `q` closes the dialog rather than the
+  program (`Ctrl-C` still quits). Every unrecognized key does nothing — never
+  "defaults to confirming".
+- **The dialog performs no I/O.** `App::confirm_delete` parks the snapshot for
+  `App::take_confirmed_delete`, which the event loop drains — the same
+  request/take shape as `r`. Task 15 hangs the three-phase execution off that
+  hook; keep the state machine free of the network so it stays testable without
+  a runtime.
+- **Refused items are rendered, never dropped**: `Target::Refused` shows as
+  `SKIPPED` with its reason and its bytes are excluded from the total. The modal
+  also states whether the files go with the task (`delete_files`) and is
+  labelled `DRY RUN` when `--dry-run` is active — both come from
+  `delete::DeleteOptions`, which is session state and therefore a *parameter* of
+  `build_confirmation`, not a field of the plan.
+- `build_confirmation(&DeletePlan, DeleteOptions) -> ConfirmSummary` produces
+  plain strings and counts and is where the wording and the arithmetic are
+  tested; `render_confirm` only draws. Modal scroll is clamped in `App` against
+  the line count and again at render against the height, the same split as
+  `ui::table`'s derived scroll offset.
+- `--fixture` mode forces `DeleteOptions::dry_run()`: there is no client
+  offline, so a modal promising a real recursive delete would be lying.
+
 ### Terminal lifecycle (`ui`)
 
 - `ui::TerminalGuard::new()` is the **only** place raw mode and the alternate

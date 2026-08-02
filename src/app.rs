@@ -24,9 +24,11 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModif
 
 use crate::api::client::parse_envelope;
 use crate::api::download_station::DS_TASK_API;
+use crate::delete::{DeleteOptions, DeletePlan};
 use crate::error::Result;
 use crate::event::AppEvent;
 use crate::model::{Task, TaskList};
+use crate::ui::dialog;
 use crate::view::{self, View};
 
 /// Rows a `PageUp`/`PageDown` moves before the first frame has been drawn.
@@ -38,8 +40,8 @@ pub const DEFAULT_PAGE_SIZE: usize = 20;
 
 /// What the UI is currently doing, and therefore which keys mean what.
 ///
-/// [`Mode::Normal`] and [`Mode::Search`] are reachable; the confirmation modal
-/// lands in Task 14 and the help overlay in Task 17.
+/// [`Mode::Normal`], [`Mode::Search`] and [`Mode::Confirm`] are reachable; the
+/// help overlay lands in Task 17.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Mode {
     /// Browsing the table.
@@ -52,6 +54,29 @@ pub enum Mode {
     Confirm,
     /// The help overlay is open.
     Help,
+}
+
+/// Which button of the confirmation modal `Enter` will press.
+///
+/// **The default is [`ConfirmFocus::Cancel`], and that is the whole point.** A
+/// dialog that opens with the destructive button primed turns a reflexive
+/// `Enter` into a recursive delete. `y` remains the one-key confirm for a user
+/// who means it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ConfirmFocus {
+    #[default]
+    Cancel,
+    Delete,
+}
+
+impl ConfirmFocus {
+    /// The other button.
+    fn other(self) -> Self {
+        match self {
+            ConfirmFocus::Cancel => ConfirmFocus::Delete,
+            ConfirmFocus::Delete => ConfirmFocus::Cancel,
+        }
+    }
 }
 
 /// The whole of the application state.
@@ -68,6 +93,9 @@ pub struct App {
     /// Task IDs the user has selected. IDs rather than rows, deliberately.
     pub selected: HashSet<String>,
     pub mode: Mode,
+    /// What a confirmed delete is allowed to do — the resolved `delete_files`
+    /// and `dry_run` settings. The confirmation modal states both.
+    pub delete_options: DeleteOptions,
     /// One line of feedback shown in the footer: the result of the last
     /// operation or the startup banner.
     pub status_message: Option<String>,
@@ -88,6 +116,26 @@ pub struct App {
     /// edits the live query (the table narrows as the user types), so the only
     /// way to undo an abandoned edit is to have kept the original.
     search_backup: Option<String>,
+    /// The snapshot the confirmation modal is showing. `Some` exactly while
+    /// [`Mode::Confirm`] is active, and owned — see [`DeletePlan`]: what the
+    /// user reads is what would be deleted, however the task list moves
+    /// underneath.
+    pending_delete: Option<DeletePlan>,
+    /// Which modal button `Enter` presses. Reset to
+    /// [`ConfirmFocus::Cancel`] every time the dialog opens.
+    confirm_focus: ConfirmFocus,
+    /// First body line the modal shows, for a plan longer than the modal is
+    /// tall. Clamped against the line count here and against the *height* at
+    /// render time, the same split the table uses.
+    confirm_scroll: usize,
+    /// A plan the user confirmed, waiting to be picked up.
+    ///
+    /// **The dialog performs no I/O.** Confirming records the intent here and
+    /// the event loop drains it with [`App::take_confirmed_delete`]; Task 15
+    /// hangs the actual three-phase delete off that hook. Keeping it a value
+    /// means the whole confirmation flow stays testable without a runtime, a
+    /// client or a NAS.
+    confirmed_delete: Option<DeletePlan>,
     /// Set by `q` / `Ctrl-C`; the event loop owns the actual exit.
     quit: bool,
 }
@@ -102,11 +150,16 @@ impl Default for App {
             cursor: 0,
             selected: HashSet::new(),
             mode: Mode::Normal,
+            delete_options: DeleteOptions::default(),
             status_message: None,
             error: None,
             page_size: DEFAULT_PAGE_SIZE,
             refresh_requested: false,
             search_backup: None,
+            pending_delete: None,
+            confirm_focus: ConfirmFocus::default(),
+            confirm_scroll: 0,
+            confirmed_delete: None,
             quit: false,
         }
     }
@@ -131,6 +184,12 @@ impl App {
     /// Nothing polls in this mode — the list is whatever the file said.
     pub fn from_fixture(path: &Path) -> Result<Self> {
         Ok(Self::new(read_fixture(path)?))
+    }
+
+    /// Set what a confirmed delete may do (from the merged configuration).
+    pub fn with_delete_options(mut self, options: DeleteOptions) -> Self {
+        self.delete_options = options;
+        self
     }
 
     /// Replace the footer message.
@@ -425,6 +484,139 @@ impl App {
         self.selected.clear();
     }
 
+    // ---- the delete confirmation -------------------------------------------
+    //
+    // `d` never deletes. It takes a **snapshot** ([`DeletePlan`]) and opens a
+    // modal describing it; only `y`, or `Enter` on a deliberately re-focused
+    // Delete button, records the intent. Even then nothing here touches the
+    // network — [`App::take_confirmed_delete`] hands the plan to the event loop,
+    // and Task 15 owns the three-phase execution.
+
+    /// Open the confirmation modal for the current target (`d`).
+    ///
+    /// The target is **the selection when there is one, and the row under the
+    /// cursor otherwise** — a `d` aimed at a row the user is looking at must
+    /// work without arming it first. A plan with no items (an empty table)
+    /// opens no dialog at all: there is nothing to confirm.
+    pub fn begin_delete(&mut self) {
+        let plan = self.delete_target();
+        if plan.is_empty() {
+            self.set_status("nothing to delete");
+            return;
+        }
+
+        tracing::info!(items = plan.len(), "opening the delete confirmation");
+        self.pending_delete = Some(plan);
+        // Every open starts on Cancel. Focus must never carry over from a
+        // previous dialog the user left on Delete.
+        self.confirm_focus = ConfirmFocus::Cancel;
+        self.confirm_scroll = 0;
+        self.mode = Mode::Confirm;
+    }
+
+    /// Snapshot whatever `d` would act on right now.
+    fn delete_target(&self) -> DeletePlan {
+        if self.selected_count() > 0 {
+            DeletePlan::snapshot(self.selected_tasks())
+        } else {
+            DeletePlan::snapshot(self.cursor_task())
+        }
+    }
+
+    /// The plan the modal is displaying, if it is open.
+    pub fn pending_delete(&self) -> Option<&DeletePlan> {
+        self.pending_delete.as_ref()
+    }
+
+    /// Which modal button `Enter` would press.
+    pub fn confirm_focus(&self) -> ConfirmFocus {
+        self.confirm_focus
+    }
+
+    /// First body line the modal should show.
+    pub fn confirm_scroll(&self) -> usize {
+        self.confirm_scroll
+    }
+
+    /// Move the focus between Cancel and Delete (`Tab`, `←`/`→`, `h`/`l`).
+    pub fn toggle_confirm_focus(&mut self) {
+        self.confirm_focus = self.confirm_focus.other();
+    }
+
+    /// Scroll the modal body, clamped to the lines there are.
+    ///
+    /// The *height* is not known here — the renderer clamps again against it,
+    /// exactly as `ui::table` derives its scroll offset — but clamping to the
+    /// line count stops a held `j` from running the offset up to a number the
+    /// user then has to hold `k` through.
+    pub fn scroll_confirm(&mut self, delta: isize) {
+        let last = self.confirm_line_count().saturating_sub(1);
+        self.confirm_scroll = if delta < 0 {
+            self.confirm_scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.confirm_scroll.saturating_add(delta.unsigned_abs())
+        }
+        .min(last);
+    }
+
+    /// Jump the modal body to the top or the bottom.
+    pub fn scroll_confirm_to(&mut self, line: usize) {
+        self.confirm_scroll = line.min(self.confirm_line_count().saturating_sub(1));
+    }
+
+    /// How many body lines the open plan renders to.
+    ///
+    /// Goes through [`dialog::build_confirmation`] rather than counting items
+    /// so there is exactly one definition of what the dialog shows; the summary
+    /// is a handful of strings and rebuilding it per keystroke costs nothing.
+    fn confirm_line_count(&self) -> usize {
+        self.pending_delete.as_ref().map_or(0, |plan| {
+            dialog::build_confirmation(plan, self.delete_options).line_count()
+        })
+    }
+
+    /// Close the modal without deleting anything (`n`, `Esc`, `q`, or `Enter`
+    /// on the default focus).
+    pub fn cancel_delete(&mut self) {
+        if self.pending_delete.take().is_some() {
+            tracing::info!("delete cancelled");
+        }
+        self.confirm_scroll = 0;
+        self.confirm_focus = ConfirmFocus::Cancel;
+        self.mode = Mode::Normal;
+    }
+
+    /// Accept the plan on screen (`y`, or `Enter` with the Delete button
+    /// focused).
+    ///
+    /// **This performs no I/O.** The snapshot is parked in `confirmed_delete`
+    /// for [`App::take_confirmed_delete`]; the execution — pause, files, task —
+    /// belongs to Task 15.
+    pub fn confirm_delete(&mut self) {
+        if let Some(plan) = self.pending_delete.take() {
+            tracing::info!(
+                items = plan.len(),
+                deletable = plan.deletable().count(),
+                refused = plan.refused().count(),
+                dry_run = self.delete_options.dry_run,
+                delete_files = self.delete_options.delete_files,
+                "delete confirmed"
+            );
+            self.confirmed_delete = Some(plan);
+        }
+        self.confirm_scroll = 0;
+        self.confirm_focus = ConfirmFocus::Cancel;
+        self.mode = Mode::Normal;
+    }
+
+    /// Take the confirmed plan, if the user confirmed one since the last call.
+    ///
+    /// The counterpart of [`App::take_refresh_request`], and the seam Task 15
+    /// plugs the executor into.
+    pub fn take_confirmed_delete(&mut self) -> Option<DeletePlan> {
+        self.confirmed_delete.take()
+    }
+
     /// Tell the app how tall the table body is, so `PageUp`/`PageDown` move by
     /// a screenful. Clamped to at least one row — a zero-row page would make
     /// the key silently dead.
@@ -516,11 +708,11 @@ impl App {
         match self.mode {
             Mode::Normal => self.handle_normal_key(key),
             Mode::Search => self.handle_search_key(key),
-            // The confirmation modal (Task 14) and the help overlay (Task 17)
-            // each own their keys. Until they land, nothing can put the app
-            // into these modes; falling back to Normal means a stray mode can
-            // never trap the user.
-            Mode::Confirm | Mode::Help => self.mode = Mode::Normal,
+            Mode::Confirm => self.handle_confirm_key(key),
+            // The help overlay (Task 17) owns its keys. Until it lands nothing
+            // can put the app into that mode; falling back to Normal means a
+            // stray mode can never trap the user.
+            Mode::Help => self.mode = Mode::Normal,
         }
     }
 
@@ -540,10 +732,49 @@ impl App {
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('S') => self.toggle_sort_dir(),
             KeyCode::Char('f') => self.cycle_filter(),
+            KeyCode::Char('d') => self.begin_delete(),
             KeyCode::Char('/') => self.begin_search(),
             // `Esc` is mode-specific: here it is the panic button for a
             // selection, in `Mode::Search` it cancels the edit.
             KeyCode::Esc => self.clear_selection(),
+            _ => {}
+        }
+    }
+
+    /// Keys while the confirmation modal is open.
+    ///
+    /// The safety rules, in order of how easily they are got wrong:
+    ///
+    /// * **`Enter` presses the focused button**, and the focus starts on
+    ///   Cancel. A modal that opens with `Enter` wired straight to a recursive
+    ///   delete is one reflex away from data loss.
+    /// * **`q` closes the dialog rather than the program.** Quitting out of a
+    ///   half-read confirmation is a perfectly reasonable thing to want, and
+    ///   `Ctrl-C` (handled above, before the mode dispatch) still does it.
+    /// * **Every unrecognized key does nothing at all** — never "the safe
+    ///   default of confirming".
+    fn handle_confirm_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_delete(),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') | KeyCode::Esc => {
+                self.cancel_delete();
+            }
+            KeyCode::Enter => match self.confirm_focus {
+                ConfirmFocus::Cancel => self.cancel_delete(),
+                ConfirmFocus::Delete => self.confirm_delete(),
+            },
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Char('h')
+            | KeyCode::Char('l') => self.toggle_confirm_focus(),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_confirm(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_confirm(1),
+            KeyCode::PageUp => self.scroll_confirm(-page_delta(self.page_size)),
+            KeyCode::PageDown => self.scroll_confirm(page_delta(self.page_size)),
+            KeyCode::Home => self.scroll_confirm_to(0),
+            KeyCode::End => self.scroll_confirm_to(usize::MAX),
             _ => {}
         }
     }
@@ -616,6 +847,14 @@ mod tests {
         parse_envelope::<TaskList>(FIXTURE, "SYNO.DownloadStation.Task")
             .expect("the fixture must parse")
             .tasks
+    }
+
+    /// One fixture task by id.
+    fn fixture_task(id: &str) -> Task {
+        fixture_tasks()
+            .into_iter()
+            .find(|task| task.id == id)
+            .unwrap_or_else(|| panic!("fixture has no task {id}"))
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -1667,6 +1906,305 @@ mod tests {
         app.handle_key(press(KeyCode::Char('r')));
         assert_eq!(app.cursor, 1);
         assert!(app.selected.is_empty());
+    }
+
+    // ---- the delete confirmation -------------------------------------------
+    //
+    // `d` is the key that loses data. Every test here is about one of two
+    // questions: *what* did it snapshot, and *how hard is it to confirm*.
+
+    /// The IDs a plan covers, in snapshot order.
+    fn plan_ids(plan: &DeletePlan) -> Vec<&str> {
+        plan.items.iter().map(|item| item.id.as_str()).collect()
+    }
+
+    #[test]
+    fn d_with_nothing_selected_confirms_the_row_under_the_cursor() {
+        let mut app = app_with(4);
+        app.cursor = 2;
+
+        app.handle_key(press(KeyCode::Char('d')));
+
+        assert_eq!(app.mode, Mode::Confirm);
+        let plan = app.pending_delete().expect("a dialog is open");
+        assert_eq!(plan_ids(plan), ["id_002"]);
+        assert!(
+            app.selected.is_empty(),
+            "the cursor fallback must not arm anything"
+        );
+    }
+
+    #[test]
+    fn d_with_a_selection_confirms_the_selection_and_ignores_the_cursor() {
+        let mut app = app_with(4);
+        app.selected.insert("id_000".to_string());
+        app.selected.insert("id_003".to_string());
+        app.cursor = 1;
+
+        app.handle_key(press(KeyCode::Char('d')));
+
+        let plan = app.pending_delete().expect("a dialog is open");
+        assert_eq!(plan_ids(plan), ["id_000", "id_003"]);
+        assert!(
+            !plan_ids(plan).contains(&"id_001"),
+            "the cursor row must not be added to a selection"
+        );
+    }
+
+    #[test]
+    fn d_on_an_empty_table_opens_no_dialog() {
+        let mut app = App::default();
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.pending_delete().is_none());
+        assert!(app.take_confirmed_delete().is_none());
+    }
+
+    #[test]
+    fn d_with_every_row_hidden_opens_no_dialog() {
+        // A filter that hides everything leaves no cursor row to fall back to.
+        let mut app = App::new(fixture_tasks());
+        app.view.search = "no-such-task".to_string();
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.pending_delete().is_none());
+    }
+
+    #[test]
+    fn d_with_a_stale_selection_falls_back_to_the_cursor_row() {
+        // Selected IDs that name nothing are not a selection.
+        let mut app = app_with(2);
+        app.selected.insert("ghost".to_string());
+        app.cursor = 1;
+
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(
+            plan_ids(app.pending_delete().expect("a dialog")),
+            ["id_001"]
+        );
+    }
+
+    #[test]
+    fn the_plan_a_dialog_shows_is_a_snapshot_of_what_was_selected() {
+        // Refusals are part of the snapshot, not an aborted batch: dbid_013's
+        // files share no common root and must appear as a skip.
+        let mut app = App::new(fixture_tasks());
+        for id in ["dbid_001", "dbid_013"] {
+            app.selected.insert(id.to_string());
+        }
+        app.handle_key(press(KeyCode::Char('d')));
+
+        let plan = app.pending_delete().expect("a dialog is open");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan.deletable().count(), 1);
+        assert_eq!(plan.refused().count(), 1);
+        assert_eq!(plan.total_size(), fixture_task("dbid_001").size);
+    }
+
+    #[test]
+    fn the_dialog_opens_with_cancel_focused() {
+        // The single most important line in this file: an `Enter` reflex must
+        // not delete anything.
+        let mut app = app_with(1);
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.confirm_focus(), ConfirmFocus::Cancel);
+
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(
+            app.take_confirmed_delete().is_none(),
+            "Enter on the default focus must cancel"
+        );
+    }
+
+    #[test]
+    fn enter_confirms_only_after_the_focus_is_moved_to_delete() {
+        let mut app = app_with(1);
+        app.handle_key(press(KeyCode::Char('d')));
+        app.handle_key(press(KeyCode::Right));
+        assert_eq!(app.confirm_focus(), ConfirmFocus::Delete);
+
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
+        let plan = app.take_confirmed_delete().expect("the plan was confirmed");
+        assert_eq!(plan_ids(&plan), ["id_000"]);
+    }
+
+    #[test]
+    fn every_focus_key_moves_between_the_two_buttons() {
+        let mut app = app_with(1);
+        app.handle_key(press(KeyCode::Char('d')));
+        for key in [
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Char('h'),
+            KeyCode::Char('l'),
+        ] {
+            let before = app.confirm_focus();
+            app.handle_key(press(key));
+            assert_ne!(app.confirm_focus(), before, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn y_confirms_from_either_focus() {
+        for focus_key in [None, Some(KeyCode::Tab)] {
+            let mut app = app_with(1);
+            app.handle_key(press(KeyCode::Char('d')));
+            if let Some(key) = focus_key {
+                app.handle_key(press(key));
+            }
+            app.handle_key(press(KeyCode::Char('y')));
+
+            assert_eq!(app.mode, Mode::Normal);
+            assert!(app.pending_delete().is_none());
+            assert!(app.take_confirmed_delete().is_some(), "{focus_key:?}");
+        }
+    }
+
+    #[test]
+    fn n_esc_and_q_all_cancel_without_confirming_anything() {
+        for key in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Char('q')] {
+            let mut app = app_with(1);
+            app.handle_key(press(KeyCode::Char('d')));
+            app.handle_key(press(key));
+
+            assert_eq!(app.mode, Mode::Normal, "{key:?}");
+            assert!(app.pending_delete().is_none(), "{key:?}");
+            assert!(app.take_confirmed_delete().is_none(), "{key:?}");
+            assert!(
+                !app.should_quit(),
+                "{key:?} must close the dialog, not the program"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_c_still_leaves_the_program_from_inside_the_dialog() {
+        let mut app = app_with(1);
+        app.handle_key(press(KeyCode::Char('d')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn an_unbound_key_in_the_dialog_changes_nothing() {
+        // Least of all does it count as a confirmation.
+        let mut app = app_with(2);
+        app.handle_key(press(KeyCode::Char('d')));
+        let before = format!("{app:?}");
+        for key in [
+            KeyCode::Char('x'),
+            KeyCode::Char('a'),
+            KeyCode::Char(' '),
+            KeyCode::Char('r'),
+            KeyCode::Char('/'),
+            KeyCode::Char('d'),
+        ] {
+            app.handle_key(press(key));
+            assert_eq!(format!("{app:?}"), before, "{key:?}");
+        }
+        assert_eq!(app.mode, Mode::Confirm);
+    }
+
+    #[test]
+    fn cancelling_leaves_the_table_the_selection_and_the_cursor_exactly_as_they_were() {
+        let mut app = app_with(4);
+        app.cursor = 2;
+        app.selected.insert("id_001".to_string());
+        let before = format!("{app:?}");
+
+        app.handle_key(press(KeyCode::Char('d')));
+        app.handle_key(press(KeyCode::Esc));
+
+        assert_eq!(format!("{app:?}"), before);
+    }
+
+    #[test]
+    fn confirming_deletes_nothing_here_and_hands_the_plan_over_exactly_once() {
+        // The dialog performs no I/O: the plan is parked for the event loop,
+        // and the task list is untouched until a refresh says otherwise.
+        let mut app = app_with(3);
+        app.selected.insert("id_001".to_string());
+        app.handle_key(press(KeyCode::Char('d')));
+        app.handle_key(press(KeyCode::Char('y')));
+
+        assert_eq!(app.tasks.len(), 3, "nothing is removed locally");
+        assert_eq!(selected_ids(&app), ["id_001"]);
+        assert_eq!(
+            plan_ids(&app.take_confirmed_delete().expect("one plan")),
+            ["id_001"]
+        );
+        assert!(
+            app.take_confirmed_delete().is_none(),
+            "taking the plan must clear it"
+        );
+    }
+
+    #[test]
+    fn reopening_the_dialog_starts_from_cancel_and_the_top_of_the_list() {
+        let mut app = app_with(3);
+        app.handle_key(press(KeyCode::Char('d')));
+        app.handle_key(press(KeyCode::Tab));
+        app.handle_key(press(KeyCode::Esc));
+
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.confirm_focus(), ConfirmFocus::Cancel);
+        assert_eq!(app.confirm_scroll(), 0);
+    }
+
+    #[test]
+    fn the_dialog_body_scrolls_and_clamps_at_both_ends() {
+        // Two body lines per item, so a twenty-task plan is well past any
+        // modal height.
+        let mut app = app_with(20);
+        app.toggle_select_all_visible();
+        app.handle_key(press(KeyCode::Char('d')));
+        let lines = app.confirm_line_count();
+        assert_eq!(lines, 40);
+
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Char('j')));
+        assert_eq!(app.confirm_scroll(), 2);
+
+        app.handle_key(press(KeyCode::Up));
+        app.handle_key(press(KeyCode::Char('k')));
+        app.handle_key(press(KeyCode::Char('k')));
+        assert_eq!(app.confirm_scroll(), 0, "scrolling up clamps at the top");
+
+        app.handle_key(press(KeyCode::End));
+        assert_eq!(app.confirm_scroll(), lines - 1);
+        for _ in 0..5 {
+            app.handle_key(press(KeyCode::PageDown));
+        }
+        assert_eq!(app.confirm_scroll(), lines - 1, "and at the bottom");
+
+        app.handle_key(press(KeyCode::Home));
+        assert_eq!(app.confirm_scroll(), 0);
+    }
+
+    #[test]
+    fn scrolling_a_plan_that_fits_goes_nowhere() {
+        let mut app = app_with(1);
+        app.handle_key(press(KeyCode::Char('d')));
+        for _ in 0..5 {
+            app.handle_key(press(KeyCode::Down));
+        }
+        assert_eq!(app.confirm_scroll(), 1, "two lines, so one line of travel");
+    }
+
+    #[test]
+    fn the_delete_options_ride_along_with_the_app() {
+        let mut app = app_with(1).with_delete_options(DeleteOptions::dry_run());
+        assert!(app.delete_options.dry_run);
+        assert!(app.delete_options.delete_files);
+
+        // ...and a dry run still opens a dialog and still confirms.
+        app.handle_key(press(KeyCode::Char('d')));
+        app.handle_key(press(KeyCode::Char('y')));
+        assert!(app.take_confirmed_delete().is_some());
     }
 
     // ---- fixture mode ------------------------------------------------------

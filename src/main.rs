@@ -19,6 +19,7 @@ use syno_clean::api::download_station;
 use syno_clean::app::App;
 use syno_clean::cli::Cli;
 use syno_clean::config::{self, Config, Paths, ResolvedConfig, SessionCache};
+use syno_clean::delete::{DeleteOptions, DeletePlan};
 use syno_clean::event::{self, AppEvent, Receiver, RefreshHandle};
 use syno_clean::ui::{self, TerminalGuard};
 
@@ -60,7 +61,7 @@ async fn main() -> Result<()> {
         return dump(&cli, &resolved, &paths).await;
     }
 
-    let mut app = App::new(Vec::new());
+    let mut app = App::new(Vec::new()).with_delete_options(DeleteOptions::from_config(&resolved));
     app.set_status(format!(
         "{} as {} · logs: {}",
         resolved.base_url(),
@@ -102,8 +103,13 @@ async fn main() -> Result<()> {
 async fn run_fixture(path: &Path) -> Result<()> {
     tracing::info!(fixture = %path.display(), "offline fixture mode");
 
+    // Offline mode is a **dry run** by construction: there is no client here,
+    // so no delete could reach a NAS even if one were confirmed. Saying so in
+    // the confirmation dialog is honest; letting it promise a real recursive
+    // delete it cannot perform is not.
     let mut app = App::from_fixture(path)
-        .with_context(|| format!("could not load the fixture {}", path.display()))?;
+        .with_context(|| format!("could not load the fixture {}", path.display()))?
+        .with_delete_options(DeleteOptions::dry_run());
     app.set_status(format!(
         "offline · {} · {} tasks",
         path.display(),
@@ -170,10 +176,29 @@ async fn run_tui(app: &mut App, mut rx: Receiver, refresh: &RefreshHandle) -> Re
         if app.take_refresh_request() {
             refresh.request();
         }
+
+        if let Some(plan) = app.take_confirmed_delete() {
+            spawn_delete(plan);
+        }
     }
 
     tracing::info!("exiting");
     Ok(())
+}
+
+/// Act on a confirmed delete plan.
+///
+/// **Task 15 owns the execution**; this is the seam it plugs into. The dialog
+/// deliberately performs no I/O of its own, so until the three-phase delete
+/// lands a confirmation is recorded in the log and nothing on the NAS is
+/// touched — which is the correct half of the behaviour to have first.
+fn spawn_delete(plan: DeletePlan) {
+    tracing::warn!(
+        items = plan.len(),
+        deletable = plan.deletable().count(),
+        refused = plan.refused().count(),
+        "delete confirmed, but execution is not wired up yet (Task 15)"
+    );
 }
 
 /// Which of the two event sources won a pass of the loop.

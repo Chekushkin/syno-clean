@@ -63,8 +63,55 @@
 //! poller is suspended in `Mode::Confirm` as well — belt *and* braces, because
 //! the failure mode here is deleting something the user never read.)
 
+use crate::config::{DEFAULT_DELETE_FILES, ResolvedConfig};
 use crate::error::{Error, Result};
 use crate::model::{Task, TaskFile, TaskStatus};
+
+/// What a confirmed delete is allowed to do, resolved from the config and the
+/// CLI (`delete_files`, `--no-delete-files`, `--dry-run`).
+///
+/// It rides alongside the [`DeletePlan`] rather than inside it: the plan is a
+/// snapshot of *which* tasks are involved, and these two flags are a property of
+/// the whole session. The confirmation dialog has to state both — a user who
+/// configured `delete_files = false` and one who did not are being asked
+/// materially different questions, and a dry run is not a question at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteOptions {
+    /// Delete the payload on the volume as well as the DSM task. `false` leaves
+    /// the files exactly where they are — the task is all that goes.
+    pub delete_files: bool,
+    /// Log the intended operations and issue **no** destructive call.
+    pub dry_run: bool,
+}
+
+impl Default for DeleteOptions {
+    /// Deleting the files as well as the task is the entire point of the tool,
+    /// so that is the default — but a dry run never is: it has to be asked for.
+    fn default() -> Self {
+        Self {
+            delete_files: DEFAULT_DELETE_FILES,
+            dry_run: false,
+        }
+    }
+}
+
+impl DeleteOptions {
+    /// The two delete-affecting settings of a merged configuration.
+    pub fn from_config(config: &ResolvedConfig) -> Self {
+        Self {
+            delete_files: config.delete_files,
+            dry_run: config.dry_run,
+        }
+    }
+
+    /// A dry run: everything is described, nothing is removed.
+    pub fn dry_run() -> Self {
+        Self {
+            dry_run: true,
+            ..Self::default()
+        }
+    }
+}
 
 /// The shared top-level component of a torrent's file list, if there is
 /// exactly one.
