@@ -444,8 +444,8 @@ async fn delete_one(
     // instant before the file phase needs it. The snapshot on `item` is as old
     // as the dialog plus this item's place in the queue — minutes, for a batch
     // of twenty — and a task that finished in that window would otherwise have
-    // an absent payload waved through as ordinary partial data. Its two halves
-    // are dated differently on purpose; see `PauseRead`.
+    // an absent payload waved through as ordinary partial data. Both of its
+    // halves ratchet toward "the payload must exist"; see `PauseRead`.
     let mut live: Option<PauseRead> = None;
 
     for (index, op) in ops.iter().enumerate() {
@@ -663,9 +663,9 @@ fn decide_file_phase(
 
 /// How much of its payload DSM said a task had written, at one moment.
 ///
-/// Split out from [`PayloadState`] because the pause phase must treat the
-/// counters and the status differently — see [`PauseRead`] — and passing two
-/// bare `u64`s around is how they end up swapped.
+/// Split out from [`PayloadState`] because the pause phase folds the counters
+/// and the status across reads on their own evidence — see [`PauseRead`] — and
+/// passing two bare `u64`s around is how they end up swapped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Counters {
     downloaded: u64,
@@ -710,40 +710,45 @@ impl Counters {
     }
 }
 
-/// What the pause phase learned about the task, kept in **two halves that go
-/// stale in opposite directions**.
+/// What the pause phase learned about the task, in **two halves that each
+/// ratchet toward "the payload must exist"**.
 ///
 /// The file phase asks one question of this — "should this task's payload be on
-/// the volume" ([`crate::delete::payload_should_exist`]) — and the two inputs to
-/// that question cannot come from the same read:
+/// the volume" ([`crate::delete::payload_should_exist`]) — and each half is
+/// folded across every read of the task under the same monotonic rule: a later
+/// read may move the answer toward *must exist*, never away from it. Only the
+/// evidence differs.
 ///
-/// * the **status** must be the one from *before* this program issued its own
-///   pause. Read it afterwards and a seeding task reports `Paused`, which is
-///   exactly the state whose absent payload the check waves through as ordinary
-///   partial data: the guard would be defeated by the guard's own side effect;
-/// * the **counters** must be the freshest values seen, from *any* read
-///   including the ones taken while confirming the pause. Pausing does not
-///   un-download anything, so they carry no side effect of ours — and a task
-///   that reached 100% while the pause was taking effect is precisely the case
-///   where the stale-low value lets a missing path be judged benign and the DSM
-///   task removed.
+/// * the **status** advances when a read reports one that
+///   [`crate::delete::status_implies_payload`] accepts. That keeps a genuine
+///   upgrade — a task that reached `Finished`/`Seeding`/`Extracting` while the
+///   pause was settling, whose absent payload must fail rather than be waved
+///   through — and it discards the downgrade this program inflicts on itself,
+///   since the `Paused` a pause produces is not a status that implies a payload
+///   and so can never overwrite the `Seeding` that was there before;
+/// * the **counters** advance to the freshest values, except that a read which
+///   said the payload was complete is never walked back. Pausing does not
+///   un-download anything, so a task that reached 100% while the pause was
+///   taking effect is precisely the case where the stale-low value lets a
+///   missing path be judged benign and the DSM task removed.
 ///
-/// Collapsing the two back into a single "the state the pause read" is a
-/// regression in one direction or the other, whichever half it picks.
+/// Collapsing the two into "whatever the last read said" is a regression: it
+/// re-admits both walk-backs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PauseRead {
-    /// The task's status as DSM reported it **before** any pause was issued, or
-    /// `None` when that read carried no entry for the id.
-    pre_pause_status: Option<crate::model::TaskStatus>,
+    /// The strongest status any read of this task reported, in the ordering
+    /// [`crate::delete::status_implies_payload`] defines — or `None` when no
+    /// read carried an entry for the id.
+    status: Option<crate::model::TaskStatus>,
     /// The most complete counters any read of this task reported.
     counters: Option<Counters>,
 }
 
 impl PauseRead {
-    /// Record the read taken before any pause: both halves come from it.
+    /// Record the read taken before any pause: both halves start from it.
     fn observe_before_pause(&mut self, task: Option<&Task>) {
         let Some(task) = task else { return };
-        self.pre_pause_status = Some(task.status.clone());
+        self.status = Some(task.status.clone());
         self.merge_counters(task);
     }
 
@@ -752,17 +757,25 @@ impl PauseRead {
     /// just folded in.
     ///
     /// Recording and asking are one operation deliberately. The read that
-    /// finally reports the task stopped is also the freshest word on how much it
-    /// wrote, and a loop able to ask "is it paused yet" without folding that
-    /// read in is a loop that can return on an answer it never recorded — which
-    /// is precisely how the confirmation reads came to be thrown away. Only the
-    /// counters are taken; the status now carries this program's own pause (see
-    /// the type docs).
+    /// finally reports the task stopped is also the freshest word on what it
+    /// wrote and on what it became, and a loop able to ask "is it paused yet"
+    /// without folding that read in is a loop that can return on an answer it
+    /// never recorded — which is precisely how the confirmation reads came to be
+    /// thrown away. Both halves ratchet on the way in; see the type docs.
     fn observe_after_pause(&mut self, task: Option<&Task>) -> bool {
         if let Some(task) = task {
+            self.merge_status(task);
             self.merge_counters(task);
         }
         pause_needed(task)
+    }
+
+    /// Keep the strongest status seen so far: a later read replaces the stored
+    /// one only when it says the payload must exist. See the type docs.
+    fn merge_status(&mut self, task: &Task) {
+        if delete::status_implies_payload(&task.status) {
+            self.status = Some(task.status.clone());
+        }
     }
 
     /// Keep the most complete counters seen so far. See [`Counters::advance`].
@@ -784,12 +797,12 @@ impl PauseRead {
 /// data and the DSM task is removed; judged from the live one, it fails and the
 /// row survives to point at data that is still somewhere.
 ///
-/// The halves are taken from different moments **on purpose**, and
-/// [`PauseRead`] documents why: the status from before this program's own pause,
-/// the counters from the last read of any kind. The snapshot supplies whichever
-/// half the pause phase did not observe — a `getinfo` that carried no entry for
-/// this id, or no pause phase at all (a dry run, which never reaches the lookup
-/// anyway). Its counters are the oldest available and are still run through
+/// "Freshest" is the ratcheted value of each half rather than the last thing
+/// read, and [`PauseRead`] documents the ordering: both halves only ever move
+/// toward "the payload must exist". The snapshot supplies whichever half the
+/// pause phase did not observe — a `getinfo` that carried no entry for this id,
+/// or no pause phase at all (a dry run, which never reaches the lookup anyway).
+/// Its counters are the oldest available and are still run through
 /// [`Counters::advance`], so a snapshot that already said "complete" is not
 /// undone by a later read that says otherwise.
 fn payload_for_file_phase(live: Option<&PauseRead>, item: &DeleteItem) -> PayloadState {
@@ -801,7 +814,7 @@ fn payload_for_file_phase(live: Option<&PauseRead>, item: &DeleteItem) -> Payloa
         None => Counters::of_item(item),
     };
     PayloadState {
-        status: live.pre_pause_status.clone().unwrap_or(snapshot.status),
+        status: live.status.clone().unwrap_or(snapshot.status),
         downloaded: counters.downloaded,
         size: counters.size,
     }
@@ -1045,15 +1058,17 @@ fn task_with_id<'a>(tasks: &'a [Task], id: &str) -> Option<&'a Task> {
 /// turning a perfectly good delete into a failure.
 ///
 /// **What it learned is handed back for the file phase to use** — as a
-/// [`PauseRead`], whose two halves come from deliberately different moments:
+/// [`PauseRead`], whose two halves are folded across every read here under one
+/// rule: a later read may only move the answer toward "the payload must exist".
 ///
-/// * the **status** is the one read *before* any pause was issued. Pausing a
-///   seeding task and then reporting `Paused` would turn a task whose payload
-///   must exist into one whose absence looks ordinary — the check would defeat
-///   itself;
-/// * the **counters** are refreshed from every confirmation read. A pause does
-///   not un-download anything, so there is no self-inflicted answer to guard
-///   against here — while a task that reaches 100% *during* the pause is
+/// * the **status** is refreshed by any confirmation read reporting one of the
+///   statuses that imply a payload, so a task that finishes while the pause
+///   settles is judged as finished. `Paused` is not one of them, so pausing a
+///   seeding task cannot turn a payload that must exist into one whose absence
+///   looks ordinary — the check would otherwise defeat itself;
+/// * the **counters** are refreshed from every confirmation read, and never
+///   walked back below a reading that said "complete". A pause does not
+///   un-download anything, while a task that reaches 100% *during* the pause is
 ///   precisely the one whose stale-low counters would let a missing path look
 ///   like ordinary partial data.
 ///
@@ -2130,8 +2145,8 @@ mod tests {
         assert_eq!(
             chosen.status,
             TaskStatus::Downloading,
-            "the status stays the pre-pause one: reporting our own `Paused` would defeat the \
-             check it feeds"
+            "`Paused` does not imply a payload, so it does not replace the status the ratchet \
+             already holds — reporting our own pause back would defeat the check it feeds"
         );
         assert!(delete::payload_should_exist(&chosen));
 
@@ -2150,10 +2165,11 @@ mod tests {
 
     #[test]
     fn a_pause_never_lets_the_status_it_caused_be_used() {
-        // The other direction, and why the halves are dated differently: a
-        // seeding task's payload must exist, and reading the status back after
-        // pausing it would report `Paused` — turning "this payload must be
-        // there" into "its absence is ordinary". Only the counters are refreshed.
+        // The downgrade the ratchet exists to refuse: a seeding task's payload
+        // must exist, and reading the status back after pausing it reports
+        // `Paused` — which would turn "this payload must be there" into "its
+        // absence is ordinary". `Paused` does not imply a payload, so it cannot
+        // replace the `Seeding` already held.
         let item = &DeletePlan::snapshot([&fixture_task("dbid_001")]).items[0];
         let mut live = PauseRead::default();
         live.observe_before_pause(Some(&live_task("dbid_001", TaskStatus::Seeding, 0, 0)));
@@ -2162,6 +2178,73 @@ mod tests {
         let chosen = payload_for_file_phase(Some(&live), item);
         assert_eq!(chosen.status, TaskStatus::Seeding);
         assert!(delete::payload_should_exist(&chosen));
+    }
+
+    #[test]
+    fn a_status_that_completes_while_the_pause_takes_effect_keeps_the_task() {
+        // The upgrade the ratchet exists to keep, and the half the counters
+        // cannot cover: a task with unselected files seeds at `downloaded <
+        // size`, so it finishes without the counters ever reading complete. It
+        // was downloading when the pause phase looked and seeding by the time
+        // DSM reported it stopped. Holding the pre-pause status unconditionally
+        // judged the absent path from `Downloading` — benign, task deleted,
+        // payload orphaned.
+        let item = &DeletePlan::snapshot([&fixture_task("dbid_001")]).items[0];
+        let size = item.size;
+        let selected = size / 2;
+
+        let mut live = PauseRead::default();
+        live.observe_before_pause(Some(&live_task(
+            "dbid_001",
+            TaskStatus::Downloading,
+            selected / 2,
+            size,
+        )));
+        assert!(!delete::payload_should_exist(&payload_for_file_phase(
+            Some(&live),
+            item
+        )));
+
+        // The task completes its selected files mid-pause and starts seeding.
+        // Still active, so the pause loop keeps polling...
+        assert!(live.observe_after_pause(Some(&live_task(
+            "dbid_001",
+            TaskStatus::Seeding,
+            selected,
+            size,
+        ))));
+        // ...and the read that ends the loop is our own pause landing, which
+        // must not walk that upgrade back.
+        assert!(!live.observe_after_pause(Some(&live_task(
+            "dbid_001",
+            TaskStatus::Paused,
+            selected,
+            size,
+        ))));
+
+        let chosen = payload_for_file_phase(Some(&live), item);
+        assert_eq!(
+            chosen.status,
+            TaskStatus::Seeding,
+            "a read that says the payload must exist replaces the pre-pause status"
+        );
+        assert!(
+            !chosen.fully_downloaded(),
+            "the counters never complete here: this is the status half or nothing"
+        );
+        assert!(delete::payload_should_exist(&chosen));
+
+        let outcome = decide_file_phase(
+            PathInfo::Missing,
+            "/downloads/X",
+            FileTarget::of_item(item),
+            &chosen,
+            false,
+        );
+        assert!(
+            matches!(&outcome, OpOutcome::Failed(why) if why.contains("--no-delete-files")),
+            "{outcome:?}"
+        );
     }
 
     #[test]

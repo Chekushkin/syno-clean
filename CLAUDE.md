@@ -449,17 +449,21 @@ The state those questions are asked of is what the pause phase read
 when the dialog opens and can be minutes stale mid-batch. The snapshot fills in
 whatever the pause phase did not observe.
 
-**A `PauseRead`'s two halves are dated differently on purpose.** The *status* is
-the one read **before** this program issued its own pause — read it afterwards
-and a seeding task reports `Paused`, whose absent payload the check then waves
-through as ordinary partial data, so the guard would be defeated by its own side
-effect. The *counters* (`downloaded`/`size`) are the freshest seen across **every**
-read, including the ones confirming the pause: pausing does not un-download
-anything, and a task that reaches 100% while the pause takes effect is exactly
-the case where stale-low counters let a missing path be judged benign. They also
-ratchet — a read that said "complete" is never walked back by a later one that
-does not. Do not "simplify" the two halves into a single read; either choice
-alone is a regression.
+**A `PauseRead`'s two halves both ratchet toward "the payload must exist", by
+different evidence.** Every read of the task — the one before the pause and each
+one confirming it — is folded into both halves under the same monotonic rule: a
+later read may move the answer toward *must exist*, never away from it. The
+*status* advances when a read reports one `delete::status_implies_payload`
+accepts, so a task that reaches `Finished`/`Seeding`/`Extracting` while the pause
+settles is judged as finished rather than from its stale pre-pause status; and
+because `Paused` is not such a status, this program's own pause can never walk a
+`Seeding` back into a state whose absent payload the check waves through — the
+guard is not defeated by its own side effect. The *counters* (`downloaded`/`size`)
+advance to the freshest values seen, except that a read which said "complete" is
+never walked back: pausing does not un-download anything, and a task that reaches
+100% while the pause takes effect is exactly the case where stale-low counters
+let a missing path be judged benign. Do not "simplify" either half into "whatever
+the last read said" — that re-admits both walk-backs.
 
 ### Snapshot semantics
 
