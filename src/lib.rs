@@ -10,6 +10,7 @@ pub mod api;
 pub mod app;
 pub mod cli;
 pub mod config;
+pub mod delete;
 pub mod error;
 pub mod event;
 pub mod format;
