@@ -312,6 +312,38 @@ call, so what the user read on screen is exactly what gets deleted.
   re-export. Exactly one read is ever in flight, so nothing lingers on the
   blocking pool at shutdown.
 
+### The event loop and the poller (`main.rs`, `event.rs`)
+
+- The loop is `draw → select!(terminal event, AppEvent) → apply`. **The pending
+  terminal read lives in a variable outside the loop** (`pending_read:
+  Option<JoinHandle<_>>`) and is only cleared when it resolves. A blocking read
+  cannot be cancelled, so re-creating it per iteration would spawn one orphaned
+  stdin reader per poller tick and they would then take turns eating the user's
+  keystrokes. The `select!` yields a `Next` enum rather than acting in its
+  branch bodies, so the borrow ends with the expression.
+- **Everything that touches the network runs off the loop** and reports through
+  the single `mpsc` channel of `event::AppEvent`. There is no `Tick` variant:
+  the poller drives data, and data drives redraws.
+- **The poller is non-fatal.** A failed tick becomes `AppEvent::Error` and the
+  interval keeps running; the next successful tick clears the banner. Never
+  `return` out of the poller on a poll failure — a NAS that vanishes for a
+  minute is ordinary. It ends only when the channel closes or `main` aborts it.
+- **`r` is a request, not an action.** `App::request_refresh` sets a flag the
+  loop drains with `take_refresh_request` and forwards to an
+  `event::RefreshHandle` (an `Arc<Notify>`, so repeated presses coalesce into
+  one poll). `App` holds no runtime handle and every key press stays a pure
+  state transition.
+- `App::apply_event` is the `AppEvent` counterpart of `App::handle_key` — same
+  shape, same testability. Keep the reconciliation logic there, not in `main`.
+- **`App::error` is not `App::status_message`.** The error banner is cleared
+  automatically by the next successful refresh and rendered red with `⚠`; the
+  status message survives underneath and returns when the banner clears.
+- `App::apply_tasks` invariants: the cursor follows its **task ID** through a
+  reorder; a cursor task that vanished holds its *row number* and clamps; stale
+  IDs are pruned from the selection; and a `Tasks` event arriving in
+  `Mode::Confirm` is **dropped entirely**, so the delete plan on screen cannot
+  go stale while the user reads it.
+
 ### The task table (`ui::table`)
 
 - The table is laid out **by hand**, not with ratatui's `Table` widget: every

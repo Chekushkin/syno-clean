@@ -7,16 +7,19 @@
 //! loop, which owns the terminal for as long as the TUI is running.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ratatui::crossterm::event::{self, Event};
+use ratatui::crossterm::event::{self as terminal_event, Event};
 use syno_clean::api::auth::{self, Credentials};
 use syno_clean::api::client::SynoClient;
 use syno_clean::api::download_station;
 use syno_clean::app::App;
 use syno_clean::cli::Cli;
 use syno_clean::config::{self, Config, Paths, ResolvedConfig, SessionCache};
+use syno_clean::event::{self, AppEvent, Receiver, RefreshHandle};
 use syno_clean::ui::{self, TerminalGuard};
 
 #[tokio::main]
@@ -65,15 +68,37 @@ async fn main() -> Result<()> {
         log_file.display()
     ));
 
-    run_tui(&mut app).await
+    // Discovery and login happen *before* the alternate screen: both can prompt
+    // (password, 2FA code) and both can fail with a message worth reading, and
+    // neither is any use inside a terminal the TUI has already taken over.
+    let mut client = SynoClient::new(&resolved)?;
+    client.discover().await?;
+    let client = Arc::new(authenticate(client, &resolved, &paths).await?);
+
+    let (tx, rx) = event::channel();
+    let refresh = RefreshHandle::new();
+    let poller = event::spawn_poller(
+        client,
+        Duration::from_secs(resolved.refresh_secs),
+        tx,
+        refresh.clone(),
+    );
+
+    let result = run_tui(&mut app, rx, &refresh).await;
+    // The poller owns no terminal state, so stopping it is housekeeping rather
+    // than cleanup — but leaving a task mid-request would make the runtime wait
+    // out an in-flight HTTP timeout before the process could exit.
+    poller.abort();
+    result
 }
 
 /// The hidden `--fixture` mode: the TUI over a captured `list` response.
 ///
-/// Until the poller lands in Task 11 this is the only way to see the table at
-/// all, and afterwards it stays the way the UI is exercised without a NAS — the
-/// table, multi-select, sorting, filtering and search are all verifiable from a
-/// checked-in JSON file.
+/// The way the UI is exercised without a NAS — the table, multi-select,
+/// sorting, filtering and search are all verifiable from a checked-in JSON
+/// file. No poller runs, so the event channel here only ever stays quiet: the
+/// sender is held for the lifetime of the loop so `recv` pends rather than
+/// reporting a closed channel on every pass.
 async fn run_fixture(path: &Path) -> Result<()> {
     tracing::info!(fixture = %path.display(), "offline fixture mode");
 
@@ -85,48 +110,76 @@ async fn run_fixture(path: &Path) -> Result<()> {
         app.tasks.len()
     ));
 
-    run_tui(&mut app).await
+    let (_tx, rx) = event::channel();
+    run_tui(&mut app, rx, &RefreshHandle::new()).await
 }
 
-/// The main event loop: draw, wait for one event, hand it to [`App`], repeat.
+/// The main event loop: draw, wait for whichever comes first — a key press or
+/// something from the background — hand it to [`App`], repeat.
 ///
 /// The panic hook is installed **before** the guard, so a panic during setup is
 /// covered too, and the guard is dropped on every exit path — including the `?`
 /// below — restoring the terminal.
 ///
-/// Shape note for Task 11: the loop deliberately reduces to *draw, await one
-/// event, apply it*. Turning it into the planned
-/// `tokio::select! { terminal event, poller event }` means replacing the single
-/// `next_terminal_event().await` with the select and adding an arm for
-/// `AppEvent`; nothing else here has to move.
-async fn run_tui(app: &mut App) -> Result<()> {
+/// **The pending terminal read is held across iterations.** `event::read` runs
+/// on the blocking pool and cannot be cancelled: if the [`select!`] dropped its
+/// future every time an [`AppEvent`] won the race, each poller tick would leave
+/// another orphaned thread blocked on stdin, and they would then take turns
+/// swallowing the user's keystrokes. Keeping the [`JoinHandle`] in
+/// `pending_read` means exactly one read exists at any moment, and — since the
+/// only thing that sets `quit` is a key press, which consumes it — none is left
+/// over to stall the runtime at shutdown.
+///
+/// [`select!`]: tokio::select
+/// [`JoinHandle`]: tokio::task::JoinHandle
+async fn run_tui(app: &mut App, mut rx: Receiver, refresh: &RefreshHandle) -> Result<()> {
     ui::install_panic_hook();
     let mut terminal = TerminalGuard::new().context(
         "could not take over the terminal — syno-clean needs an interactive TTY \
          (use --dump-api-info or --dump-tasks-json when piping output)",
     )?;
 
+    let mut pending_read = None;
+
     while !app.should_quit() {
         terminal.draw(app)?;
         // A page jump is a screenful of the table, so the app is told how tall
         // that is after every draw — including after a resize.
         app.set_page_size(terminal.page_size()?);
-        app.handle_event(next_terminal_event().await?);
+
+        let read =
+            pending_read.get_or_insert_with(|| tokio::task::spawn_blocking(terminal_event::read));
+        // The select's result is returned rather than acted on in the branch
+        // bodies, so the mutable borrow of `pending_read` ends with the
+        // expression and the arm below can clear it.
+        let next = tokio::select! {
+            result = read => Next::Terminal(result),
+            Some(app_event) = rx.recv() => Next::Background(app_event),
+        };
+
+        match next {
+            Next::Terminal(result) => {
+                pending_read = None;
+                app.handle_event(result??);
+            }
+            Next::Background(app_event) => app.apply_event(app_event),
+        }
+
+        // `r` is a request, not an action: the app records it and the poller —
+        // which owns the interval and the client — does the work.
+        if app.take_refresh_request() {
+            refresh.request();
+        }
     }
 
     tracing::info!("exiting");
     Ok(())
 }
 
-/// Wait for the next terminal event without blocking the async runtime.
-///
-/// crossterm's `event-stream` feature is **not** enabled by ratatui's crossterm
-/// re-export, and adding crossterm directly is forbidden (see `CLAUDE.md`), so
-/// the blocking `event::read` runs on the blocking pool instead. Exactly one
-/// read is ever in flight — it is awaited immediately — so nothing lingers on
-/// that pool when the loop exits.
-async fn next_terminal_event() -> Result<Event> {
-    Ok(tokio::task::spawn_blocking(event::read).await??)
+/// Which of the two event sources won a pass of the loop.
+enum Next {
+    Terminal(std::result::Result<std::io::Result<Event>, tokio::task::JoinError>),
+    Background(AppEvent),
 }
 
 /// The hidden `--dump-api-info` / `--dump-tasks-json` modes.
