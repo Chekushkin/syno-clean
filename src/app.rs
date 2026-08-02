@@ -169,6 +169,15 @@ pub struct App {
     /// means the whole confirmation flow stays testable without a runtime, a
     /// client or a NAS.
     confirmed_delete: Option<DeletePlan>,
+    /// Whether an operation batch the event loop started is still running.
+    ///
+    /// Pushed in by [`App::set_op_in_flight`] before every draw — `App` owns no
+    /// runtime handle and cannot ask. It exists so `d`, `p` and `u` can say no
+    /// **before** the user commits: refusing after
+    /// [`App::take_confirmed_delete`] had already taken the plan discarded it,
+    /// and the only notice was a footer line the running batch's next progress
+    /// event overwrote milliseconds later.
+    op_in_flight: bool,
     /// Set by `q` / `Ctrl-C`; the event loop owns the actual exit.
     quit: bool,
 }
@@ -195,6 +204,7 @@ impl Default for App {
             confirm_scroll: 0,
             requested_op: None,
             confirmed_delete: None,
+            op_in_flight: false,
             quit: false,
         }
     }
@@ -256,6 +266,43 @@ impl App {
     /// Take the error banner down.
     pub fn clear_error(&mut self) {
         self.error = None;
+    }
+
+    /// Tell the app whether an operation batch is still running on the NAS.
+    ///
+    /// The event loop is what knows (it holds the [`JoinHandle`]s) and pushes
+    /// the answer in before every draw. **One batch at a time** is the rule
+    /// this enforces — two overlapping delete runs would interleave their
+    /// pause/delete phases against the same NAS — and enforcing it *here*,
+    /// rather than where the plan is drained, is what makes the refusal
+    /// something the user is told before they press `y`.
+    ///
+    /// [`JoinHandle`]: tokio::task::JoinHandle
+    pub fn set_op_in_flight(&mut self, running: bool) {
+        self.op_in_flight = running;
+    }
+
+    /// Whether the loop reported an operation still running.
+    pub fn op_in_flight(&self) -> bool {
+        self.op_in_flight
+    }
+
+    /// Say no to a second batch, and report why. Returns whether it said no.
+    ///
+    /// `what` names the operation that was refused, for the log; the message on
+    /// screen deliberately does not, because the footer it lands in is also
+    /// where the *running* batch reports itself and two similar lines about two
+    /// different operations read as one.
+    fn refuse_while_busy(&mut self, what: &str) -> bool {
+        if !self.op_in_flight {
+            return false;
+        }
+
+        tracing::warn!(refused = what, "an operation is already in flight");
+        self.set_status(
+            "an operation is still running — wait for it to finish before starting another",
+        );
+        true
     }
 
     // ---- background events -------------------------------------------------
@@ -559,6 +606,10 @@ impl App {
     /// work without arming it first. A plan with no items (an empty table)
     /// opens no dialog at all: there is nothing to confirm.
     pub fn begin_delete(&mut self) {
+        if self.refuse_while_busy("a delete") {
+            return;
+        }
+
         let plan = DeletePlan::snapshot(self.target_tasks());
         if plan.is_empty() {
             self.set_status("nothing to delete");
@@ -633,6 +684,10 @@ impl App {
     /// a **no-op with a message**, never an empty batch: a round trip that can
     /// only report "nothing to do" is not worth making.
     fn request_task_op(&mut self, op: TaskOp) {
+        if self.refuse_while_busy(op.label()) {
+            return;
+        }
+
         let tasks: Vec<TaskRef> = self
             .target_tasks()
             .into_iter()
@@ -2331,6 +2386,67 @@ mod tests {
         assert_eq!(plan.deletable().count(), 1);
         assert_eq!(plan.refused().count(), 1);
         assert_eq!(plan.total_size(), fixture_task("dbid_001").size);
+    }
+
+    // ---- one batch at a time ------------------------------------------------
+
+    #[test]
+    fn d_while_a_batch_is_running_never_opens_a_dialog_it_cannot_honour() {
+        // The refusal has to happen *before* the user commits. Taking the plan
+        // and then refusing dropped it silently: the footer said so for the few
+        // milliseconds before the running batch's next progress event
+        // overwrote the line, and the user walked away believing their second
+        // delete had run.
+        let mut app = app_with(2);
+        app.set_op_in_flight(true);
+
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.mode, Mode::Normal, "no modal may open");
+        assert!(app.pending_delete().is_none());
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|status| status.contains("still running")),
+            "{:?}",
+            app.status_message
+        );
+        assert!(app.take_confirmed_delete().is_none());
+    }
+
+    #[test]
+    fn p_and_u_while_a_batch_is_running_are_refused_the_same_way() {
+        for key in ['p', 'u'] {
+            let mut app = app_with(2);
+            app.set_op_in_flight(true);
+            app.handle_key(press(KeyCode::Char(key)));
+            assert!(
+                app.take_requested_op().is_none(),
+                "{key} must not queue an operation on top of a live batch"
+            );
+            assert!(
+                app.status_message
+                    .as_deref()
+                    .is_some_and(|status| status.contains("still running")),
+                "{key}: {:?}",
+                app.status_message
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_lifts_when_the_batch_finishes() {
+        // The flag is pushed in by the event loop before every draw, so a
+        // finished batch has to re-enable the keys with no other state change.
+        let mut app = app_with(2);
+        app.set_op_in_flight(true);
+        app.handle_key(press(KeyCode::Char('d')));
+        assert!(app.pending_delete().is_none());
+
+        app.set_op_in_flight(false);
+        assert!(!app.op_in_flight());
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.mode, Mode::Confirm);
+        assert!(app.pending_delete().is_some());
     }
 
     #[test]

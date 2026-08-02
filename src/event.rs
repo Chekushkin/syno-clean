@@ -38,12 +38,16 @@
 //!   and removing the task would destroy the only pointer to data still on the
 //!   volume. See [`decide_file_phase`];
 //! * after the recursive delete reports success the path is looked up **once
-//!   more**, and anything other than "gone" fails the item. The `status`
+//!   more**, and a path that is *still there* fails the item — the `status`
 //!   payload's error count is the only other signal, and no real NAS response
 //!   has been captured to confirm this client is reading it under the right
-//!   name;
+//!   name. A re-check that cannot be read is **not** a failure, though: see
+//!   [`decide_confirm_phase`] for why the same answer means opposite things
+//!   before and after the delete;
 //! * the pause phase resolves against a **live** status read rather than the
-//!   snapshot's, because the snapshot's is as old as the confirmation dialog;
+//!   snapshot's, because the snapshot's is as old as the confirmation dialog —
+//!   and a live read that says nothing about the id asked for is read as
+//!   "pause it", never as "it is idle";
 //! * `--dry-run` reports what it would do and issues **no destructive call at
 //!   all** — not even the existence check, which is a read but also a round trip
 //!   the user did not ask for.
@@ -535,26 +539,67 @@ async fn run_op(
 /// Because the field is `#[serde(default)]`, a rename would make a delete that
 /// removed nothing — a permission failure, say — look finished and clean, and
 /// the DSM task would then be removed on top of files that are still there.
-/// One extra `getinfo` makes the safety property hold regardless of the field
+/// One extra `getinfo` makes that safety property hold regardless of the field
 /// name.
 ///
-/// Anything other than "gone" fails the item, **including a lookup that
-/// errors**: failing leaves the task pointing at its data, which is the
-/// recoverable direction.
+/// **Only a path that is still *there* fails the item.** A lookup that cannot
+/// be read is inconclusive, and the previous phase already got a positive
+/// [`PathInfo::Found`] out of the same call for the same path — see
+/// [`decide_confirm_phase`].
 async fn confirm_deleted(client: &SynoClient, path: &str) -> OpOutcome {
     match file_station::path_info(client, path).await {
-        Ok(PathInfo::Missing) => OpOutcome::Done,
-        Ok(PathInfo::Found { .. }) => OpOutcome::Failed(format!(
-            "File Station reported the delete of {path} as finished but the path is still there"
+        Ok(info) => decide_confirm_phase(info, path),
+        // The delete's own `status` said finished with no path errors, and this
+        // second opinion is unavailable rather than negative. Failing here
+        // would leave a DSM task pointing at files that are gone — and for a
+        // title-derived name, a retry then hits `decide_file_phase`'s
+        // Missing + Title refusal and the task can never be removed at all.
+        Err(err) => {
+            tracing::warn!(
+                path,
+                %err,
+                "could not re-check the path after deleting it; trusting the delete's own report"
+            );
+            OpOutcome::Done
+        }
+    }
+}
+
+/// What the post-delete re-check means. The **asymmetric twin** of
+/// [`decide_file_phase`], and the asymmetry is the point:
+///
+/// * *before* a delete, an answer this client cannot attribute to the path
+///   ([`PathInfo::Unknown`]) is a hard failure — it is what an unreadable
+///   `getinfo` shape produces, and reading it as absence would delete every
+///   task in the batch while reclaiming nothing;
+/// * *after* a delete that reported itself finished, the same answer is
+///   evidence in the other direction. This code only ever gets here through a
+///   [`PathInfo::Found`] on the *same* call for the *same* path, so the
+///   response shape demonstrably parses on this NAS: an entry that has now
+///   stopped being attributable is a path that has stopped being there. On a
+///   DSM build that answers an absent path with `{"files": []}`, demanding a
+///   positive `Missing` failed **every** item of **every** run — files gone,
+///   task kept, footer reporting FAILED.
+///
+/// So: still `Found` is the failure. Anything else is the delete having done
+/// what it said it did.
+fn decide_confirm_phase(info: PathInfo, path: &str) -> OpOutcome {
+    match info {
+        PathInfo::Found { .. } => OpOutcome::Failed(format!(
+            "File Station reported the delete of {path} as finished but the path is still \
+             there — leaving the task in place (use --no-delete-files to remove the task \
+             without touching the files)"
         )),
-        Ok(other) => OpOutcome::Failed(format!(
-            "could not confirm that {path} is gone after deleting it ({other:?}); \
-             leaving the task in place"
-        )),
-        Err(err) => OpOutcome::Failed(format!(
-            "could not confirm that {path} is gone after deleting it: {err}; \
-             leaving the task in place"
-        )),
+        PathInfo::Missing => OpOutcome::Done,
+        other => {
+            tracing::warn!(
+                path,
+                answer = ?other,
+                "the post-delete check could not be read; the delete reported itself finished \
+                 and the path is not there, so the task is removed"
+            );
+            OpOutcome::Done
+        }
     }
 }
 
@@ -573,10 +618,28 @@ async fn delete_task(client: &SynoClient, id: &str) -> Result<()> {
 /// Whether a pause has to be issued at all, given what DSM says about the task
 /// **right now**.
 ///
-/// `None` — no entry for the id — needs no pause: the task is not there any
-/// more, so whatever it was holding, it is not holding it now.
+/// `None` — the `getinfo` answer carried no entry for the id that was asked
+/// about — means a pause **is** needed. That is the fail-*safe* direction, and
+/// it is the same reasoning
+/// [`check_task_result`](crate::api::download_station::check_task_result) and
+/// [`PathInfo::Unknown`] apply: an empty result says nothing about the id in
+/// the question, and [`crate::model::TaskList::tasks`] is `#[serde(default)]`,
+/// so any payload this client cannot read arrives here as no entry at all.
+/// Reading that as "idle" sends a recursive delete into a directory Download
+/// Station may be writing into — the exact hazard the unconditional
+/// [`Op::Pause`] exists for.
 fn pause_needed(current: Option<&Task>) -> bool {
-    current.is_some_and(|task| delete::requires_pause(&task.status))
+    current.is_none_or(|task| delete::requires_pause(&task.status))
+}
+
+/// The entry for the id that was asked about — **never merely the first one**.
+///
+/// `getinfo` takes an id list and there is nothing in the protocol that
+/// promises the answer is about the id requested (or about only that one). A
+/// build that ignored the parameter and answered with the whole task list would
+/// otherwise let an unrelated task's status decide whether this one is paused.
+fn task_with_id<'a>(tasks: &'a [Task], id: &str) -> Option<&'a Task> {
+    tasks.iter().find(|task| task.id == id)
 }
 
 /// Pause one task and wait until DSM agrees that it is no longer active.
@@ -596,7 +659,8 @@ fn pause_needed(current: Option<&Task>) -> bool {
 async fn pause_and_confirm(client: &SynoClient, id: &str) -> Result<()> {
     let ids = [id.to_string()];
 
-    if !pause_needed(download_station::task_info(client, &ids).await?.first()) {
+    let current = download_station::task_info(client, &ids).await?;
+    if !pause_needed(task_with_id(&current, id)) {
         tracing::debug!(id, "the task is already inactive; no pause is needed");
         return Ok(());
     }
@@ -606,7 +670,8 @@ async fn pause_and_confirm(client: &SynoClient, id: &str) -> Result<()> {
 
     let deadline = Instant::now() + PAUSE_CONFIRM_TIMEOUT;
     loop {
-        if !pause_needed(download_station::task_info(client, &ids).await?.first()) {
+        let current = download_station::task_info(client, &ids).await?;
+        if !pause_needed(task_with_id(&current, id)) {
             return Ok(());
         }
 
@@ -1269,12 +1334,95 @@ mod tests {
         assert!(matches!(outcome, OpOutcome::Failed(_)), "{outcome:?}");
     }
 
+    // ---- the post-delete re-check -------------------------------------------
+    //
+    // The asymmetry with `decide_file_phase` above is deliberate and is what
+    // these pin: the *same* unreadable answer is a hard failure before the
+    // delete and an acceptable one after it.
+
+    #[test]
+    fn a_path_still_there_after_the_delete_fails_the_item() {
+        let outcome = decide_confirm_phase(PathInfo::Found { is_dir: true }, "/downloads/X");
+        assert!(
+            matches!(&outcome, OpOutcome::Failed(why) if why.contains("still there")),
+            "{outcome:?}"
+        );
+        // The task survives, so the user needs the one flag that can still
+        // remove it.
+        assert!(matches!(
+            &outcome,
+            OpOutcome::Failed(why) if why.contains("--no-delete-files")
+        ));
+    }
+
+    #[test]
+    fn a_path_confirmed_gone_completes_the_item() {
+        assert_eq!(
+            decide_confirm_phase(PathInfo::Missing, "/downloads/X"),
+            OpOutcome::Done
+        );
+    }
+
+    #[test]
+    fn an_unreadable_recheck_does_not_strand_the_task() {
+        // The whole-run failure this replaced: on a DSM build that answers an
+        // absent path with `{"files": []}` every item deleted its files, got
+        // `Unknown` back, failed, and kept the task — a half-completed delete
+        // on every single run, reported as FAILED.
+        assert_eq!(
+            decide_confirm_phase(PathInfo::Unknown, "/downloads/X"),
+            OpOutcome::Done,
+            "the delete reported itself finished and the path is not there"
+        );
+        assert_eq!(
+            decide_confirm_phase(PathInfo::Error(403), "/downloads/X"),
+            OpOutcome::Done
+        );
+    }
+
+    #[test]
+    fn the_recheck_is_the_mirror_image_of_the_pre_check_only_for_found() {
+        // The two directions in one place, because collapsing them into one
+        // helper is the tempting simplification that reintroduces both bugs.
+        for info in [PathInfo::Unknown, PathInfo::Error(403)] {
+            assert!(
+                matches!(
+                    decide_file_phase(info, "/downloads/X", Some(NameSource::FileList)),
+                    OpOutcome::Failed(_)
+                ),
+                "{info:?} before a delete must refuse to touch anything"
+            );
+            assert_eq!(
+                decide_confirm_phase(info, "/downloads/X"),
+                OpOutcome::Done,
+                "{info:?} after a finished delete must not strand the task"
+            );
+        }
+    }
+
     // ---- the pause phase's live re-check ------------------------------------
 
     #[test]
-    fn a_task_that_is_no_longer_listed_needs_no_pause() {
-        // Whatever it was holding, it is not holding it now.
-        assert!(!pause_needed(None));
+    fn a_task_the_status_read_says_nothing_about_is_paused_anyway() {
+        // Fail-safe, not fail-open. `TaskList::tasks` is `#[serde(default)]`,
+        // so a `getinfo` payload this client cannot read arrives as no entry at
+        // all — and reading that as "idle" walks a recursive delete into a
+        // directory Download Station may still be writing into.
+        assert!(pause_needed(None));
+    }
+
+    #[test]
+    fn the_status_read_is_matched_to_the_id_that_was_asked_about() {
+        // A build that ignored the `id` parameter would otherwise let some
+        // other task's `paused` decide this one's fate.
+        let tasks = fixture_tasks();
+        let id = "dbid_004";
+        assert!(matches!(task_with_id(&tasks, id), Some(task) if task.id == id));
+        assert!(task_with_id(&tasks, "dbid_nonexistent").is_none());
+        assert!(
+            pause_needed(task_with_id(&tasks, "dbid_nonexistent")),
+            "an answer that does not cover the id is not an answer"
+        );
     }
 
     #[test]

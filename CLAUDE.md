@@ -276,8 +276,9 @@ needs must be `info!` or higher. `--log-file` changes only *where* the file goes
   the result array through `download_station::check_task_results`; reading only
   `success` reports a failed delete as a success, and the delete ordering depends
   on knowing whether a pause actually happened.
-- **`getinfo` distinguishes three answers, and so does `PathInfo`**: `Missing`
-  (skip the file phase, still delete the task), `Found`, and `Error(code)` —
+- **`getinfo` distinguishes four answers, and so does `PathInfo`**: `Missing`
+  (skip the file phase, still delete the task), `Found`, `Error(code)` and
+  `Unknown` (nothing attributable to the path — see below) —
   a permission problem is *not* absence, and collapsing the two would delete the
   task and strand the files. `Missing` arrives as a per-entry code 408, as a bare
   entry with no `isdir`, or at the envelope level depending on the DSM build;
@@ -418,7 +419,12 @@ deleted.
   success — Download Station cleans up its own partial data.
 - **"Confirm paused" is a real re-read** (`download_station::task_info`, polled
   until the task reports itself paused, bounded at 15 s). DSM accepting a `pause`
-  says the request was queued, not that the task stopped writing.
+  says the request was queued, not that the task stopped writing. The answer is
+  matched to **the id that was asked about** (`event::task_with_id`, never
+  `.first()`), and an answer carrying no entry for it means **pause**, not
+  "idle": `TaskList::tasks` is `#[serde(default)]`, so an unreadable payload
+  arrives as no entry at all, and fail-open there recurses through a directory
+  Download Station may still be writing into.
 
 ### How the ordering is expressed (`delete.rs` + `event.rs`)
 
@@ -460,9 +466,20 @@ deleted.
 - **The recursive delete is confirmed by a second `path_info`**, not by
   `path_err_num` alone. That field is `#[serde(default)]` and no real NAS
   response has been captured to check the spelling, so a rename would make a
-  delete that removed nothing look finished and clean. Anything other than
-  "gone" — including a lookup that errors — fails the item and leaves the task
-  pointing at its data.
+  delete that removed nothing look finished and clean.
+- ⚠️ **The same `getinfo` answer means opposite things before and after the
+  delete**, and `event::decide_file_phase` / `event::decide_confirm_phase` are
+  deliberately *not* one function. Before: `Unknown` (and any error) is a hard
+  failure — nothing has been touched yet and an unreadable response must not
+  authorize a delete. After: only a path that is **still `Found`** fails.
+  `confirm_deleted` is only ever reached through a `Found` on the same call for
+  the same path, so the shape demonstrably parses on this NAS and an entry that
+  has stopped being attributable is a path that has stopped being there.
+  Demanding a positive `Missing` there made every item of every run half-complete
+  (files gone, task kept, footer reporting FAILED) on any DSM build that answers
+  an absent path with `{"files": []}` — and for a `NameSource::Title` item the
+  retry then hits the Missing+Title refusal, so the task could never be removed
+  at all.
 - **`delete_files = false` drops the file phase *and* the pause.** The pause
   exists only to keep DS out of the way of the file delete; with no file delete a
   failed pause would block a task-only removal for nothing.
@@ -679,6 +696,20 @@ rows are hidden and by what, so the fix is on screen rather than guessed at.
   minute is ordinary. It ends only when the channel closes or `main` aborts it,
   which `main` does after the loop so an in-flight 30 s HTTP timeout cannot delay
   exit.
+- **Quitting stops the poller *before* waiting for in-flight op batches, and
+  keeps draining the channel while it waits** (`main::shutdown`). The poller and
+  the op tasks share one `mpsc` of 64 slots; a poller still ticking into a
+  channel the loop no longer drains fills it, and the delete's next
+  `OpProgress` send then blocks forever — a hang with the terminal already
+  restored, escapable only by the `Ctrl-C` that abandons the batch between "the
+  files are gone" and "the task is gone". The wait is bounded
+  (`main::IN_FLIGHT_GRACE`) for the same reason.
+- **One op batch at a time, refused in `App` rather than in the loop.** The loop
+  pushes `App::set_op_in_flight` before each draw and `d` / `p` / `u` say no on
+  the spot. Refusing where the plan is *drained* meant
+  `take_confirmed_delete` had already consumed it, and the footer line saying so
+  was overwritten by the running batch's next progress event — the user saw a
+  delete they confirmed report as finished having never run.
 - **`r` is a request, not an action.** The loop drains it and pokes an
   `event::RefreshHandle` (an `Arc<Notify>`, so repeated presses coalesce into one
   poll); the poller `reset()`s its interval after a manual tick.
