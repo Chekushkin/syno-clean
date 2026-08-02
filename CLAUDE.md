@@ -142,6 +142,25 @@ reach the log file, and holds the `WorkerGuard` for the whole of `main`.
   encoding lives in pure `build_*_params() -> Vec<(&str, String)>` functions so
   it is unit-testable and changeable in one place.
 
+### Using the client (`api::client`)
+
+- Never build a URL or pick a version by hand. Call
+  `client.call::<T>(api, method, SUPPORTED, &params)` — it resolves the
+  endpoint from the discovery map, attaches `_sid`, and owns the re-login
+  retry. `call_no_data` is the variant for methods that answer with a bare
+  `{"success": true}`. `SynoClient::send` is the no-retry escape hatch and
+  exists for `auth::login`, which must not recurse into the retry.
+- Each API module declares its own `SUPPORTED: VersionRange` const (inclusive
+  `(min, max)`); `pick_version_in` takes the top of the overlap with what the
+  NAS advertises and errors naming both ranges when there is none.
+- Three envelope readers: `parse_envelope` (payload required),
+  `parse_envelope_optional` (payload may be absent), `check_envelope` (success
+  only). A protocol violation — success with no data, failure with no code, a
+  body that is not an envelope — is an `Error::Parse` built with
+  `serde::de::Error::custom`; do not add error variants for these.
+- Credentials are redacted in `Debug`. Keep it that way: `SynoClient` derives
+  `Debug` and holds them.
+
 ## Delete ordering (three phases, ordered for recoverability)
 
 | Task status | Ordering |

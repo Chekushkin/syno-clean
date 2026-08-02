@@ -314,13 +314,24 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 - Create: `src/api/client.rs`
 - Create: `src/api/auth.rs`
 
-- [ ] define `Envelope<T> { success, data: Option<T>, error: Option<DsmError> }` and a `parse_envelope` helper turning `success=false` into `Error::Dsm`
-- [ ] build `SynoClient`: base URL from host/port/https, `danger_accept_invalid_certs` when `insecure`, sane timeouts, shared `reqwest::Client`
-- [ ] implement `query_api_info()` against **`/webapi/query.cgi`** (hardcoded — `SYNO.API.Info` is not served from `entry.cgi`), caching each API's `path`, `minVersion`, `maxVersion`; implement `pick_version(api, supported_range)` used by every later call so **no version is hardcoded**; error clearly when a required API is absent
-- [ ] implement `login()` / `logout()` against `SYNO.API.Auth` with `session=DownloadStation`, `format=sid`, optional `otp_code`; logout is invoked **only** by `--logout`, never on normal quit
-- [ ] implement the request helper: build the URL from the discovered path, attach `_sid`, and on DSM **106/107/119** re-login once and retry exactly once
-- [ ] write tests for envelope parsing (success payload, error payload, malformed body), for the API-info map lookup (present / missing API), and for `pick_version` (clamps to `maxVersion`, errors when the NAS range and the supported range do not overlap)
-- [ ] run `cargo test` — must pass before task 5
+- [x] define `Envelope<T> { success, data: Option<T>, error: Option<DsmError> }` and a `parse_envelope` helper turning `success=false` into `Error::Dsm`
+- [x] build `SynoClient`: base URL from host/port/https, `danger_accept_invalid_certs` when `insecure`, sane timeouts, shared `reqwest::Client` — 10 s connect, 30 s request
+- [x] implement `query_api_info()` against **`/webapi/query.cgi`** (hardcoded — `SYNO.API.Info` is not served from `entry.cgi`), caching each API's `path`, `minVersion`, `maxVersion`; implement `pick_version(api, supported_range)` used by every later call so **no version is hardcoded**; error clearly when a required API is absent — landed as `SynoClient::discover()` + `ApiInfoMap` (see note below)
+- [x] implement `login()` / `logout()` against `SYNO.API.Auth` with `session=DownloadStation`, `format=sid`, optional `otp_code`; logout is invoked **only** by `--logout`, never on normal quit
+- [x] implement the request helper: build the URL from the discovered path, attach `_sid`, and on DSM **106/107/119** re-login once and retry exactly once — `SynoClient::call_text` / `call` / `call_no_data`
+- [x] write tests for envelope parsing (success payload, error payload, malformed body), for the API-info map lookup (present / missing API), and for `pick_version` (clamps to `maxVersion`, errors when the NAS range and the supported range do not overlap)
+- [x] run `cargo test` — must pass before task 5 — 84 tests pass
+
+⚠️ **Decisions taken during Task 4** (plan text above kept verbatim; actuals recorded here):
+- Discovery landed as **`SynoClient::discover()` + an `ApiInfoMap` value** rather than a bare `query_api_info()`. The map owns the lookup, `pick_version` and `endpoint(base_url, api, supported) -> Endpoint { api, url, version }`, so URL and version resolution have exactly one definition and are all unit-testable without a client. `pick_version_in(api, nas, supported)` is the pure range intersection behind it.
+- **Three envelope entry points** instead of one: `parse_envelope` (payload required), `parse_envelope_optional` (payload may be absent), and `check_envelope` (success only, payload ignored). Logout/pause/resume answer with a bare `{"success": true}`, and the retry path has to classify a response *before* committing to a payload type.
+- **Protocol violations reuse `Error::Parse`**, constructed via `serde::de::Error::custom`, rather than adding an enum variant. "Success with no data", "failure with no error code" and "JSON that is not an envelope" are all "the body was not what this client can work with". No new error variant, and the plan's variant list is unchanged.
+- `Envelope`'s `data`/`error` fields carry **no `#[serde(default)]`** — serde already treats `Option` fields as optional, and the attribute would drag a spurious `T: Default` bound into the derived `Deserialize`.
+- The retry is `call_text`: fetch, `check_envelope`, and only on a session code (via `error::is_session_error`) clear the sid, re-login and re-send **once**. `auth::login` deliberately goes through the lower-level `SynoClient::send`, so a login can never recurse into the retry that called it. Re-login needs stored `Credentials`; without them the session error is returned as-is.
+- ➕ `AUTH_SUPPORTED = (3, 6)`. The floor is 3 because `otp_code` does not exist below it, so a 2FA account could never log in; the ceiling is 6 because nothing here needs 7 and the negotiation clamps to the overlap regardless.
+- ➕ `Credentials` has a **hand-written `Debug`** that redacts the password and OTP, so no `{:?}` on it (or on `SynoClient`, which holds it) can leak a credential into the log file.
+- ➕ Added `SynoClient::discovery_json()` now, so Task 5's hidden `--dump-api-info` flag is a one-liner.
+- Per the plan's Testing Strategy, **nothing in this task's tests touches the network**: the 34 new tests cover envelope deserialization from JSON strings, the API-info map, `pick_version`, URL/parameter construction and the login/logout param builders. The `async fn`s are verified by running the binary.
 
 ### Task 5: Task model and Download Station list endpoint
 
