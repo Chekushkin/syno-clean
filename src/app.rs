@@ -3,8 +3,9 @@
 //! [`App`] holds *everything* the program knows; rendering (`crate::ui`) is a
 //! pure function of `&App`, and every key press is a `&mut App` transition. No
 //! widget reads the network, and no networking code touches a widget — the
-//! poller and the op tasks in `event.rs` (Task 11) will hand their results to
-//! `App` as plain data.
+//! poller and the op tasks in [`crate::event`] hand their results to `App` as
+//! plain data through [`App::apply_event`], which is a `&mut App` transition
+//! exactly like a key press and just as testable without a runtime.
 //!
 //! Two conventions set here and relied on by later tasks:
 //!
@@ -14,7 +15,7 @@
 //! * **Selection is keyed by task ID, not row index**, so a refresh that
 //!   reorders or removes rows can never silently reassign what is selected.
 //!   [`App::cursor`] is a position in the *visible* list and is reconciled by
-//!   ID in Task 11.
+//!   ID in [`App::apply_tasks`].
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -24,6 +25,7 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModif
 use crate::api::client::parse_envelope;
 use crate::api::download_station::DS_TASK_API;
 use crate::error::Result;
+use crate::event::AppEvent;
 use crate::model::{Task, TaskList};
 use crate::view::{self, View};
 
@@ -67,11 +69,20 @@ pub struct App {
     pub selected: HashSet<String>,
     pub mode: Mode,
     /// One line of feedback shown in the footer: the result of the last
-    /// operation, a poll failure, or the startup banner.
+    /// operation or the startup banner.
     pub status_message: Option<String>,
+    /// A **non-fatal** failure banner — a poll that could not reach the NAS,
+    /// most often. Kept apart from [`App::status_message`] so it can be styled
+    /// as a warning and, crucially, cleared automatically by the next
+    /// successful refresh: the UI recovers on its own.
+    pub error: Option<String>,
     /// How far `PageUp`/`PageDown` jump: the height of the table body, as of
     /// the last frame. See [`DEFAULT_PAGE_SIZE`].
     page_size: usize,
+    /// Set by `r`, cleared by the event loop when it forwards the request to
+    /// the poller. A flag rather than a channel handle so `App` stays free of
+    /// the runtime and every key press stays a pure state transition.
+    refresh_requested: bool,
     /// Set by `q` / `Ctrl-C`; the event loop owns the actual exit.
     quit: bool,
 }
@@ -87,7 +98,9 @@ impl Default for App {
             selected: HashSet::new(),
             mode: Mode::Normal,
             status_message: None,
+            error: None,
             page_size: DEFAULT_PAGE_SIZE,
+            refresh_requested: false,
             quit: false,
         }
     }
@@ -106,10 +119,10 @@ impl App {
     /// An app over a captured DSM `list` response on disk — the hidden
     /// `--fixture` mode.
     ///
-    /// Offline verification hangs off this: the poller does not exist until
-    /// Task 11, so the table, multi-select and the sort/filter keys have no
-    /// other way to be exercised, and a 500-task file is the cheapest possible
-    /// render-performance check.
+    /// Offline verification hangs off this: with no NAS in reach the table,
+    /// multi-select and the sort/filter keys have no other way to be exercised,
+    /// and a 500-task file is the cheapest possible render-performance check.
+    /// Nothing polls in this mode — the list is whatever the file said.
     pub fn from_fixture(path: &Path) -> Result<Self> {
         Ok(Self::new(read_fixture(path)?))
     }
@@ -117,6 +130,98 @@ impl App {
     /// Replace the footer message.
     pub fn set_status(&mut self, message: impl Into<String>) {
         self.status_message = Some(message.into());
+    }
+
+    /// Raise the non-fatal error banner.
+    ///
+    /// Nothing here ends the program: a NAS that is briefly unreachable is an
+    /// ordinary event, and the next successful refresh takes the banner down
+    /// again (see [`App::apply_tasks`]).
+    pub fn set_error(&mut self, message: impl Into<String>) {
+        self.error = Some(message.into());
+    }
+
+    /// Take the error banner down.
+    pub fn clear_error(&mut self) {
+        self.error = None;
+    }
+
+    // ---- background events -------------------------------------------------
+
+    /// Apply one [`AppEvent`] from the poller or an op task.
+    ///
+    /// The counterpart of [`App::handle_event`] for everything that is not a
+    /// key press. Like key handling it is a pure `&mut self` transition, so the
+    /// whole reconciliation is testable without a runtime or a NAS.
+    pub fn apply_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::Tasks(tasks) => self.apply_tasks(tasks),
+            AppEvent::Error(message) => self.set_error(message),
+            // Tasks 15 and 16 own the operations; the variants exist now so the
+            // channel has one definition. Reporting them is deliberately not
+            // guessed at here.
+            AppEvent::OpProgress { .. } | AppEvent::OpDone { .. } => {}
+        }
+    }
+
+    /// Reconcile a freshly fetched task list into the app.
+    ///
+    /// Three invariants, all of them about not moving things under the user:
+    ///
+    /// 1. **The cursor follows its task, by ID.** A list that came back sorted
+    ///    differently, or with a row inserted above, must not leave the cursor
+    ///    pointing at a different torrent than it did a moment ago — that is
+    ///    how the wrong task gets deleted by a `d` that was already half typed.
+    ///    When the task under the cursor is gone entirely, the *position* is
+    ///    kept instead and clamped into the new list.
+    /// 2. **Selections for tasks that no longer exist are dropped.** An ID that
+    ///    names nothing is not a selection, and keeping it would let a task
+    ///    that reappears later come back pre-armed for deletion.
+    /// 3. **A refresh arriving while the confirmation modal is open is ignored
+    ///    outright** — not merged, not queued. The `delete` plan on
+    ///    screen is a snapshot, and the user is reading it; changing the list
+    ///    underneath would make the dialog describe something other than what
+    ///    is about to happen.
+    pub fn apply_tasks(&mut self, tasks: Vec<Task>) {
+        if self.mode == Mode::Confirm {
+            tracing::debug!("dropping a refresh while the confirmation dialog is open");
+            return;
+        }
+
+        let cursor_id = self.cursor_task().map(|task| task.id.clone());
+
+        self.tasks = tasks;
+        let live: HashSet<&str> = self.tasks.iter().map(|task| task.id.as_str()).collect();
+        self.selected.retain(|id| live.contains(id.as_str()));
+
+        self.cursor = match cursor_id {
+            Some(id) => self
+                .visible()
+                .iter()
+                .position(|&index| self.tasks[index].id == id)
+                // The task is gone: hold the row number rather than jumping to
+                // the top, so the cursor stays where the user's eye is.
+                .unwrap_or(self.cursor),
+            None => self.cursor,
+        };
+        self.clamp_cursor();
+
+        // A tick that got through is the proof the last failure has passed.
+        self.clear_error();
+    }
+
+    /// Ask for an immediate refresh (`r`).
+    pub fn request_refresh(&mut self) {
+        self.refresh_requested = true;
+    }
+
+    /// Whether `r` was pressed since this was last asked, clearing the flag.
+    ///
+    /// The event loop calls this after every event and pokes the poller; in
+    /// offline `--fixture` mode nothing is listening and the request is simply
+    /// dropped.
+    pub fn take_refresh_request(&mut self) -> bool {
+        std::mem::take(&mut self.refresh_requested)
     }
 
     /// Indices into [`App::tasks`] of the rows to display, in display order.
@@ -329,6 +434,7 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => self.cursor_to_last(),
             KeyCode::Char(' ') => self.toggle_selection(),
             KeyCode::Char('a') => self.toggle_select_all_visible(),
+            KeyCode::Char('r') => self.request_refresh(),
             // Task 12 gives `Esc` its other jobs (leave search, dismiss a
             // dialog); in Normal mode it is the panic button for a selection.
             KeyCode::Esc => self.clear_selection(),
@@ -494,26 +600,37 @@ mod tests {
 
     // ---- cursor movement ---------------------------------------------------
 
+    /// One synthetic task. Everything the reconciliation cares about is the ID;
+    /// the title and size are what the sort and the footer read.
+    fn task(id: &str, title: &str, size: u64) -> Task {
+        Task {
+            id: id.to_string(),
+            title: title.to_string(),
+            status: TaskStatus::Paused,
+            size,
+            downloaded: 0,
+            uploaded: 0,
+            download_speed: 0,
+            upload_speed: 0,
+            destination: "downloads".to_string(),
+            files: Vec::new(),
+            seeders: 0,
+            leechers: 0,
+            create_time: None,
+        }
+    }
+
     /// An app over `count` synthetic tasks, all visible.
     fn app_with(count: usize) -> App {
         let tasks = (0..count)
-            .map(|n| Task {
-                id: format!("id_{n:03}"),
-                title: format!("task {n:03}"),
-                status: TaskStatus::Paused,
-                size: 0,
-                downloaded: 0,
-                uploaded: 0,
-                download_speed: 0,
-                upload_speed: 0,
-                destination: "downloads".to_string(),
-                files: Vec::new(),
-                seeders: 0,
-                leechers: 0,
-                create_time: None,
-            })
+            .map(|n| task(&format!("id_{n:03}"), &format!("task {n:03}"), 0))
             .collect();
         App::new(tasks)
+    }
+
+    /// The ID of the task the cursor is on, for the reconciliation assertions.
+    fn cursor_id(app: &App) -> Option<&str> {
+        app.cursor_task().map(|task| task.id.as_str())
     }
 
     #[test]
@@ -798,6 +915,273 @@ mod tests {
         app.selected.insert("ghost".to_string());
         assert_eq!(app.selected_count(), 1);
         assert_eq!(app.selected_size(), 0);
+    }
+
+    // ---- refresh reconciliation --------------------------------------------
+    //
+    // The heart of Task 11. A refresh lands every few seconds, unannounced,
+    // possibly while the user is reaching for `d` — so what it may *not* do is
+    // move the cursor onto a different task or leave a selection armed against
+    // one that is gone.
+
+    #[test]
+    fn a_refresh_that_reorders_the_list_keeps_the_cursor_on_the_same_task() {
+        // A new task sorting above the cursor pushes every row down by one. The
+        // row number must follow the task, not the other way round.
+        let mut app = App::new(vec![
+            task("id_b", "bravo", 0),
+            task("id_c", "charlie", 0),
+            task("id_d", "delta", 0),
+        ]);
+        app.cursor = 1;
+        assert_eq!(cursor_id(&app), Some("id_c"));
+
+        app.apply_tasks(vec![
+            task("id_d", "delta", 0),
+            task("id_a", "alpha", 0),
+            task("id_c", "charlie", 0),
+            task("id_b", "bravo", 0),
+        ]);
+
+        assert_eq!(app.cursor, 2, "charlie is now the third visible row");
+        assert_eq!(cursor_id(&app), Some("id_c"));
+    }
+
+    #[test]
+    fn a_refresh_that_re_sorts_the_list_keeps_the_cursor_on_the_same_task() {
+        // Same invariant when it is the *data* that moves the rows: sorting by
+        // size, a task that grew overtakes the one the cursor is on.
+        let mut app = App::new(vec![
+            task("id_a", "alpha", 100),
+            task("id_b", "bravo", 200),
+            task("id_c", "charlie", 300),
+        ]);
+        app.view.sort_key = view::SortKey::Size;
+        app.cursor = 0;
+        assert_eq!(cursor_id(&app), Some("id_a"));
+
+        app.apply_tasks(vec![
+            task("id_a", "alpha", 100),
+            task("id_b", "bravo", 200),
+            task("id_c", "charlie", 50),
+        ]);
+
+        assert_eq!(app.cursor, 1, "charlie shrank past alpha");
+        assert_eq!(cursor_id(&app), Some("id_a"));
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_cursor_on_the_same_task_inside_a_filtered_view() {
+        // The cursor is a position in the *visible* list, so the reconciliation
+        // has to search the visible list, not `tasks`.
+        let mut app = App::new(fixture_tasks());
+        app.view.filter = StatusFilter::Seeding;
+        app.cursor_to_last();
+        assert_eq!(app.cursor, 1);
+        let kept = cursor_id(&app).expect("a seeding task").to_string();
+        let dropped = app.tasks[app.visible()[0]].id.clone();
+
+        // The *other* seeding task disappears, so the row number has to change
+        // for the cursor to stay on the same torrent.
+        let refreshed: Vec<Task> = fixture_tasks()
+            .into_iter()
+            .filter(|task| task.id != dropped)
+            .collect();
+        app.apply_tasks(refreshed);
+
+        assert_eq!(app.cursor, 0);
+        assert_eq!(cursor_id(&app), Some(kept.as_str()));
+    }
+
+    #[test]
+    fn a_refresh_drops_selections_for_tasks_that_no_longer_exist() {
+        let mut app = app_with(3);
+        app.selected.insert("id_000".to_string());
+        app.selected.insert("id_002".to_string());
+
+        app.apply_tasks(vec![task("id_000", "task 000", 0), task("id_001", "x", 0)]);
+
+        assert_eq!(selected_ids(&app), ["id_000"], "id_002 is gone");
+        assert_eq!(app.selected_count(), 1);
+    }
+
+    #[test]
+    fn a_refresh_that_removes_the_cursor_task_clamps_the_cursor_into_the_list() {
+        // Cursor on the last row, and that task is what vanished.
+        let mut app = app_with(4);
+        app.cursor_to_last();
+        assert_eq!(cursor_id(&app), Some("id_003"));
+
+        app.apply_tasks(vec![
+            task("id_000", "task 000", 0),
+            task("id_001", "task 001", 0),
+        ]);
+
+        assert_eq!(app.cursor, 1, "clamped to the new last row");
+        assert_eq!(cursor_id(&app), Some("id_001"));
+    }
+
+    #[test]
+    fn a_refresh_that_removes_the_cursor_task_mid_list_holds_the_row_number() {
+        // Nothing to follow, so the cursor stays where the user's eye is rather
+        // than jumping to the top of the list.
+        let mut app = app_with(5);
+        app.cursor = 2;
+        let mut refreshed: Vec<Task> = app.tasks.clone();
+        refreshed.remove(2);
+
+        app.apply_tasks(refreshed);
+
+        assert_eq!(app.cursor, 2);
+        assert_eq!(cursor_id(&app), Some("id_003"));
+    }
+
+    #[test]
+    fn a_refresh_that_empties_the_list_leaves_a_valid_cursor() {
+        let mut app = app_with(5);
+        app.cursor_to_last();
+        app.handle_key(press(KeyCode::Char('a')));
+
+        app.apply_tasks(Vec::new());
+
+        assert_eq!(app.cursor, 0);
+        assert!(app.cursor_task().is_none());
+        assert!(app.selected.is_empty(), "every ID is stale now");
+    }
+
+    #[test]
+    fn a_refresh_is_ignored_entirely_while_the_confirmation_dialog_is_open() {
+        // The delete plan on screen is a snapshot the user is reading. Merging
+        // a refresh into it would make the dialog describe something other than
+        // what is about to be deleted.
+        let mut app = app_with(3);
+        app.cursor = 2;
+        app.selected.insert("id_002".to_string());
+        app.set_error("nas unreachable");
+        app.mode = Mode::Confirm;
+        let before = format!("{app:?}");
+
+        app.apply_event(AppEvent::Tasks(vec![task("id_009", "brand new", 0)]));
+
+        assert_eq!(format!("{app:?}"), before, "nothing may change in Confirm");
+        assert_eq!(app.tasks.len(), 3);
+        assert_eq!(cursor_id(&app), Some("id_002"));
+        assert_eq!(selected_ids(&app), ["id_002"]);
+        assert_eq!(app.error.as_deref(), Some("nas unreachable"));
+    }
+
+    #[test]
+    fn a_refresh_lands_again_as_soon_as_the_dialog_closes() {
+        let mut app = app_with(3);
+        app.mode = Mode::Confirm;
+        app.apply_event(AppEvent::Tasks(vec![task("id_009", "brand new", 0)]));
+        assert_eq!(app.tasks.len(), 3);
+
+        app.mode = Mode::Normal;
+        app.apply_event(AppEvent::Tasks(vec![task("id_009", "brand new", 0)]));
+        assert_eq!(app.tasks.len(), 1);
+        assert_eq!(cursor_id(&app), Some("id_009"));
+    }
+
+    // ---- the non-fatal error banner ----------------------------------------
+
+    #[test]
+    fn a_failed_poll_raises_a_banner_without_disturbing_anything_else() {
+        let mut app = app_with(3);
+        app.cursor = 1;
+        app.selected.insert("id_001".to_string());
+
+        app.apply_event(AppEvent::Error("refresh failed: connection refused".into()));
+
+        assert_eq!(
+            app.error.as_deref(),
+            Some("refresh failed: connection refused")
+        );
+        assert!(
+            !app.should_quit(),
+            "a poll failure must not end the program"
+        );
+        assert_eq!(app.tasks.len(), 3, "the last good list is still on screen");
+        assert_eq!(app.cursor, 1);
+        assert_eq!(selected_ids(&app), ["id_001"]);
+    }
+
+    #[test]
+    fn the_next_successful_refresh_takes_the_banner_down() {
+        let mut app = app_with(1);
+        app.apply_event(AppEvent::Error("refresh failed: timed out".into()));
+        assert!(app.error.is_some());
+
+        app.apply_event(AppEvent::Tasks(vec![task("id_000", "task 000", 0)]));
+        assert!(app.error.is_none(), "the UI recovers on its own");
+    }
+
+    #[test]
+    fn an_error_banner_does_not_replace_the_status_message() {
+        // They are different things: one is what the program is doing, the
+        // other is what went wrong. The footer decides which to show.
+        let mut app = App::default();
+        app.set_status("nas.local as eduard");
+        app.set_error("refresh failed");
+        assert_eq!(app.status_message.as_deref(), Some("nas.local as eduard"));
+        app.clear_error();
+        assert_eq!(app.status_message.as_deref(), Some("nas.local as eduard"));
+    }
+
+    #[test]
+    fn operation_events_are_accepted_and_change_nothing_yet() {
+        // Tasks 15 and 16 give these meaning; until then they must be inert
+        // rather than unhandled.
+        let mut app = app_with(2);
+        let before = format!("{app:?}");
+        app.apply_event(AppEvent::OpProgress {
+            op: crate::event::OpKind::Delete,
+            done: 1,
+            total: 2,
+            detail: "deleted /downloads/x".into(),
+        });
+        app.apply_event(AppEvent::OpDone {
+            op: crate::event::OpKind::Delete,
+            succeeded: 1,
+            skipped: 1,
+            failed: 0,
+        });
+        assert_eq!(format!("{app:?}"), before);
+    }
+
+    // ---- manual refresh ----------------------------------------------------
+
+    #[test]
+    fn r_asks_for_a_refresh_exactly_once_per_press() {
+        let mut app = app_with(2);
+        assert!(!app.take_refresh_request(), "nothing asked for yet");
+
+        app.handle_key(press(KeyCode::Char('r')));
+        assert!(app.take_refresh_request());
+        assert!(
+            !app.take_refresh_request(),
+            "taking the request must clear it"
+        );
+    }
+
+    #[test]
+    fn repeated_r_presses_coalesce_into_one_request() {
+        // Leaning on the key must not queue a round trip per keystroke.
+        let mut app = app_with(2);
+        for _ in 0..5 {
+            app.handle_key(press(KeyCode::Char('r')));
+        }
+        assert!(app.take_refresh_request());
+        assert!(!app.take_refresh_request());
+    }
+
+    #[test]
+    fn r_does_not_move_the_cursor_or_the_selection() {
+        let mut app = app_with(3);
+        app.cursor = 1;
+        app.handle_key(press(KeyCode::Char('r')));
+        assert_eq!(app.cursor, 1);
+        assert!(app.selected.is_empty());
     }
 
     // ---- fixture mode ------------------------------------------------------

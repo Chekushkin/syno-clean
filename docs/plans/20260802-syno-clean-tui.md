@@ -61,16 +61,19 @@ Coverage is intentionally scoped to **pure logic where bugs are silent and expen
 **Architecture: tokio async + ratatui, with a background poller.**
 
 ```
-                 ┌────────────────────────────────┐
-  crossterm      │        main event loop         │
-  EventStream ──▶│   tokio::select! {             │
-                 │     terminal event  → App      │──▶ ratatui render
-  poller task ──▶│     AppEvent::Tasks → App      │
-  (interval)     │     AppEvent::OpDone→ App      │
-                 │   }                            │
-  op tasks    ──▶└────────────────────────────────┘
-  (delete/pause)          mpsc::Sender<AppEvent>
+  spawn_blocking   ┌────────────────────────────────┐
+  (event::read)  ──▶│        main event loop       │
+  one JoinHandle,  │   tokio::select! {             │
+  held across      │     terminal event  → App      │──▶ ratatui render
+  iterations       │     AppEvent::Tasks → App      │
+                   │     AppEvent::OpDone→ App      │
+  poller task ────▶│   }                            │
+  (interval)       └────────────────────────────────┘
+  op tasks    ────▶        mpsc::Sender<AppEvent>
+  (delete/pause)
 ```
+
+⚠️ **The input source is `spawn_blocking(event::read)`, not `crossterm::EventStream`** — the `event-stream` feature is not enabled by ratatui's crossterm re-export and adding crossterm directly is forbidden (Task 1's ⚠️ note). The pending `JoinHandle` is kept across loop iterations rather than re-created per pass: a blocking read cannot be cancelled, so a `select!` that dropped it whenever an `AppEvent` won the race would leave one orphaned stdin reader per poller tick, all of them then taking turns swallowing keystrokes. Exactly one read exists at any moment.
 
 - A **poller task** refreshes the task list on an interval and pushes `AppEvent::Tasks(Vec<Task>)` down an mpsc channel. The UI never blocks on the network.
 - **Delete and pause/resume run as spawned tasks**, reporting back via `AppEvent::OpProgress` / `OpDone`. Deleting twenty torrents does not freeze the terminal.
@@ -488,13 +491,23 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 - Modify: `src/main.rs`
 - Modify: `src/app.rs`
 
-- [ ] define `AppEvent { Tasks(Vec<Task>), Error(String), OpProgress{..}, OpDone{..} }` and an mpsc channel (no `Tick` variant — the poller drives data and `EventStream` drives redraws)
-- [ ] spawn the poller task on a `tokio::time::interval` of `refresh_secs`, sending `Tasks` or `Error`
-- [ ] merge crossterm's `EventStream` with the channel in a `tokio::select!` main loop
-- [ ] implement `apply_tasks()`: reconcile new data while **preserving cursor position by task ID** and dropping selections for tasks that no longer exist; **ignore incoming `Tasks` events while `Mode::Confirm` is active** so a pending delete plan cannot go stale under the user
-- [ ] add `r` for manual refresh and a non-fatal error banner (poll failures must not kill the UI — it should recover on the next successful tick)
-- [ ] write tests for `apply_tasks` reconciliation: reordered list keeps the cursor on the same task, a removed task drops from the selection set, a removed cursor task clamps sanely, and an update is a no-op while in `Confirm` mode
-- [ ] run `cargo test` — must pass before task 12
+- [x] define `AppEvent { Tasks(Vec<Task>), Error(String), OpProgress{..}, OpDone{..} }` and an mpsc channel (no `Tick` variant — the poller drives data and `EventStream` drives redraws) — plus `OpKind` (Delete/Pause/Resume) so Tasks 15/16 name their operations once
+- [x] spawn the poller task on a `tokio::time::interval` of `refresh_secs`, sending `Tasks` or `Error` — `event::spawn_poller`, first tick immediate, `MissedTickBehavior::Delay`
+- [x] merge crossterm's `EventStream` with the channel in a `tokio::select!` main loop — ⚠️ **`EventStream` is unavailable**; the select's terminal arm is the held `spawn_blocking(event::read)` `JoinHandle` (see the ⚠️ under Solution Overview)
+- [x] implement `apply_tasks()`: reconcile new data while **preserving cursor position by task ID** and dropping selections for tasks that no longer exist; **ignore incoming `Tasks` events while `Mode::Confirm` is active** so a pending delete plan cannot go stale under the user
+- [x] add `r` for manual refresh and a non-fatal error banner (poll failures must not kill the UI — it should recover on the next successful tick) — `App::request_refresh` + `event::RefreshHandle`; the banner is `App::error`, rendered red in the footer and cleared by the next successful tick
+- [x] write tests for `apply_tasks` reconciliation: reordered list keeps the cursor on the same task, a removed task drops from the selection set, a removed cursor task clamps sanely, and an update is a no-op while in `Confirm` mode
+- [x] run `cargo test` — must pass before task 12 — 264 tests pass
+
+⚠️ **Decisions taken during Task 11** (plan text above kept verbatim; actuals recorded here):
+- 🔺 **`EventStream` → `spawn_blocking(event::read)`** (the deviation Task 1 predicted and Task 8 already implemented). The architecture diagram above is updated. The *new* constraint this task adds is that the `JoinHandle` must live in a variable outside the loop: with a second `select!` arm that can now win, dropping the future per iteration would spawn an orphaned blocking stdin reader on every poller tick. The `select!` therefore yields a small `Next` enum instead of acting inside its branch bodies, so the mutable borrow of `pending_read` ends with the expression and the terminal arm can clear it.
+- **`r` sets a flag; the event loop forwards it.** `App::request_refresh` / `take_refresh_request` keep `App` free of any tokio handle, so every key press stays a pure state transition and the whole keymap remains testable without a runtime. The loop pokes an `event::RefreshHandle` (an `Arc<Notify>`), which **coalesces** — leaning on `r` cannot queue one round trip per keystroke — and the poller `reset()`s its interval after a manual tick.
+- **The error banner is its own field**, `App::error`, not a status message. It has different lifetime rules (cleared automatically by the next successful `Tasks` event, which is what "recovers on the next tick" means) and different styling (red, `⚠`, not dimmed). `status_message` survives underneath and comes back when the banner clears.
+- **A refresh that cannot find the cursor's task holds the row number** rather than jumping to the top: the cursor stays where the user's eye is, then clamps into the new list. Two tests cover it — a removed *last* row clamps up, a removed middle row keeps its index.
+- `apply_tasks` in `Mode::Confirm` returns **before** touching anything, including the error banner; the test asserts the whole `{app:?}` is byte-identical, so no field can be added later that quietly leaks through.
+- ➕ The poller ends only when the channel closes or it is aborted. A failed poll is a `tracing::warn!` plus an `AppEvent::Error`, never a `return` — `main` also `abort()`s the handle after the loop so an in-flight 30-second HTTP timeout cannot delay process exit.
+- ➕ Discovery and login moved into `main`'s live path **before** the alternate screen (they can prompt for a password or a 2FA code). `--fixture` still short-circuits above all of it and runs the same loop with a channel nothing ever sends on.
+- ➕ 24 tests added (13 in `app`, 3 in `ui`, 5 in `event`, plus helpers). Nothing in them touches a network or a real timer: the poller is exercised only through its pure parts (the refresh handshake, the channel), and the reconciliation through `apply_tasks` directly.
 
 ### Task 12: Sort, filter, and search keybindings
 

@@ -31,7 +31,7 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Padding, Paragraph};
 
@@ -43,7 +43,11 @@ pub type Backend = CrosstermBackend<Stdout>;
 
 /// Footer hints in [`crate::app::Mode::Normal`]. The full list is the `?`
 /// overlay (Task 17); this is the reminder that it exists.
-const NORMAL_HINTS: &str = "q quit · ? help";
+const NORMAL_HINTS: &str = "q quit · r refresh · ? help";
+
+/// Prefix on the non-fatal error banner, so a failure is recognizable as one
+/// even where colour is unavailable.
+pub const ERROR_MARKER: &str = "⚠";
 
 /// Rows the frame spends on chrome: the title bar, the table header and the
 /// footer.
@@ -239,19 +243,31 @@ fn selection_summary(app: &App) -> Option<String> {
     ))
 }
 
-/// The footer: the selection summary, then the last status message or the key
-/// hints. The selection comes first because it is the state that changes what
-/// the next `d` will do.
+/// The footer: the selection summary, then the error banner if there is one,
+/// otherwise the last status message or the key hints.
+///
+/// The selection comes first because it is the state that changes what the next
+/// `d` will do. An error outranks the status message and is *not* dimmed — a
+/// poll failure is non-fatal, so the only way the user learns the numbers on
+/// screen have stopped moving is by reading it.
 fn footer_bar(app: &App) -> Paragraph<'static> {
-    let tail = match &app.status_message {
-        Some(message) => message.clone(),
-        None => NORMAL_HINTS.to_string(),
+    let (tail, style) = match &app.error {
+        Some(error) => (
+            format!("{ERROR_MARKER} {error}"),
+            Style::default().fg(Color::Red),
+        ),
+        None => (
+            app.status_message
+                .clone()
+                .unwrap_or_else(|| NORMAL_HINTS.to_string()),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
     };
     let text = match selection_summary(app) {
         Some(selection) => format!(" {selection} · {tail} "),
         None => format!(" {tail} "),
     };
-    Paragraph::new(Line::from(text)).style(Style::default().add_modifier(Modifier::DIM))
+    Paragraph::new(Line::from(text)).style(style)
 }
 
 #[cfg(test)]
@@ -430,6 +446,41 @@ mod tests {
         );
         // The hints are still there — the summary is a prefix, not a takeover.
         assert!(lines[7].contains(NORMAL_HINTS), "{:?}", lines[7]);
+    }
+
+    #[test]
+    fn a_failed_poll_shows_a_banner_in_the_footer_over_the_status_message() {
+        // Non-fatal: the table is still there, still showing the last good
+        // data, and the only sign the numbers have stopped moving is this line.
+        let mut app = App::new(fixture_tasks());
+        app.set_status("nas.local as eduard");
+        app.set_error("refresh failed: connection refused");
+
+        let lines = frame_lines(&app, 120, 8);
+        assert!(lines[7].contains(ERROR_MARKER), "{:?}", lines[7]);
+        assert!(lines[7].contains("connection refused"), "{:?}", lines[7]);
+        assert!(!lines[7].contains("nas.local as eduard"), "{:?}", lines[7]);
+        assert!(lines[1].contains("Name"), "the table is still drawn");
+    }
+
+    #[test]
+    fn clearing_the_error_brings_the_status_message_back() {
+        let mut app = App::default();
+        app.set_status("nas.local as eduard");
+        app.set_error("refresh failed");
+        app.clear_error();
+        assert!(frame_lines(&app, 120, 8)[7].contains("nas.local as eduard"));
+    }
+
+    #[test]
+    fn the_selection_summary_survives_an_error_banner() {
+        // Both matter at once: what is armed, and that the list is stale.
+        let mut app = App::new(fixture_tasks());
+        app.toggle_select_all_visible();
+        app.set_error("refresh failed");
+        let lines = frame_lines(&app, 120, 8);
+        assert!(lines[7].contains("14 selected"), "{:?}", lines[7]);
+        assert!(lines[7].contains("refresh failed"), "{:?}", lines[7]);
     }
 
     #[test]
