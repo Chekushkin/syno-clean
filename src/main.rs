@@ -2,18 +2,20 @@
 //! Download Station tasks.
 //!
 //! This binary is deliberately thin: everything of substance lives in the
-//! `syno_clean` library crate (`src/lib.rs`). The terminal guard and the event
-//! loop land in later tasks; for now `main` performs startup — logging, config
-//! resolution, and the two hidden `--dump-*` modes that print a raw DSM
-//! response and exit.
+//! `syno_clean` library crate (`src/lib.rs`). What is left here is startup —
+//! logging, config resolution, the two hidden `--dump-*` modes — and the event
+//! loop, which owns the terminal for as long as the TUI is running.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
+use ratatui::crossterm::event::{self, Event};
 use syno_clean::api::auth::{self, Credentials};
 use syno_clean::api::client::SynoClient;
 use syno_clean::api::download_station;
+use syno_clean::app::App;
 use syno_clean::cli::Cli;
 use syno_clean::config::{self, Config, Paths, ResolvedConfig, SessionCache};
+use syno_clean::ui::{self, TerminalGuard};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -46,15 +48,53 @@ async fn main() -> Result<()> {
         return dump(&cli, &resolved, &paths).await;
     }
 
-    println!(
-        "{} {} — {} as {} (logs: {})",
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION"),
+    let mut app = App::new(Vec::new());
+    app.set_status(format!(
+        "{} as {} · logs: {}",
         resolved.base_url(),
         resolved.username,
         log_file.display()
-    );
+    ));
+
+    run_tui(&mut app).await
+}
+
+/// The main event loop: draw, wait for one event, hand it to [`App`], repeat.
+///
+/// The panic hook is installed **before** the guard, so a panic during setup is
+/// covered too, and the guard is dropped on every exit path — including the `?`
+/// below — restoring the terminal.
+///
+/// Shape note for Task 11: the loop deliberately reduces to *draw, await one
+/// event, apply it*. Turning it into the planned
+/// `tokio::select! { terminal event, poller event }` means replacing the single
+/// `next_terminal_event().await` with the select and adding an arm for
+/// `AppEvent`; nothing else here has to move.
+async fn run_tui(app: &mut App) -> Result<()> {
+    ui::install_panic_hook();
+    let mut terminal = TerminalGuard::new().context(
+        "could not take over the terminal — syno-clean needs an interactive TTY \
+         (use --dump-api-info or --dump-tasks-json when piping output)",
+    )?;
+
+    while !app.should_quit() {
+        terminal.draw(app)?;
+        app.handle_event(next_terminal_event().await?);
+    }
+
+    tracing::info!("exiting");
     Ok(())
+}
+
+/// Wait for the next terminal event without blocking the async runtime.
+///
+/// crossterm's `event-stream` feature is **not** enabled by ratatui's crossterm
+/// re-export, and adding crossterm directly is forbidden (see `CLAUDE.md`), so
+/// the blocking `event::read` runs on the blocking pool instead. Exactly one
+/// read is ever in flight — it is awaited immediately — so nothing lingers on
+/// that pool when the loop exits.
+async fn next_terminal_event() -> Result<Event> {
+    Ok(tokio::task::spawn_blocking(event::read).await??)
 }
 
 /// The hidden `--dump-api-info` / `--dump-tasks-json` modes.

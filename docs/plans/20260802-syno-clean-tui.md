@@ -412,12 +412,23 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 - Create: `src/app.rs`
 - Modify: `src/main.rs`
 
-- [ ] implement a terminal guard type that enables raw mode + alternate screen on construction and restores on `Drop`
-- [ ] install a panic hook that restores the terminal **before** printing the panic, so a crash never leaves a wrecked shell
-- [ ] define a minimal `App { tasks, view, cursor, selected, mode, status_message }` and `Mode` enum (Normal, Search, Confirm, Help)
-- [ ] render a bordered empty frame with a title bar and footer; `q` and `Ctrl-C` exit cleanly
-- [ ] verify manually: launch, resize the terminal, quit, confirm the shell is intact; also verify `panic!()` in the loop still restores
-- [ ] no unit tests this task (terminal lifecycle — verified by running)
+- [x] implement a terminal guard type that enables raw mode + alternate screen on construction and restores on `Drop` — `ui::TerminalGuard`, which **owns** the `Terminal` so a drawable terminal cannot outlive the restoration
+- [x] install a panic hook that restores the terminal **before** printing the panic, so a crash never leaves a wrecked shell — `ui::install_panic_hook`, chaining to the previous hook, `Once`-guarded
+- [x] define a minimal `App { tasks, view, cursor, selected, mode, status_message }` and `Mode` enum (Normal, Search, Confirm, Help)
+- [x] render a bordered empty frame with a title bar and footer; `q` and `Ctrl-C` exit cleanly
+- [x] verify manually: launch, resize the terminal, quit, confirm the shell is intact; also verify `panic!()` in the loop still restores — (verified by inspection + TestBackend; no TTY available in the execution environment). Non-interactively confirmed: `--help` works, and with stdin/stdout not a TTY the binary exits 1 with "syno-clean needs an interactive TTY", writes nothing to stdout and changes no terminal state (raw mode is the first thing attempted and it fails closed)
+- [x] no unit tests this task (terminal lifecycle — verified by running) — ➕ 19 non-terminal tests added anyway (see note below): `App` key handling and `TestBackend` frame rendering, neither of which needs a TTY
+
+⚠️ **Decisions taken during Task 8** (plan text above kept verbatim; actuals recorded here):
+- **The guard and the renderer live in `src/ui/mod.rs`, not `main.rs`.** The module layout in Technical Details files the terminal guard under `main.rs`, but `main.rs` is a thin shell over the library (Task 2) and nothing in a binary crate is reachable from tests. The guard, `restore()`, `install_panic_hook()` and `render()` are all in `ui`; `main.rs` keeps the event loop, which is what the architecture diagram actually calls "main event loop".
+- **The event loop is `draw → await one event → apply`**, deliberately shaped so Task 11 replaces exactly one line. `next_terminal_event()` is a `spawn_blocking(event::read)` because crossterm's `event-stream` feature is unavailable through the `ratatui::crossterm` re-export (Task 1's ⚠️ note). Exactly one read is ever in flight — it is awaited immediately — so no blocking task lingers to stall runtime shutdown at quit.
+- ➕ **Tests were added despite "no unit tests this task".** The terminal *lifecycle* genuinely is not testable and was not tested; but `App::handle_key` is a pure state machine and `render` is a pure function of `&App` that ratatui's `TestBackend` will draw into an in-memory `Buffer` **with no TTY**. 19 tests: quit keys (including `Ctrl-C` from every mode, and that a bare `c` does not quit), key *releases* ignored, resize absorbed, and frame rendering — every row exactly the terminal width at three sizes, a 1x1 terminal clips instead of panicking, the counts and empty states read correctly, and `render` leaves the `App` untouched.
+- `App::handle_key` filters on `KeyEventKind::Press`: Windows and the kitty protocol report releases too, and acting on both halves would run every binding twice — a bug that is invisible on macOS and immediate for a Windows user.
+- A key pressed in `Mode::Search`/`Confirm`/`Help` currently falls back to `Mode::Normal`. Nothing can enter those modes before Tasks 12/14/17, and this way a mode reached by accident can never trap the user with no way out.
+- The **panic hook is not unit-tested**: a panic hook is process-global, so a test that installs one would swallow the output of any test panicking concurrently and be flaky under the default parallel harness. It is eight lines, chains to the previous hook and is `Once`-guarded — reviewable by inspection.
+- `TerminalGuard::new` unwinds its own partial setup: if entering the alternate screen or constructing the `Terminal` fails, raw mode is disabled again before returning the error. Otherwise a half-failed startup hands back a raw-mode terminal with no program left to read keys.
+- ➕ The body placeholder already distinguishes "No tasks" from "No tasks match the current filter" (`View::is_narrowed`, added in Task 7). Task 17 owns the polished empty states; this keeps the distinction from being forgotten.
+- ➕ `CLAUDE.md` gained a "Terminal lifecycle" section recording these invariants.
 
 ### Task 9: Offline fixture mode, task table, and arrow navigation
 
