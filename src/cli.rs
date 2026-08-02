@@ -42,7 +42,8 @@ pub struct Cli {
     #[arg(long = "refresh-secs", value_name = "SECS")]
     pub refresh_secs: Option<u64>,
 
-    /// Remove the DSM task only, leaving the downloaded files in place.
+    /// Remove the DSM task only, leaving a finished task's files in place (DSM
+    /// still discards the partial data of an unfinished one).
     #[arg(long = "no-delete-files")]
     pub no_delete_files: bool,
 

@@ -208,7 +208,7 @@ the config key.
 | `--port <PORT>` | DSM port (default 5001 for HTTPS, 5000 for HTTP) |
 | `--insecure` | Accept a self-signed or otherwise invalid TLS certificate |
 | `--refresh-secs <SECS>` | Seconds between automatic task-list refreshes |
-| `--no-delete-files` | Remove the DSM task only, leave the downloaded files |
+| `--no-delete-files` | Remove the DSM task only, leave a finished task's files |
 | `--log-file <PATH>` | Write logs here instead of the default cache path |
 | `--dry-run` | Report what would happen; issue no destructive call |
 | `--logout` | Invalidate the cached session and exit |
@@ -326,7 +326,10 @@ tool could destroy the wrong data, so it is built to **refuse rather than guess*
    `/volume`, `/volumeUSB1/usbshare1-2`, `/volumeSATA1/…` — and surrounding slashes
    trimmed) and joined as `/{destination}/{name}`. A *relative* destination is never
    touched, and an absolute first component that is not a mount point (`/downloads`)
-   is already share-rooted and left alone.
+   is already share-rooted and left alone. A mount point is matched by **shape** —
+   `volume`, `volume<N>`, `volumeUSB<N>`, `volumeSATA<N>` — so a share that merely
+   starts with the word (`/volumes/movies`, `/volume-media/tv`) keeps its first
+   component instead of having the delete re-rooted into a different share.
 5. The normalized destination is **empty** → **the task is refused**. With no
    destination there is no share to root the path at, and `/{name}` would name a share
    rather than a directory inside one.
@@ -407,8 +410,12 @@ one.
   existence check. Pause and resume are suppressed too: a flag promising the NAS is
   untouched must mean it.
 - **`--no-delete-files`** (or `delete_files = false`) — removes the Download Station
-  task only and leaves the files on the volume. The dialog says so, and the totals line
-  reads "left on disk" instead of "to free". This is also the way to remove a task
+  task only and leaves a **finished** task's files on the volume. The dialog says so,
+  and the totals line reads "left on disk" instead of "to free". ⚠️ A task that has
+  *not* finished is different: DSM deletes its partial data along with the task
+  (`force_complete=false`, which is deliberate — the alternative marks the task
+  complete and keeps a half-downloaded file). The dialog says that too, per row and in
+  the totals, so those bytes are never counted as staying. This is also the way to remove a task
   whose on-disk location cannot be worked out — no destination, or a file list with
   several top-level directories. Those rows are `SKIPPED` in the normal flow, because
   a recursive delete that cannot be aimed must not be followed by removing the only

@@ -234,7 +234,12 @@ async fn poll_once(client: &SynoClient, tx: &Sender) -> bool {
 /// Download Station accepting a `pause` says the request was queued, not that
 /// the task has stopped writing. Short, because this blocks the delete of every
 /// later item in the batch.
-const PAUSE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
+///
+/// Public because it is part of the *longest legitimate silence* of a single
+/// item, which is what the quit-time no-progress grace in `main` has to exceed:
+/// no [`AppEvent::OpProgress`] is sent until the whole item is done, pause
+/// confirmation included.
+pub const PAUSE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
 /// How often the pause is re-checked.
 const PAUSE_CONFIRM_INTERVAL: Duration = Duration::from_millis(500);
 
