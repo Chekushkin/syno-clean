@@ -1,0 +1,126 @@
+//! Command-line interface definitions.
+//!
+//! The CLI is the *highest-precedence* configuration layer: every flag here
+//! overrides the matching `SYNO_CLEAN_*` environment variable, which in turn
+//! overrides the config file. See [`crate::config::merge`].
+//!
+//! Boolean flags are one-way switches — they can turn a setting on
+//! (`--insecure`, `--dry-run`) or off (`--no-delete-files`), but their absence
+//! means "not specified", never "false". That keeps `insecure = true` in the
+//! config file working without a matching `--no-insecure` flag.
+
+use std::path::PathBuf;
+
+use clap::Parser;
+
+/// A terminal UI for reviewing and cleaning up Synology Download Station
+/// tasks — removing both the DSM task and the files it left on the volume.
+#[derive(Debug, Clone, Default, Parser)]
+#[command(name = "syno-clean", version, about, long_about = None)]
+pub struct Cli {
+    /// Path to the config file (default: `~/.config/syno-clean/config.toml`).
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// DSM hostname or IP address.
+    #[arg(long, value_name = "HOST")]
+    pub host: Option<String>,
+
+    /// DSM account name.
+    #[arg(long = "user", value_name = "NAME")]
+    pub username: Option<String>,
+
+    /// DSM port (default: 5001 for HTTPS, 5000 for HTTP).
+    #[arg(long, value_name = "PORT")]
+    pub port: Option<u16>,
+
+    /// Accept a self-signed or otherwise invalid TLS certificate.
+    #[arg(long)]
+    pub insecure: bool,
+
+    /// Seconds between automatic task-list refreshes.
+    #[arg(long = "refresh-secs", value_name = "SECS")]
+    pub refresh_secs: Option<u64>,
+
+    /// Remove the DSM task only, leaving the downloaded files in place.
+    #[arg(long = "no-delete-files")]
+    pub no_delete_files: bool,
+
+    /// Write logs here instead of `~/.cache/syno-clean/syno-clean.log`.
+    #[arg(long = "log-file", value_name = "PATH")]
+    pub log_file: Option<PathBuf>,
+
+    /// Report what would be deleted without issuing any destructive call.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
+
+    /// Invalidate the cached session and exit. Normal quit never logs out.
+    #[arg(long)]
+    pub logout: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        // Catches duplicate flags, bad arg specs and the like at test time
+        // rather than on first run.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn flags_parse_into_the_expected_fields() {
+        let cli = Cli::try_parse_from([
+            "syno-clean",
+            "--config",
+            "/tmp/c.toml",
+            "--host",
+            "nas.local",
+            "--user",
+            "eduard",
+            "--port",
+            "5011",
+            "--insecure",
+            "--refresh-secs",
+            "7",
+            "--no-delete-files",
+            "--log-file",
+            "/tmp/s.log",
+            "--dry-run",
+            "--logout",
+        ])
+        .expect("valid arguments");
+
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("/tmp/c.toml"))
+        );
+        assert_eq!(cli.host.as_deref(), Some("nas.local"));
+        assert_eq!(cli.username.as_deref(), Some("eduard"));
+        assert_eq!(cli.port, Some(5011));
+        assert!(cli.insecure);
+        assert_eq!(cli.refresh_secs, Some(7));
+        assert!(cli.no_delete_files);
+        assert_eq!(
+            cli.log_file.as_deref(),
+            Some(std::path::Path::new("/tmp/s.log"))
+        );
+        assert!(cli.dry_run);
+        assert!(cli.logout);
+    }
+
+    #[test]
+    fn bare_invocation_specifies_nothing() {
+        let cli = Cli::try_parse_from(["syno-clean"]).expect("no arguments is valid");
+        assert!(cli.host.is_none());
+        assert!(cli.username.is_none());
+        assert!(cli.port.is_none());
+        assert!(!cli.insecure);
+        assert!(!cli.no_delete_files);
+        assert!(!cli.dry_run);
+        assert!(!cli.logout);
+    }
+}
