@@ -341,14 +341,24 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 - Create: `tests/fixtures/task_list.json`
 - Modify: `src/cli.rs`
 
-- [ ] add hidden `--dump-api-info` and `--dump-tasks-json` flags that log in, call the respective endpoint, print raw JSON, and exit
-- [ ] capture `tests/fixtures/task_list.json` from the real NAS with `--dump-tasks-json`. **If the NAS is unreachable, do not stall**: hand-write a provisional fixture from the documented v1 response shape, mark it at the top of the file as `⚠️ PROVISIONAL — not captured from a real NAS`, proceed with the remaining tasks, and re-capture in Task 21
-- [ ] define `TaskStatus` enum with `from_dsm_str` covering the v1 **string** statuses: `waiting`, `downloading`, `paused`, `finishing`, `finished`, `hash_checking`, `seeding`, `filehosting_waiting`, `extracting`, `error` — plus an `Unknown(String)` catch-all so an unrecognized status never panics or drops the row
-- [ ] define `TaskFile { filename, size, priority, selected }` and `Task { id, title, status, size, downloaded, uploaded, download_speed, upload_speed, destination, files: Vec<TaskFile>, seeders, leechers, create_time }` with derived `progress()` / `ratio()` / `eta()`
-- [ ] implement `build_list_params()` (pure, returns `Vec<(&str, String)>`) and `list_tasks()` requesting `additional=detail,transfer,file`
-- [ ] write tests parsing the fixture: field mapping, every status variant plus an unknown one, zero-size task (no divide-by-zero in `progress`), missing `additional` blocks, and a task with an empty file list
-- [ ] write a test for `build_list_params` (comma-separated `additional` encoding)
-- [ ] run `cargo test` — must pass before task 6
+- [x] add hidden `--dump-api-info` and `--dump-tasks-json` flags that log in, call the respective endpoint, print raw JSON, and exit — `--dump-api-info` deliberately skips the login (discovery needs no session)
+- [x] capture `tests/fixtures/task_list.json` from the real NAS with `--dump-tasks-json`. **If the NAS is unreachable, do not stall**: hand-write a provisional fixture from the documented v1 response shape, mark it at the top of the file as `⚠️ PROVISIONAL — not captured from a real NAS`, proceed with the remaining tasks, and re-capture in Task 21 — ⚠️ **fallback path taken: the fixture is hand-written and PROVISIONAL**, marker in a top-level `_comment` key (JSON has no comments); Task 21 must re-capture
+- [x] define `TaskStatus` enum with `from_dsm_str` covering the v1 **string** statuses: `waiting`, `downloading`, `paused`, `finishing`, `finished`, `hash_checking`, `seeding`, `filehosting_waiting`, `extracting`, `error` — plus an `Unknown(String)` catch-all so an unrecognized status never panics or drops the row
+- [x] define `TaskFile { filename, size, priority, selected }` and `Task { id, title, status, size, downloaded, uploaded, download_speed, upload_speed, destination, files: Vec<TaskFile>, seeders, leechers, create_time }` with derived `progress()` / `ratio()` / `eta()`
+- [x] implement `build_list_params()` (pure, returns `Vec<(&str, String)>`) and `list_tasks()` requesting `additional=detail,transfer,file`
+- [x] write tests parsing the fixture: field mapping, every status variant plus an unknown one, zero-size task (no divide-by-zero in `progress`), missing `additional` blocks, and a task with an empty file list
+- [x] write a test for `build_list_params` (comma-separated `additional` encoding)
+- [x] run `cargo test` — must pass before task 6 — 115 tests pass
+
+⚠️ **Decisions taken during Task 5** (plan text above kept verbatim; actuals recorded here):
+- ⚠️ **The fixture is PROVISIONAL.** No Synology NAS was reachable from the implementation environment, so the plan's documented fallback was taken. It is a full `list` envelope with 14 tasks covering every known status plus an unknown one (`captcha_needed`), missing and partial `additional` blocks, an empty file list, a non-BT HTTP download with no `file` key, a zero-size task, a CJK title, an emoji title, a file list with **no common root** (pre-staged for Task 13's refusal test) and a `/volume1/...` destination. A `model.rs` test asserts the `PROVISIONAL` marker is still present, so Task 21 cannot silently forget to re-capture: delete that test along with the marker.
+- The wire shape lives in **private `Raw*` structs** collapsed into a flat `Task` via `#[serde(from = "RawTask")]`. Nothing outside `model.rs` reaches through `additional.transfer.…`, and every `additional` sub-block is independently optional — one malformed task must not blank the whole table.
+- ➕ **Permissive numeric deserializers** (`de_u64` / `de_u32` / `de_i64_opt`): DSM returns numbers as JSON numbers *or* as strings depending on the field, version and build (file sizes and `create_time` especially). Every numeric field accepts both. The fixture deliberately mixes the two forms so the tolerance is tested.
+- `TaskStatus` derives `Ord` (declaration order) for Task 7's status sort, implements `Default` as `Unknown("")` so a task with no `status` key still parses, and `from_dsm_str` trims and case-folds. `TaskStatus::KNOWN` lists the ten documented variants so the fixture's coverage can be asserted exhaustively.
+- **`DS_TASK_SUPPORTED` is pinned to `(1, 1)`**, not the NAS's advertised max (3 on DSM 7). v2/v3 change the status encoding and `additional` shape that `model.rs` is built around, so following the NAS upward would silently break parsing. Asserted by a test.
+- `list_tasks` always requests `limit = -1` (every task). The poller reconciles the whole list each tick; paging would make the cursor/selection reconciliation lie.
+- ➕ `main` is now `#[tokio::main] async` and grew a small `authenticate()` helper (cached-sid reuse, login, 403 → OTP prompt → retry) because the dump flags need a real session. It resolves credentials **even when a cached sid exists**, so a stale sid is repaired by the client's transparent re-login retry rather than failing the run; the cost is a password prompt when `SYNO_CLEAN_PASSWORD` is unset. Task 17 owns refining the first-run experience.
+- ➕ Added `Cli::is_dump()` so `main` has one definition of "print JSON and exit instead of entering the TUI".
 
 ### Task 6: Human-readable formatting helpers
 

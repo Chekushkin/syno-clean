@@ -161,6 +161,45 @@ reach the log file, and holds the `WorkerGuard` for the whole of `main`.
 - Credentials are redacted in `Debug`. Keep it that way: `SynoClient` derives
   `Debug` and holds them.
 
+### Task model (`model.rs`)
+
+- The DSM wire shape lives in **private `Raw*` structs** and is collapsed into
+  a flat `Task` by `From<RawTask>` (`#[serde(from = "RawTask")]`). Nothing
+  outside `model.rs` reaches through `additional.transfer.…`.
+- **Every `additional` sub-block is optional.** A task with no `additional` at
+  all, or with only some of `detail`/`transfer`/`file`, parses with zeroed
+  counters. One odd task must never blank the whole table.
+- **Numbers may arrive as JSON numbers or as strings** (DSM is inconsistent per
+  field and per build — file sizes and timestamps especially). Every numeric
+  field goes through the permissive `de_u64` / `de_u32` / `de_i64_opt`
+  deserializers. Do not add a plain `u64` field.
+- `TaskStatus::Unknown(String)` keeps an unrecognized status verbatim so a row
+  is never dropped; `from_dsm_str` trims and case-folds. `TaskStatus::KNOWN`
+  lists the ten documented variants.
+- `progress()` / `ratio()` / `eta()` all guard their denominators — a zero-size
+  task is ordinary, not an error.
+
+### The task-list fixture
+
+`tests/fixtures/task_list.json` is a full `list` envelope covering every known
+status plus an unknown one, missing/partial `additional` blocks, an empty file
+list, a non-BT download, a zero-size task, a CJK title, an emoji title, a file
+list with **no common root** (the `delete.rs` refusal case) and a
+`/volume1/...` destination. It drives the `model.rs` parser tests and the
+offline `--fixture` mode.
+
+⚠️ It is currently **hand-written and marked `PROVISIONAL`** in a top-level
+`_comment` key — no NAS was reachable when it was written. Re-capture with
+`syno-clean --dump-tasks-json > tests/fixtures/task_list.json` and drop the
+marker (and the test asserting it) once it comes from a real DSM 7 NAS.
+
+### Hidden debugging flags
+
+`--dump-api-info` and `--dump-tasks-json` print a raw DSM response verbatim and
+exit. They are `hide = true` — debugging aids, not advertised interface.
+`--dump-api-info` deliberately does **not** log in, since discovery needs no
+session and that is exactly the case where a login is what is broken.
+
 ## Delete ordering (three phases, ordered for recoverability)
 
 | Task status | Ordering |

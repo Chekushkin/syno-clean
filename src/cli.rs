@@ -57,6 +57,29 @@ pub struct Cli {
     /// Invalidate the cached session and exit. Normal quit never logs out.
     #[arg(long)]
     pub logout: bool,
+
+    /// Print the raw `SYNO.API.Info` discovery response and exit.
+    ///
+    /// Hidden: a debugging aid, not part of the advertised interface. It needs
+    /// no session, so it works before any credentials exist.
+    #[arg(long = "dump-api-info", hide = true)]
+    pub dump_api_info: bool,
+
+    /// Print the raw `SYNO.DownloadStation.Task` list response and exit.
+    ///
+    /// Hidden. This is how `tests/fixtures/task_list.json` is captured from a
+    /// real NAS:
+    /// `syno-clean --dump-tasks-json > tests/fixtures/task_list.json`.
+    #[arg(long = "dump-tasks-json", hide = true)]
+    pub dump_tasks_json: bool,
+}
+
+impl Cli {
+    /// True when the invocation is one of the hidden dump modes, which print
+    /// raw JSON and exit instead of entering the TUI.
+    pub fn is_dump(&self) -> bool {
+        self.dump_api_info || self.dump_tasks_json
+    }
 }
 
 #[cfg(test)]
@@ -91,6 +114,8 @@ mod tests {
             "/tmp/s.log",
             "--dry-run",
             "--logout",
+            "--dump-api-info",
+            "--dump-tasks-json",
         ])
         .expect("valid arguments");
 
@@ -110,6 +135,33 @@ mod tests {
         );
         assert!(cli.dry_run);
         assert!(cli.logout);
+        assert!(cli.dump_api_info);
+        assert!(cli.dump_tasks_json);
+        assert!(cli.is_dump());
+    }
+
+    #[test]
+    fn the_dump_flags_are_hidden_from_help() {
+        // They are debugging aids for capturing real responses, not part of
+        // the advertised interface.
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("--dump-api-info"), "{help}");
+        assert!(!help.contains("--dump-tasks-json"), "{help}");
+        // ...but the documented flags are all there.
+        assert!(help.contains("--dry-run"), "{help}");
+    }
+
+    #[test]
+    fn each_dump_flag_works_on_its_own() {
+        let cli = Cli::try_parse_from(["syno-clean", "--dump-api-info"]).expect("valid");
+        assert!(cli.dump_api_info);
+        assert!(!cli.dump_tasks_json);
+        assert!(cli.is_dump());
+
+        let cli = Cli::try_parse_from(["syno-clean", "--dump-tasks-json"]).expect("valid");
+        assert!(!cli.dump_api_info);
+        assert!(cli.dump_tasks_json);
+        assert!(cli.is_dump());
     }
 
     #[test]
@@ -122,5 +174,6 @@ mod tests {
         assert!(!cli.no_delete_files);
         assert!(!cli.dry_run);
         assert!(!cli.logout);
+        assert!(!cli.is_dump());
     }
 }
