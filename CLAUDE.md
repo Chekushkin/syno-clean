@@ -363,9 +363,16 @@ and the bulk of the test suite lives in `delete.rs` for that reason.
    slashes. Join as `/{destination}/{name}`.
 
 Resolution also records an `ExpectedKind` — `Dir` for a multi-entry file list (or
-one entry with a separator), `File` for a single flat entry, `Unknown` for the
-title fallback, where DSM says nothing about the shape. The semantic guard
-refuses a path whose `isdir` disagrees.
+one entry with a separator), `File` for a single flat entry, `AnyFromTitle` for
+the title fallback, where DSM says nothing about the shape, and `Indeterminate`
+for a file list that *does* say something and it does not describe a payload
+(flat entries repeating one identical filename), or for a refused item. The
+semantic guard refuses a path whose `isdir` disagrees. **The two "not knowable"
+variants are opposite answers, and that is the point:** no metadata to consult
+is a reason to accept what is there, metadata that contradicts itself is a
+reason to refuse. Never collapse them back into one permissive `Unknown` — that
+let a malformed file list authorize the recursive delete the file list exists to
+constrain.
 
 Supporting rules, each of which exists because the alternative is a guess:
 
@@ -422,9 +429,13 @@ while aiming one level deeper than the task's own directory.
 `SYNO.FileStation.List` `getinfo` runs against the resolved path before any
 recursive delete, and **existence alone does not authorize it**:
 
-- **found, kind matches `ExpectedKind`** ⇒ delete;
+- **found, kind matches `ExpectedKind`** ⇒ delete (`AnyFromTitle` matches both:
+  rule 3 had nothing to go on, and the kind found is logged);
 - **found, kind disagrees** ⇒ *fail* the item. The path is not this task's
   payload, and the delete is recursive;
+- **found, `ExpectedKind::Indeterminate`** ⇒ *fail* the item. The file list was
+  consulted and describes no payload, so there is nothing to check the object
+  against and a malformed answer must not be what authorizes a recursive delete;
 - **not found** ⇒ report *skipped* and still delete the DSM task — but only when
   nothing says the payload must be there. It must be there for a finished,
   seeding or extracting task, for one whose counters say it downloaded
@@ -433,10 +444,22 @@ recursive delete, and **existence alone does not authorize it**:
   the *title*. Those *fail* instead, so the row survives to point at the data;
 - **error** is not absence — see `PathInfo` above.
 
-The status those questions are asked of is the **live** read taken by the pause
-phase (`pause_and_confirm` hands it back), not `DeleteItem::status`, which is
-frozen when the dialog opens and can be minutes stale mid-batch. The snapshot is
-the fallback for the case with no live read.
+The state those questions are asked of is what the pause phase read
+(`pause_and_confirm` hands back a `PauseRead`), not `DeleteItem`, which is frozen
+when the dialog opens and can be minutes stale mid-batch. The snapshot fills in
+whatever the pause phase did not observe.
+
+**A `PauseRead`'s two halves are dated differently on purpose.** The *status* is
+the one read **before** this program issued its own pause — read it afterwards
+and a seeding task reports `Paused`, whose absent payload the check then waves
+through as ordinary partial data, so the guard would be defeated by its own side
+effect. The *counters* (`downloaded`/`size`) are the freshest seen across **every**
+read, including the ones confirming the pause: pausing does not un-download
+anything, and a task that reaches 100% while the pause takes effect is exactly
+the case where stale-low counters let a missing path be judged benign. They also
+ratchet — a read that said "complete" is never walked back by a later one that
+does not. Do not "simplify" the two halves into a single read; either choice
+alone is a regression.
 
 ### Snapshot semantics
 

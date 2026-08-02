@@ -59,9 +59,11 @@ version to have changed anything from.
 - A File Station existence check before any recursive delete, distinguishing "already
   gone" (skip the files, still remove the task) from "an error" (touch nothing) — and
   checking *what* is there, not only that something is: a path whose kind disagrees with
-  what the task resolved to is refused rather than removed recursively. A payload that
-  should exist (a finished task, or one whose counters say it downloaded everything) and
-  does not keeps its task, judged from a live read rather than the dialog's snapshot.
+  what the task resolved to — or whose file list describes no shape at all — is refused
+  rather than removed recursively. A payload that should exist (a finished task, or one
+  whose counters say it downloaded everything) and does not keeps its task, judged from
+  the pause phase's reads rather than the dialog's snapshot: the status from before the
+  pause was issued, the transfer counters from the freshest read of all.
 - Three-phase delete ordered for recoverability: pause an active task and **confirm by
   re-reading it** that it actually stopped, then delete the files, then delete the task.
   Any phase failing skips every later phase, so a task is never removed while its data

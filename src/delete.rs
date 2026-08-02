@@ -268,8 +268,17 @@ pub enum NameSource {
 /// expected — or a directory where a file was — the path is not this task's
 /// payload, and `recursive=true` would then remove whatever *is* there.
 ///
-/// See [`crate::event::decide_file_phase`], which turns a mismatch into a
-/// failed item rather than a delete.
+/// **There are two ways not to know the kind, and they are not the same
+/// answer.** Whether an indeterminate expectation is permissive is a property
+/// of where the name came from, not of the indeterminacy: no metadata to
+/// consult is a reason to accept what is there, metadata that says something
+/// self-contradictory is a reason to refuse. The two therefore have separate
+/// variants rather than a shared `Unknown` that a caller has to remember to
+/// qualify by [`NameSource`].
+///
+/// See [`crate::event::decide_file_phase`], which turns a mismatch — and an
+/// indeterminate expectation over a path that exists — into a failed item
+/// rather than a delete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpectedKind {
     /// The task wrote a directory: the file list has more than one entry, or a
@@ -278,10 +287,10 @@ pub enum ExpectedKind {
     /// The task wrote one file with no enclosing directory: exactly one flat
     /// file-list entry.
     File,
-    /// **Not knowable from what DSM said.** The name came from the title
-    /// (rule 3), so there is no file list to describe the shape: an HTTP
-    /// download writes a file, an NZB task's destination is usually a
-    /// directory, and DSM's `list` response distinguishes neither.
+    /// **Nothing DSM sent describes the shape, because there was nothing to
+    /// send.** The name came from the title (rule 3): an HTTP download writes a
+    /// file, an NZB task's destination is usually a directory, and DSM's `list`
+    /// response distinguishes neither.
     ///
     /// Deliberately permissive — either kind is accepted — because the
     /// alternative is refusing every task rule 3 exists for on a guess about
@@ -289,26 +298,46 @@ pub enum ExpectedKind {
     /// route: a title-named path that is *absent* already fails hard
     /// (`event::decide_file_phase`), and both routes name `--no-delete-files`.
     /// The kind that was found is logged so a surprise is visible.
-    Unknown,
+    AnyFromTitle,
+    /// **Metadata that should have determined the kind did not.** A file list
+    /// whose flat entries repeat one identical filename says something DSM
+    /// should never say, and a refused item resolved nothing at all.
+    ///
+    /// The opposite of [`ExpectedKind::AnyFromTitle`], and deliberately so:
+    /// here there *is* a file list, so "either kind will do" would be reading a
+    /// malformed answer as permission. Nothing at the path can be checked
+    /// against anything, and the call that would follow is a recursive delete,
+    /// so it is refused — `--no-delete-files` still removes the task.
+    Indeterminate,
 }
 
 impl ExpectedKind {
     /// Whether an object of the kind the NAS reported can be this task's
-    /// payload. [`ExpectedKind::Unknown`] accepts both — see the variant docs.
+    /// payload.
+    ///
+    /// [`ExpectedKind::AnyFromTitle`] accepts both and
+    /// [`ExpectedKind::Indeterminate`] accepts neither — see the variant docs.
+    /// A caller therefore cannot authorize a delete off an indeterminate
+    /// expectation by forgetting to ask where the name came from.
     pub fn accepts(self, is_dir: bool) -> bool {
         match self {
             ExpectedKind::Dir => is_dir,
             ExpectedKind::File => !is_dir,
-            ExpectedKind::Unknown => true,
+            ExpectedKind::AnyFromTitle => true,
+            ExpectedKind::Indeterminate => false,
         }
     }
 
     /// How the expectation reads in a refusal message.
+    ///
+    /// [`ExpectedKind::Indeterminate`] has no shape to name, and the refusal it
+    /// produces says so in its own words rather than through this.
     pub fn label(self) -> &'static str {
         match self {
             ExpectedKind::Dir => "a directory",
             ExpectedKind::File => "a file",
-            ExpectedKind::Unknown => "either a file or a directory",
+            ExpectedKind::AnyFromTitle => "either a file or a directory",
+            ExpectedKind::Indeterminate => "something its file list does not describe",
         }
     }
 }
@@ -318,15 +347,17 @@ impl ExpectedKind {
 /// Any entry with a separator means the root encloses something, so it is a
 /// directory. Exactly one flat entry is the downloaded file itself. Several
 /// entries that are all flat can only happen when they share one *identical*
-/// filename — a shape DSM should never send — and that is left
-/// [`ExpectedKind::Unknown`] rather than guessed at in either direction.
+/// filename — a shape DSM should never send — and that is
+/// [`ExpectedKind::Indeterminate`]: the list is metadata, it was consulted, and
+/// what it said does not describe a payload. Guessing either way would let a
+/// malformed answer authorize the recursive delete.
 fn expected_kind_of(files: &[TaskFile]) -> ExpectedKind {
     if files.iter().any(|file| file.filename.contains('/')) {
         return ExpectedKind::Dir;
     }
     match files {
         [_] => ExpectedKind::File,
-        _ => ExpectedKind::Unknown,
+        _ => ExpectedKind::Indeterminate,
     }
 }
 
@@ -374,7 +405,7 @@ pub fn resolve_delete_target(task: &Task) -> Result<ResolvedTarget> {
     validate_path(&path)?;
     let expected_kind = match name_source {
         NameSource::FileList => expected_kind_of(&task.files),
-        NameSource::Title => ExpectedKind::Unknown,
+        NameSource::Title => ExpectedKind::AnyFromTitle,
     };
     Ok(ResolvedTarget {
         path,
@@ -574,8 +605,9 @@ pub struct DeleteItem {
     /// Which resolution rule produced the on-disk name, or `None` for a refused
     /// item. Decides how an *absent* path is read; see [`NameSource`].
     pub name_source: Option<NameSource>,
-    /// What should be found at the path. [`ExpectedKind::Unknown`] for a refused
-    /// item, which has no path to find anything at.
+    /// What should be found at the path. [`ExpectedKind::Indeterminate`] — the
+    /// variant that authorizes nothing — for a refused item, which resolved no
+    /// path to find anything at.
     pub expected_kind: ExpectedKind,
 }
 
@@ -589,15 +621,19 @@ impl DeleteItem {
                 Some(resolved.name_source),
                 resolved.expected_kind,
             ),
+            // A refused item carries the expectation that accepts *nothing*.
+            // It has no path, so no lookup can reach it — but the permissive
+            // expectation belongs to the title fallback alone, and a refusal is
+            // the furthest thing from "whatever is there will do".
             Err(Error::UnsafePath { reason, .. }) => {
-                (Target::Refused(reason), None, ExpectedKind::Unknown)
+                (Target::Refused(reason), None, ExpectedKind::Indeterminate)
             }
             // `resolve_delete_target` only produces `UnsafePath` today; anything
             // else is still a refusal, never a fallthrough to deletion.
             Err(other) => (
                 Target::Refused(other.to_string()),
                 None,
-                ExpectedKind::Unknown,
+                ExpectedKind::Indeterminate,
             ),
         };
         DeleteItem {
@@ -755,11 +791,12 @@ pub fn requires_pause(status: &TaskStatus) -> bool {
 /// What a task says about whether its payload was ever written — status *and*
 /// the transfer counters, from whichever read is freshest.
 ///
-/// A separate type because there are two sources for it and the executor must
-/// prefer the right one: a **live** `getinfo` from the pause phase, or
-/// [`DeleteItem::payload_state`] (the confirmation snapshot) when no live read
-/// happened. Passing the two fields around loose is how the stale one gets
-/// used by accident.
+/// A separate type because the executor must assemble it from the freshest
+/// evidence for each half rather than from one read: `event::PauseRead` supplies
+/// the status from before its own pause and the counters from the last read of
+/// all, and [`DeleteItem::payload_state`] (the confirmation snapshot) fills in
+/// whatever the pause phase never observed. Passing the fields around loose is
+/// how the stale one gets used by accident.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PayloadState {
     pub status: TaskStatus,
@@ -770,7 +807,12 @@ pub struct PayloadState {
 }
 
 impl PayloadState {
-    /// Read a live task — what `event::pause_and_confirm` hands back.
+    /// Everything one read of a task says, taken together.
+    ///
+    /// The whole state from a single moment, which is what the confirmation
+    /// dialog asks [`payload_survives_task_delete`] about. The delete executor
+    /// does **not** use this: it must mix two moments, and
+    /// `event::payload_for_file_phase` is where that happens.
     pub fn of_task(task: &Task) -> Self {
         PayloadState {
             status: task.status.clone(),
@@ -2264,9 +2306,9 @@ mod tests {
         // file, an NZB task's destination is usually a directory, and DSM says
         // neither. Documented as undetermined rather than guessed at.
         let resolved = resolve_delete_target(&task("dbid_007")).expect("resolvable");
-        assert_eq!(resolved.expected_kind, ExpectedKind::Unknown);
-        assert!(ExpectedKind::Unknown.accepts(true));
-        assert!(ExpectedKind::Unknown.accepts(false));
+        assert_eq!(resolved.expected_kind, ExpectedKind::AnyFromTitle);
+        assert!(ExpectedKind::AnyFromTitle.accepts(true));
+        assert!(ExpectedKind::AnyFromTitle.accepts(false));
     }
 
     #[test]
@@ -2279,21 +2321,37 @@ mod tests {
         // expectation that would authorize one either.
         assert_eq!(
             DeleteItem::for_task(&task("dbid_013")).expected_kind,
-            ExpectedKind::Unknown
+            ExpectedKind::Indeterminate
         );
     }
 
     #[test]
+    fn an_indeterminate_expectation_accepts_neither_kind() {
+        // The half of "not knowable" that is **not** permissive. Both
+        // indeterminate variants used to be one `Unknown` that accepted
+        // anything, which let a malformed file list authorize the recursive
+        // delete the file list was supposed to constrain.
+        assert!(!ExpectedKind::Indeterminate.accepts(true));
+        assert!(!ExpectedKind::Indeterminate.accepts(false));
+    }
+
+    #[test]
     fn several_identically_named_flat_entries_are_left_undetermined() {
-        // A shape DSM should never send. Neither answer is defensible, so no
-        // answer is given rather than a guess that could refuse a real payload.
+        // A shape DSM should never send. Neither answer is defensible — but
+        // this list *was* consulted and answered with something that describes
+        // no payload, which is a reason to refuse rather than to accept
+        // whatever happens to be at the path. Unlike the title fallback, which
+        // has no metadata to be malformed.
         let task = Task {
             task_type: TaskType::BitTorrent,
             files: vec![file("Some.Release"), file("Some.Release")],
             ..bare()
         };
         let resolved = resolve_delete_target(&task).expect("resolvable");
-        assert_eq!(resolved.expected_kind, ExpectedKind::Unknown);
+        assert_eq!(resolved.name_source, NameSource::FileList);
+        assert_eq!(resolved.expected_kind, ExpectedKind::Indeterminate);
+        assert!(!resolved.expected_kind.accepts(true));
+        assert!(!resolved.expected_kind.accepts(false));
     }
 
     // -----------------------------------------------------------------------
