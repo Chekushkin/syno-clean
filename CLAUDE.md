@@ -253,9 +253,26 @@ Resolution order in `delete.rs`, and it **refuses rather than guesses**:
 4. Normalize `destination`: strip a leading `/volumeN`, trim surrounding
    slashes. Join as `/{destination}/{name}`.
 
-Syntactic guards — a resolved path is refused if it is empty, `/`, has fewer
-than two components, contains a `..` component, has an empty or `.` name
-component, or lacks a leading `/`.
+Syntactic guards (`delete::validate_path`) — a resolved path is refused if it is
+empty, `/`, has fewer than two components, contains a `..` or `.` component
+(anywhere, not just at the end), has an empty component, or lacks a leading `/`.
+Two further guards are **not** in the plan and exist because each turns a merely
+wrong path into a *share-destroying* one if anything downstream normalizes it:
+
+- **no control characters** — a NUL truncates the path in any C-based consumer,
+  so `/downloads\0/Some.Torrent` arrives as `/downloads`, the share root;
+- **no blank (whitespace-only) components** — if any layer trims,
+  `/   /Some.Torrent` collapses to `/Some.Torrent`, again a share root.
+  Incidental leading/trailing spaces *inside* a real name are left alone.
+
+The on-disk name is guarded separately before it is joined
+(`delete::validate_name`): it must be a single component, so the `title`
+fallback cannot smuggle a `/` in and delete one level deeper than the task's own
+directory. `common_root` compares components **exactly** — the NAS filesystem is
+case-sensitive, and an entry with an empty or absolute `filename` makes the whole
+list unresolvable rather than letting a leading `/` report the volume as the
+shared root. A deselected file still counts towards the common root: `selected`
+describes what was downloaded, not what is on disk.
 
 Semantic guard — `SYNO.FileStation.List` `getinfo` runs against the resolved
 path before any recursive delete. Not found ⇒ report *skipped* (the files were

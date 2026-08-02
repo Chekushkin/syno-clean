@@ -538,15 +538,27 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 **Files:**
 - Create: `src/delete.rs`
 
-- [ ] implement `common_root(&[TaskFile]) -> Option<String>` returning the shared top-level component of a torrent's file list
-- [ ] implement `normalize_destination(&str) -> String` stripping a leading `/volumeN` and trimming surrounding slashes
-- [ ] implement `resolve_delete_path(&Task) -> Result<String>` following the four-rule order in Technical Details — **crucially, refuse when the file list is non-empty but has no single common root**; fall back to `title` only when the file list is absent or empty
-- [ ] implement `validate_path(&str) -> Result<()>` rejecting: empty, `/`, fewer than two components, any `..` component, empty or `.` name component, missing leading slash
-- [ ] implement `DeletePlan { items: Vec<DeleteItem> }` as an owned snapshot, so unresolvable tasks surface as per-item skips rather than aborting the batch
-- [ ] **write thorough resolution tests** — multi-file torrent resolves to its directory; single-file torrent resolves to the file; nested destination (`video/movies`); destination with leading/trailing slashes; absolute `/volume1/downloads` destination; title differing from the on-disk root; empty file list falls back to title
-- [ ] **write the critical refusal test** — a file list whose entries share no common root is REFUSED, not resolved via `title`
-- [ ] **write thorough guard tests** — every rejection case above, including a `""` destination (would yield `/name`) and a `..` traversal attempt
-- [ ] run `cargo test` — must pass before task 14
+- [x] implement `common_root(&[TaskFile]) -> Option<String>` returning the shared top-level component of a torrent's file list
+- [x] implement `normalize_destination(&str) -> String` stripping a leading `/volumeN` and trimming surrounding slashes
+- [x] implement `resolve_delete_path(&Task) -> Result<String>` following the four-rule order in Technical Details — **crucially, refuse when the file list is non-empty but has no single common root**; fall back to `title` only when the file list is absent or empty
+- [x] implement `validate_path(&str) -> Result<()>` rejecting: empty, `/`, fewer than two components, any `..` component, empty or `.` name component, missing leading slash — plus control characters and blank components (see the ⚠️ note below)
+- [x] implement `DeletePlan { items: Vec<DeleteItem> }` as an owned snapshot, so unresolvable tasks surface as per-item skips rather than aborting the batch — `DeleteItem { id, title, size, status, target: Target::Path | Target::Refused }`
+- [x] **write thorough resolution tests** — multi-file torrent resolves to its directory; single-file torrent resolves to the file; nested destination (`video/movies`); destination with leading/trailing slashes; absolute `/volume1/downloads` destination; title differing from the on-disk root; empty file list falls back to title
+- [x] **write the critical refusal test** — a file list whose entries share no common root is REFUSED, not resolved via `title` — `a_file_list_with_no_common_root_is_refused_and_never_guessed_from_the_title`, driven by the pre-staged fixture task `dbid_013`
+- [x] **write thorough guard tests** — every rejection case above, including a `""` destination (would yield `/name`) and a `..` traversal attempt
+- [x] run `cargo test` — must pass before task 14 — 346 tests pass (56 new in `delete`)
+
+⚠️ **Decisions taken during Task 13** (plan text above kept verbatim; actuals recorded here):
+- ➕ **Two guards the plan did not enumerate**, both because they turn a merely-wrong path into a *share-destroying* one if anything downstream normalizes it. **Control characters are rejected anywhere in the path**: a NUL truncates the string in any C-based consumer, so `/downloads\0/Some.Torrent` arrives as `/downloads` — the share root, deleted recursively. **Whitespace-only components are rejected** as well as empty ones: if any layer trims, `/   /Some.Torrent` collapses to `/Some.Torrent`, again a share root. Incidental leading/trailing spaces *inside* an otherwise real name are deliberately left alone — those are legitimate on the NAS filesystem, and refusing them would skip real torrents for a hazard that needs server-side trimming to exist at all.
+- **No glob guard.** Rejecting `*`/`?`/`[`/`]` was considered and rejected: File Station's `path` parameter is a literal path (searching is a separate API), while scene release names contain brackets constantly — the guard would refuse most real torrents to defend against a behaviour DSM does not have.
+- ➕ **The on-disk name is guarded separately (`validate_name`) before it is joined.** `validate_path` would catch most of it afterwards, but a `title` fallback of `Some/Release` passes every path guard while pointing one level *deeper* than the task's own directory, at something that may belong to someone else. The name must be a single non-blank component that is not `.`/`..` and holds no control characters.
+- **`common_root` compares components exactly** — no case folding. The NAS filesystem is case-sensitive, so `Some.Release/` and `some.release/` are two directories and picking either is a guess.
+- **An entry with an empty or absolute `filename` makes the whole list unresolvable**, rather than being skipped. Splitting `/volume1/downloads/X/a.mkv` naively would report `volume1` (or an empty component) as the shared root; refusing the task is the fail-closed direction and costs one skipped row.
+- **A deselected file still counts towards the common root.** `selected` describes what was downloaded, not what is on disk, and a list that disagrees with itself must refuse either way. Filtering to selected entries would have *resolved* some of the ambiguous cases the plan's rule 2 exists to refuse.
+- **Only the absolute `/volumeN` form is stripped** by `normalize_destination`; a relative `volume1/downloads` is passed through untouched, since a share may legally be named `volume1` and mangling a relative path is how a delete lands one directory away from where it was aimed. Unrecognized forms (`/volumeUSB1/…`) are likewise passed through — the resulting path simply fails the executor's existence check and is skipped.
+- **An empty normalized destination is refused with its own reason** rather than being left to the component-count guard: `/{name}` names a *share*, and "the task reports no destination" is the message the user can act on. Fixture tasks `dbid_010` (no `additional` at all) and `dbid_011` (a `file` block but no `detail`) are both refused for this.
+- `Target::Refused(reason)` carries the `Error::UnsafePath` *reason* only, not the full `Display`, so Task 14's dialog is not repeating the path back inside every skip line.
+- ➕ 56 tests, none of which touch a network. Beyond the plan's list: a snapshot test that mutates and then clears the source `Vec` and asserts the plan is byte-identical (this is what "owned snapshot" has to mean), a whole-fixture sweep asserting every resolvable task's path re-passes `validate_path`, and an exact assertion that the fixture refuses precisely `dbid_010`, `dbid_011`, `dbid_013` — so a later change that makes one of them resolve cannot pass unnoticed.
 
 ### Task 14: Delete confirmation dialog
 
