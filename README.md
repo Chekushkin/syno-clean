@@ -11,9 +11,35 @@ keyboard, and removes both halves in one confirmed step.
 
 Nothing is installed on the NAS: it is a plain HTTP client for the documented DSM API.
 
-<!-- SCREENSHOT PLACEHOLDER — a real capture of the TUI is added before v0.1.0 is tagged. -->
+```text
+ syno-clean 0.1.0                                                                                         14 / 14 tasks
+  Name▲          Status            Size  Progress      ↓ Speed      ↑ Speed  Ratio Seeds/Peers      ETA Destination
+  Absolute.Dest… finished     256.0 MiB    100.0%            —            —   1.00           —        ∞ /volume1/downlo…
+✓ archlinux-202… finished       1.1 GiB    100.0%            —            —   0.50           —        ∞ downloads
+  Big.Buck.Bunn… seeding        1.8 GiB    100.0%            —    1.2 MiB/s   2.14         5/9        ∞ video/movies
+✓ Broken.Releas… error        700.0 MiB      0.0%            —            —   0.00           —        ∞ downloads
+  empty-placeho… waiting            0 B      0.0%            —            —   0.00           —        ∞ downloads
+  Hosted.Archiv… hosting      500.0 MiB      0.0%            —            —   0.00           —        ∞ —
+  LibreOffice.2… paused         3.0 GiB     30.0%            —            —   0.00           —        ∞ software
+  Mixed.Root.Re… seeding        3.0 MiB    100.0%            —     64 KiB/s   0.33         2/1        ∞ video/tv
+  Mystery.Task.… captcha_ne…    1.0 GiB      0.0%            —            —   0.00           —        ∞ —
+  Sintel.2010.2… finishing     12.0 GiB    100.0%    1.0 MiB/s    256 KiB/s   0.17         6/2       1s downloads/incom…
+  Some.Show.S01… checking      20.0 GiB     50.0%            —            —   0.00           —        ∞ video/tv
+  syno-clean-0.… waiting        4.0 MiB      0.0%            —            —   0.00           —        ∞ downloads
+  Ubuntu.24.04.… downloading    5.8 GiB     39.0%    8.5 MiB/s    512 KiB/s   0.05        12/4    7m 7s downloads
+  千と千尋の神…  extracting     8.0 GiB    100.0%            —            —   0.05         3/0        ∞ video/movies
+ 2 selected · 1.8 GiB · sort Name▲ · d delete · p/u pause/resume · r refresh · q quit · ? help
+```
 
-> **Screenshot pending.** A capture of the running TUI will be added here.
+> This is **not a photograph of a live session**. It is the program's own renderer
+> drawing one 120x17 frame from the checked-in test fixture
+> (`tests/fixtures/task_list.json`) into an in-memory buffer, with two rows selected —
+> the same `ratatui` `TestBackend` path the layout tests use. Colour and the cursor
+> highlight are lost in plain text; everything else is exactly what the terminal gets.
+>
+> ⚠️ **A real terminal screenshot (or an asciinema recording) against a live NAS is
+> still outstanding and must be added before v0.1.0 is published.** The fixture behind
+> this frame is itself provisional — see [Contributing](CONTRIBUTING.md).
 
 ## Features
 
@@ -22,7 +48,7 @@ Nothing is installed on the NAS: it is a plain HTTP client for the documented DS
 - Arrow/vim navigation, `Space` multi-select, `a` select-all-visible.
 - `d` → a confirmation listing exactly which tasks and which resolved on-disk paths are
   about to go, with the total it will free — then deletes the files *and* the task.
-- Sort by any column, filter by status, live substring search over titles.
+- Sort by eight keys, filter by status, live substring search over titles.
 - Live auto-refresh in the background; the UI never blocks on the network.
 - Pause (`p`) and resume (`u`) the selection.
 - Correct column alignment for CJK and emoji titles (display width, not character
@@ -87,7 +113,8 @@ tar xzf "syno-clean-${VERSION}-${TARGET}.tar.gz"
 install -m 0755 syno-clean ~/.local/bin/
 ```
 
-Each archive is published with a matching `.sha256` checksum.
+A single `SHA256SUMS` file covering every archive is attached to the same release, and
+its contents are repeated in the release notes.
 
 ## Quick start
 
@@ -226,7 +253,9 @@ cursor when there is not.
 | `f` | next status filter |
 | `/` | search titles |
 
-Sort columns: Name, Status, Size, Progress, ↓ Speed, ↑ Speed, Ratio, Added.
+Sort keys: Name, Status, Size, Progress, ↓ Speed, ↑ Speed, Ratio, Added. That is eight
+keys against eleven columns — Seeds/Peers, ETA and Destination are **not** sortable, and
+`Added` sorts by a value that has no column of its own. Post-v1 if it is missed.
 
 Status filters: **All**, **Downloading**, **Seeding**, **Finished**, **Paused**,
 **Error**. `Downloading` means "in progress" and covers `downloading`, `waiting`,
@@ -320,7 +349,23 @@ orphaned.
 
 ### 5. What you see is what goes
 
-The confirmation dialog is an owned **snapshot** taken the moment it opens: background
+```text
+  Absolute.Dest… fi┌ Delete 2 tasks ────────────────────────────────────────────────────────────────┐ ∞ /volume1/downlo…
+✓ archlinux-202… fi│ Removes the Download Station task and its files on the NAS. This cannot be     │ ∞ downloads
+  Big.Buck.Bunn… se│ undone.                                                                        │ ∞ video/movies
+✓ Broken.Releas… er│                                                                                │ ∞ downloads
+  empty-placeho… wa│ • archlinux-2026.07.01-x86_64.iso                                              │ ∞ downloads
+  Hosted.Archiv… ho│     1.1 GiB  /downloads/archlinux-2026.07.01-x86_64.iso                        │ ∞ —
+  LibreOffice.2… pa│ • Broken.Release.2019.720p                                                     │ ∞ software
+  Mixed.Root.Re… se│     700.0 MiB  /downloads/Broken.Release.2019.720p                             │ ∞ video/tv
+  Mystery.Task.… ca│                                                                                │ ∞ —
+  Sintel.2010.2… fi│ 2 tasks · 1.8 GiB to free                                                      │1s downloads/incom…
+  Some.Show.S01… ch│                        [ Cancel (Esc) ]   [ Delete (y) ]                       │ ∞ video/tv
+  syno-clean-0.… wa└────────────────────────────────────────────────────────────────────────────────┘ ∞ downloads
+```
+
+Every resolved path is on screen before anything is sent. The confirmation dialog is an
+owned **snapshot** taken the moment it opens: background
 refreshes are suspended while it is up, and the path guards are re-run immediately
 before each File Station call. Refused items are listed as `SKIPPED` with the reason
 and excluded from the total, so a skipped task can never be mistaken for a cleaned-up
