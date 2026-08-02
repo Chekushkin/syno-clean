@@ -68,8 +68,7 @@ impl SortKey {
 
     /// The next key in [`Self::ALL`], wrapping.
     pub fn next(self) -> SortKey {
-        let position = SortKey::ALL.iter().position(|k| *k == self).unwrap_or(0);
-        SortKey::ALL[(position + 1) % SortKey::ALL.len()]
+        cycle(&SortKey::ALL, self)
     }
 
     /// Compare two tasks on this key, **ascending**.
@@ -101,6 +100,20 @@ impl SortKey {
             SortKey::Added => a.create_time.cmp(&b.create_time),
         }
     }
+}
+
+/// The element after `current` in `all`, wrapping round at the end.
+///
+/// A free function rather than a trait: `s` and `f` cycle two unrelated enums
+/// with the same three lines, and two copies could drift into disagreeing about
+/// whether the cycle wraps. A value not in `all` restarts the cycle, which is
+/// the only sensible answer and keeps this total.
+fn cycle<T: PartialEq + Copy>(all: &[T], current: T) -> T {
+    if all.is_empty() {
+        return current;
+    }
+    let position = all.iter().position(|item| *item == current).unwrap_or(0);
+    all[(position + 1) % all.len()]
 }
 
 /// Which way a [`SortKey`] points. Toggled by `S`.
@@ -185,11 +198,7 @@ impl StatusFilter {
 
     /// The next filter in [`Self::ALL`], wrapping.
     pub fn next(self) -> StatusFilter {
-        let position = StatusFilter::ALL
-            .iter()
-            .position(|f| *f == self)
-            .unwrap_or(0);
-        StatusFilter::ALL[(position + 1) % StatusFilter::ALL.len()]
+        cycle(&StatusFilter::ALL, self)
     }
 
     /// Whether a task in `status` passes this filter.

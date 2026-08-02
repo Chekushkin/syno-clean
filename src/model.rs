@@ -662,4 +662,72 @@ mod tests {
         .expect("empty list");
         assert_eq!(list, TaskList::default());
     }
+
+    // ---- the lenient number readers ----------------------------------------
+    //
+    // These decide what `size` is, and `size` is the number the confirmation
+    // dialog promises the user they will get back. Every collapse below is
+    // deliberate — DSM has been seen to send all of these forms — but each one
+    // is also a way for a real value to silently become `0`, so they are
+    // pinned rather than assumed.
+
+    /// One task parsed from a bare `transfer`/`detail`-less body.
+    fn task_from(json: &str) -> Task {
+        serde_json::from_str(json).expect("a task")
+    }
+
+    #[test]
+    fn a_number_sent_as_a_string_is_read_as_the_number() {
+        // DSM v1 quotes its 64-bit counts on some builds.
+        let task = task_from(r#"{"id": "x", "title": "t", "size": "8589934592"}"#);
+        assert_eq!(task.size, 8_589_934_592);
+    }
+
+    #[test]
+    fn a_negative_size_clamps_to_zero_rather_than_wrapping() {
+        // `-1 as u64` would be 18 exabytes in the "to free" line.
+        let task = task_from(r#"{"id": "x", "title": "t", "size": -1}"#);
+        assert_eq!(task.size, 0);
+        let task = task_from(r#"{"id": "x", "title": "t", "size": "-1"}"#);
+        assert_eq!(task.size, 0);
+    }
+
+    #[test]
+    fn an_unparseable_number_collapses_to_zero_instead_of_failing_the_whole_list() {
+        // The trade: one junk field must not cost the user their entire table.
+        // The cost is that a real size can read as 0, which understates what a
+        // delete frees — the safe direction for a number the dialog promises.
+        let task = task_from(r#"{"id": "x", "title": "t", "size": "not a number"}"#);
+        assert_eq!(task.size, 0);
+        let task = task_from(r#"{"id": "x", "title": "t", "size": null}"#);
+        assert_eq!(task.size, 0);
+    }
+
+    #[test]
+    fn a_fractional_number_truncates() {
+        let task = task_from(r#"{"id": "x", "title": "t", "size": 1024.9}"#);
+        assert_eq!(task.size, 1024);
+        let task = task_from(r#"{"id": "x", "title": "t", "size": "2048.5"}"#);
+        assert_eq!(task.size, 2048);
+    }
+
+    #[test]
+    fn a_peer_count_too_large_for_u32_saturates_rather_than_wrapping() {
+        let list: TaskList =
+            serde_json::from_str(r#"{"total": 99999999999, "tasks": []}"#).expect("a task list");
+        assert_eq!(list.total, u32::MAX);
+        let list: TaskList =
+            serde_json::from_str(r#"{"total": -5, "tasks": []}"#).expect("a task list");
+        assert_eq!(list.total, 0);
+    }
+
+    #[test]
+    fn a_zeroed_size_still_yields_finite_derived_numbers() {
+        // The reason the clamps matter beyond the one field: `progress` and
+        // `ratio` divide by these.
+        let task = task_from(r#"{"id": "x", "title": "t", "size": "-1"}"#);
+        assert!(task.progress().is_finite(), "{}", task.progress());
+        assert!(task.ratio().is_finite(), "{}", task.ratio());
+        assert_eq!(task.eta(), None);
+    }
 }

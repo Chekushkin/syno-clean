@@ -37,8 +37,10 @@ assignees: ''
 ## Log output
 
 <!-- The relevant lines from ~/.cache/syno-clean/syno-clean.log (or --log-file).
-     Redact the host name if you would rather not share it; credentials are already
-     redacted before they can reach the log. -->
+     Your DSM password is never written to the log. The session id (sid) can be —
+     it is a bearer credential, so search the excerpt for `_sid=` and replace any
+     match before pasting. Redact the host name too if you would rather not share
+     it. Note that only INFO and above is recorded; there is no verbose flag. -->
 
 ```
 paste here

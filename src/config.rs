@@ -150,22 +150,6 @@ impl Config {
             delete_files: None,
         })
     }
-
-    /// Overlay the environment layer on top of `self`, env winning per field.
-    ///
-    /// [`merge`] is what production uses; this exists for callers that want a
-    /// single collapsed layer (and to keep the two orderings in one place).
-    pub fn apply_env(&mut self, get: EnvLookup<'_>) -> Result<()> {
-        let env = Config::from_env(get)?;
-        self.host = env.host.or(self.host.take());
-        self.port = env.port.or(self.port);
-        self.https = env.https.or(self.https);
-        self.insecure = env.insecure.or(self.insecure);
-        self.username = env.username.or(self.username.take());
-        self.refresh_secs = env.refresh_secs.or(self.refresh_secs);
-        self.delete_files = env.delete_files.or(self.delete_files);
-        Ok(())
-    }
 }
 
 /// Parse a config file body, returning the config and any unrecognized keys.
@@ -412,10 +396,9 @@ pub fn merge(file: Config, env: Config, cli: &Cli) -> Result<ResolvedConfig> {
     let username =
         resolved_username(&file, &env, cli).ok_or_else(|| Error::config(MISSING_USERNAME_HELP))?;
 
-    let https = cli_none()
-        .or(env.https)
-        .or(file.https)
-        .unwrap_or(DEFAULT_HTTPS);
+    // There is no `--https` / `--no-https` flag — HTTPS is chosen by config or
+    // env only — so the CLI layer contributes nothing to this one.
+    let https = env.https.or(file.https).unwrap_or(DEFAULT_HTTPS);
 
     let port = cli.port.or(env.port).or(file.port).unwrap_or(if https {
         DEFAULT_HTTPS_PORT
@@ -459,13 +442,6 @@ pub fn merge(file: Config, env: Config, cli: &Cli) -> Result<ResolvedConfig> {
         dry_run: cli.dry_run,
         logout: cli.logout,
     })
-}
-
-/// There is no `--https` / `--no-https` flag (HTTPS is chosen by config or env
-/// only), so the CLI layer contributes nothing here. Named rather than inlined
-/// as `None` so the precedence chain in [`merge`] reads uniformly.
-fn cli_none() -> Option<bool> {
-    None
 }
 
 /// The DSM password, from the environment or an interactive prompt.
@@ -843,23 +819,6 @@ delete_files = true
                 "{falsy}"
             );
         }
-    }
-
-    #[test]
-    fn apply_env_overlays_the_file_layer() {
-        let mut config = Config {
-            host: Some("filehost".into()),
-            port: Some(5001),
-            username: Some("fileuser".into()),
-            ..Config::default()
-        };
-        let env = env_of(&[(env_vars::HOST, "envhost"), (env_vars::REFRESH_SECS, "11")]);
-        config.apply_env(&env).expect("valid env");
-
-        assert_eq!(config.host.as_deref(), Some("envhost"), "env wins");
-        assert_eq!(config.port, Some(5001), "file value survives");
-        assert_eq!(config.username.as_deref(), Some("fileuser"));
-        assert_eq!(config.refresh_secs, Some(11), "env-only value applied");
     }
 
     // ---- precedence -------------------------------------------------------

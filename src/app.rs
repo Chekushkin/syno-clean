@@ -26,7 +26,7 @@ use crate::api::client::parse_envelope;
 use crate::api::download_station::DS_TASK_API;
 use crate::delete::{DeleteOptions, DeletePlan};
 use crate::error::Result;
-use crate::event::{AppEvent, OpKind};
+use crate::event::{AppEvent, OpKind, TaskOp, TaskRef};
 use crate::model::{Task, TaskList};
 use crate::ui::dialog;
 use crate::view::{self, View};
@@ -78,16 +78,25 @@ impl ConfirmFocus {
 
 /// A pause or resume the user asked for, waiting for the event loop to run it.
 ///
-/// Carries **task IDs**, resolved from the selection (or the cursor row) at the
-/// moment the key was pressed — the same reason the selection set itself holds
-/// IDs: a refresh that reorders the table between the key press and the call
-/// must not move the operation onto a different torrent.
+/// Carries **owned task ids and titles**, resolved from the selection (or the
+/// cursor row) at the moment the key was pressed — the same reason the
+/// selection set itself holds IDs: a refresh that reorders the table between
+/// the key press and the call must not move the operation onto a different
+/// torrent. The title rides along so the progress line can name the torrent
+/// instead of `dbid_042`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskOpRequest {
-    /// [`OpKind::Pause`] or [`OpKind::Resume`]; a delete goes through the
-    /// confirmation dialog instead.
-    pub op: OpKind,
-    pub ids: Vec<String>,
+    /// A delete goes through the confirmation dialog instead, which is why
+    /// [`TaskOp`] has no variant for one.
+    pub op: TaskOp,
+    pub tasks: Vec<TaskRef>,
+}
+
+impl TaskOpRequest {
+    /// The ids alone, for callers that only need to name the tasks.
+    pub fn ids(&self) -> Vec<String> {
+        self.tasks.iter().map(|task| task.id.clone()).collect()
+    }
 }
 
 /// The whole of the application state.
@@ -110,6 +119,13 @@ pub struct App {
     /// One line of feedback shown in the footer: the result of the last
     /// operation or the startup banner.
     pub status_message: Option<String>,
+    /// Whether a task list has **ever** arrived.
+    ///
+    /// `tasks.is_empty()` alone cannot tell "the NAS has nothing queued" from
+    /// "the first poll has not come back yet" — or, worse, from "every poll so
+    /// far has failed", where the empty state would assert nothing is queued
+    /// directly underneath a red banner saying the NAS is unreachable.
+    pub loaded: bool,
     /// A **non-fatal** failure banner — a poll that could not reach the NAS,
     /// most often. Kept apart from [`App::status_message`] so it can be styled
     /// as a warning and, crucially, cleared automatically by the next
@@ -169,6 +185,7 @@ impl Default for App {
             mode: Mode::Normal,
             delete_options: DeleteOptions::default(),
             status_message: None,
+            loaded: false,
             error: None,
             page_size: DEFAULT_PAGE_SIZE,
             refresh_requested: false,
@@ -188,6 +205,7 @@ impl App {
     /// poller fills it in on the first tick.
     pub fn new(tasks: Vec<Task>) -> Self {
         Self {
+            loaded: !tasks.is_empty(),
             tasks,
             ..Self::default()
         }
@@ -201,7 +219,18 @@ impl App {
     /// and a 500-task file is the cheapest possible render-performance check.
     /// Nothing polls in this mode — the list is whatever the file said.
     pub fn from_fixture(path: &Path) -> Result<Self> {
-        Ok(Self::new(read_fixture(path)?))
+        let tasks = parse_fixture(&std::fs::read_to_string(path)?)?;
+        tracing::info!(
+            fixture = %path.display(),
+            tasks = tasks.len(),
+            "loaded an offline fixture"
+        );
+        // Whatever the file said *is* the list — there is no poller behind this
+        // mode, so an empty fixture is a loaded empty list, not a pending one.
+        Ok(Self {
+            loaded: true,
+            ..Self::new(tasks)
+        })
     }
 
     /// Set what a confirmed delete may do (from the merged configuration).
@@ -279,26 +308,43 @@ impl App {
             return;
         }
 
-        let cursor_id = self.cursor_task().map(|task| task.id.clone());
+        self.preserving_cursor(|app| {
+            app.tasks = tasks;
+            let live: HashSet<&str> = app.tasks.iter().map(|task| task.id.as_str()).collect();
+            app.selected.retain(|id| live.contains(id.as_str()));
+        });
 
-        self.tasks = tasks;
-        let live: HashSet<&str> = self.tasks.iter().map(|task| task.id.as_str()).collect();
-        self.selected.retain(|id| live.contains(id.as_str()));
-
-        self.cursor = match cursor_id {
-            Some(id) => self
-                .visible()
-                .iter()
-                .position(|&index| self.tasks[index].id == id)
-                // The task is gone: hold the row number rather than jumping to
-                // the top, so the cursor stays where the user's eye is.
-                .unwrap_or(self.cursor),
-            None => self.cursor,
-        };
-        self.clamp_cursor();
-
+        // The first list to arrive is what separates "the NAS has no tasks"
+        // from "nothing has come back yet"; see `ui::empty_state`.
+        self.loaded = true;
         // A tick that got through is the proof the last failure has passed.
         self.clear_error();
+    }
+
+    /// Run `change`, then put the cursor back on the task it was on.
+    ///
+    /// The cursor is a row number in the *visible* list, so anything that
+    /// reorders, filters or replaces that list would otherwise silently move it
+    /// onto a different torrent — which is how the wrong task gets deleted by a
+    /// `d` that was already half typed. Following the task by **ID** is the
+    /// only reconciliation that cannot alias; when the change hides or removes
+    /// that task altogether the *row number* is kept instead, so the cursor
+    /// stays where the user's eye is, and clamped into whatever is left.
+    ///
+    /// Shared by [`App::apply_tasks`] and [`App::change_view`]: a refresh and a
+    /// sort are the same hazard, and two copies of this could disagree.
+    fn preserving_cursor(&mut self, change: impl FnOnce(&mut Self)) {
+        let cursor_id = self.cursor_task().map(|task| task.id.clone());
+
+        change(self);
+
+        if let Some(id) = cursor_id {
+            let visible = self.visible();
+            if let Some(row) = visible.iter().position(|&index| self.tasks[index].id == id) {
+                self.cursor = row;
+            }
+        }
+        self.clamp_cursor();
     }
 
     /// Ask for an immediate refresh (`r`).
@@ -372,19 +418,7 @@ impl App {
     /// what to *look* at; it is never an instruction to disarm rows that
     /// scrolled out of sight.
     fn change_view(&mut self, change: impl FnOnce(&mut View)) {
-        let cursor_id = self.cursor_task().map(|task| task.id.clone());
-
-        change(&mut self.view);
-
-        if let Some(id) = cursor_id
-            && let Some(row) = self
-                .visible()
-                .iter()
-                .position(|&index| self.tasks[index].id == id)
-        {
-            self.cursor = row;
-        }
-        self.clamp_cursor();
+        self.preserving_cursor(|app| change(&mut app.view));
     }
 
     /// Start editing the search query (`/`).
@@ -525,7 +559,7 @@ impl App {
     /// work without arming it first. A plan with no items (an empty table)
     /// opens no dialog at all: there is nothing to confirm.
     pub fn begin_delete(&mut self) {
-        let plan = self.delete_target();
+        let plan = DeletePlan::snapshot(self.target_tasks());
         if plan.is_empty() {
             self.set_status("nothing to delete");
             return;
@@ -540,11 +574,6 @@ impl App {
         self.mode = Mode::Confirm;
     }
 
-    /// Snapshot whatever `d` would act on right now.
-    fn delete_target(&self) -> DeletePlan {
-        DeletePlan::snapshot(self.target_tasks())
-    }
-
     /// The tasks an operation acts on: **the selection when there is one, the
     /// row under the cursor otherwise, and nothing at all when the table is
     /// empty.**
@@ -554,20 +583,31 @@ impl App {
     /// a selection ends up pausing the row their cursor happened to be resting
     /// on. A selected task that a filter is currently hiding **is** included —
     /// the selection is what is armed, not what is on screen.
+    ///
+    /// **Order is on-screen order.** The confirmation dialog lists these rows
+    /// back to the user for checking, and a dialog whose order does not match
+    /// the table's defeats the one job that screen has — under any non-default
+    /// sort, `self.tasks` order is not what the user is looking at. Selected
+    /// rows a filter is currently hiding have no on-screen position, so they
+    /// follow, in DSM order.
     fn target_tasks(&self) -> Vec<&Task> {
-        if self.selected_count() > 0 {
-            self.selected_tasks().collect()
-        } else {
-            self.cursor_task().into_iter().collect()
+        if self.selected_count() == 0 {
+            return self.cursor_task().into_iter().collect();
         }
-    }
 
-    /// The IDs [`App::target_tasks`] resolves to.
-    pub fn op_target_ids(&self) -> Vec<String> {
-        self.target_tasks()
+        let mut shown: Vec<&Task> = self
+            .visible()
             .into_iter()
-            .map(|task| task.id.clone())
-            .collect()
+            .map(|index| &self.tasks[index])
+            .filter(|task| self.selected.contains(&task.id))
+            .collect();
+
+        let on_screen: HashSet<&str> = shown.iter().map(|task| task.id.as_str()).collect();
+        shown.extend(
+            self.selected_tasks()
+                .filter(|task| !on_screen.contains(task.id.as_str())),
+        );
+        shown
     }
 
     // ---- pause and resume ---------------------------------------------------
@@ -579,12 +619,12 @@ impl App {
 
     /// Pause the current target (`p`).
     pub fn pause_target(&mut self) {
-        self.request_task_op(OpKind::Pause);
+        self.request_task_op(TaskOp::Pause);
     }
 
     /// Resume the current target (`u`).
     pub fn resume_target(&mut self) {
-        self.request_task_op(OpKind::Resume);
+        self.request_task_op(TaskOp::Resume);
     }
 
     /// Record a pause/resume for the event loop to run.
@@ -592,25 +632,32 @@ impl App {
     /// An empty target — an empty table, or a filter that hides everything — is
     /// a **no-op with a message**, never an empty batch: a round trip that can
     /// only report "nothing to do" is not worth making.
-    fn request_task_op(&mut self, op: OpKind) {
-        let ids = self.op_target_ids();
-        if ids.is_empty() {
+    fn request_task_op(&mut self, op: TaskOp) {
+        let tasks: Vec<TaskRef> = self
+            .target_tasks()
+            .into_iter()
+            .map(|task| TaskRef {
+                id: task.id.clone(),
+                title: task.title.clone(),
+            })
+            .collect();
+        if tasks.is_empty() {
             self.set_status(format!("nothing to {}", op.label()));
             return;
         }
 
         tracing::info!(
             op = op.label(),
-            tasks = ids.len(),
+            tasks = tasks.len(),
             "requesting an operation"
         );
-        let plural = if ids.len() == 1 { "task" } else { "tasks" };
+        let plural = if tasks.len() == 1 { "task" } else { "tasks" };
         self.set_status(format!(
             "{} requested for {} {plural}",
             op.label(),
-            ids.len()
+            tasks.len()
         ));
-        self.requested_op = Some(TaskOpRequest { op, ids });
+        self.requested_op = Some(TaskOpRequest { op, tasks });
     }
 
     /// Take the pause/resume the user asked for, if there is one.
@@ -649,12 +696,7 @@ impl App {
     /// user then has to hold `k` through.
     pub fn scroll_confirm(&mut self, delta: isize) {
         let last = self.confirm_line_count().saturating_sub(1);
-        self.confirm_scroll = if delta < 0 {
-            self.confirm_scroll.saturating_sub(delta.unsigned_abs())
-        } else {
-            self.confirm_scroll.saturating_add(delta.unsigned_abs())
-        }
-        .min(last);
+        self.confirm_scroll = shift(self.confirm_scroll, delta, last);
     }
 
     /// Jump the modal body to the top or the bottom.
@@ -741,12 +783,7 @@ impl App {
             self.cursor = 0;
             return;
         }
-        self.cursor = if delta < 0 {
-            self.cursor.saturating_sub(delta.unsigned_abs())
-        } else {
-            self.cursor.saturating_add(delta.unsigned_abs())
-        };
-        self.clamp_cursor();
+        self.cursor = shift(self.cursor, delta, rows.saturating_sub(1));
     }
 
     /// Jump to the first visible row (`Home`, `g`).
@@ -955,6 +992,21 @@ fn page_delta(page_size: usize) -> isize {
     isize::try_from(page_size).unwrap_or(isize::MAX)
 }
 
+/// Move `value` by a signed `delta`, saturating at `0` and at `max`.
+///
+/// Deliberately **does not wrap**: holding `j` at the bottom of a long list and
+/// jumping back to the top is how the wrong row gets deleted. Shared by the
+/// table cursor and the confirmation-modal scroll, which had the same three
+/// lines twice.
+fn shift(value: usize, delta: isize, max: usize) -> usize {
+    if delta < 0 {
+        value.saturating_sub(delta.unsigned_abs())
+    } else {
+        value.saturating_add(delta.unsigned_abs())
+    }
+    .min(max)
+}
+
 /// Parse a captured DSM `list` response envelope into tasks.
 ///
 /// Deliberately the *same* path a live response takes —
@@ -965,18 +1017,6 @@ fn page_delta(page_size: usize) -> isize {
 pub fn parse_fixture(body: &str) -> Result<Vec<Task>> {
     let list: TaskList = parse_envelope(body, DS_TASK_API)?;
     Ok(list.tasks)
-}
-
-/// Read and parse a captured `list` response from disk.
-pub fn read_fixture(path: &Path) -> Result<Vec<Task>> {
-    let body = std::fs::read_to_string(path)?;
-    let tasks = parse_fixture(&body)?;
-    tracing::info!(
-        fixture = %path.display(),
-        tasks = tasks.len(),
-        "loaded an offline fixture"
-    );
-    Ok(tasks)
 }
 
 #[cfg(test)]
@@ -2517,8 +2557,8 @@ mod tests {
         app.handle_key(press(KeyCode::Char('p')));
 
         let request = requested(&mut app).expect("a pause was requested");
-        assert_eq!(request.op, OpKind::Pause);
-        assert_eq!(request.ids, ["id_002"]);
+        assert_eq!(request.op, TaskOp::Pause);
+        assert_eq!(request.ids(), ["id_002"]);
         assert!(
             app.selected.is_empty(),
             "the cursor fallback must not arm anything"
@@ -2533,8 +2573,8 @@ mod tests {
         app.handle_key(press(KeyCode::Char('u')));
 
         let request = requested(&mut app).expect("a resume was requested");
-        assert_eq!(request.op, OpKind::Resume);
-        assert_eq!(request.ids, ["id_003"]);
+        assert_eq!(request.op, TaskOp::Resume);
+        assert_eq!(request.ids(), ["id_003"]);
     }
 
     #[test]
@@ -2547,9 +2587,9 @@ mod tests {
         app.handle_key(press(KeyCode::Char('p')));
 
         let request = requested(&mut app).expect("a pause was requested");
-        assert_eq!(request.ids, ["id_000", "id_003"]);
+        assert_eq!(request.ids(), ["id_000", "id_003"]);
         assert!(
-            !request.ids.contains(&"id_001".to_string()),
+            !request.ids().contains(&"id_001".to_string()),
             "the cursor row must not be added to a selection"
         );
     }
@@ -2592,9 +2632,77 @@ mod tests {
 
         app.handle_key(press(KeyCode::Char('u')));
         assert_eq!(
-            requested(&mut app).expect("a resume").ids,
+            requested(&mut app).expect("a resume").ids(),
             ["dbid_004".to_string()]
         );
+    }
+
+    #[test]
+    fn the_target_is_listed_in_on_screen_order_not_dsm_order() {
+        // The confirmation dialog lists these rows back for checking, so under
+        // any non-default sort a dialog ordered by `self.tasks` would not match
+        // the table the user is looking at — which defeats the one job that
+        // screen has.
+        let mut app = App::new(fixture_tasks());
+        app.view.sort_key = crate::view::SortKey::Name;
+        app.view.sort_dir = crate::view::SortDir::Desc;
+        for task in &app.tasks {
+            app.selected.insert(task.id.clone());
+        }
+
+        let on_screen: Vec<String> = app
+            .visible()
+            .into_iter()
+            .map(|index| app.tasks[index].id.clone())
+            .collect();
+        let targeted: Vec<String> = app
+            .target_tasks()
+            .into_iter()
+            .map(|task| task.id.clone())
+            .collect();
+
+        assert_eq!(targeted, on_screen);
+        assert_ne!(
+            targeted,
+            app.tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+            "the fixture must actually re-order under this sort, or this proves nothing"
+        );
+        // And the plan the dialog is built from inherits that order.
+        app.handle_key(press(KeyCode::Char('d')));
+        let plan = app.pending_delete().expect("a plan");
+        assert_eq!(
+            plan.items.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+            on_screen
+        );
+    }
+
+    #[test]
+    fn a_selected_row_a_filter_is_hiding_follows_the_visible_ones() {
+        // It has no on-screen position to sort into, but it is still armed and
+        // must still be listed.
+        let mut app = App::new(fixture_tasks());
+        app.view.filter = StatusFilter::Seeding;
+        let hidden = "dbid_004"; // paused
+        let visible_ids: Vec<String> = app
+            .visible()
+            .into_iter()
+            .map(|index| app.tasks[index].id.clone())
+            .collect();
+        assert!(!visible_ids.contains(&hidden.to_string()));
+        assert!(!visible_ids.is_empty());
+
+        app.selected.insert(hidden.to_string());
+        for id in &visible_ids {
+            app.selected.insert(id.clone());
+        }
+
+        let targeted: Vec<String> = app
+            .target_tasks()
+            .into_iter()
+            .map(|task| task.id.clone())
+            .collect();
+        assert_eq!(&targeted[..visible_ids.len()], &visible_ids[..]);
+        assert_eq!(targeted.last().map(String::as_str), Some(hidden));
     }
 
     #[test]
@@ -2604,7 +2712,7 @@ mod tests {
         app.cursor = 1;
 
         app.handle_key(press(KeyCode::Char('p')));
-        assert_eq!(requested(&mut app).expect("a pause").ids, ["id_001"]);
+        assert_eq!(requested(&mut app).expect("a pause").ids(), ["id_001"]);
     }
 
     #[test]
@@ -2660,8 +2768,11 @@ mod tests {
     fn the_checked_in_fixture_loads_straight_off_disk() {
         // The same file the model tests parse, through the same envelope
         // reader — `--fixture` is not a second, laxer parser.
-        let app = App::from_fixture(Path::new("tests/fixtures/task_list.json"))
-            .expect("the checked-in fixture must load");
+        let app = App::from_fixture(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/task_list.json"
+        )))
+        .expect("the checked-in fixture must load");
         assert_eq!(app.tasks.len(), 14);
         assert_eq!(app.visible_count(), 14);
         assert_eq!(app.cursor, 0);

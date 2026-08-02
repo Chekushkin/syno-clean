@@ -255,11 +255,19 @@ pub fn dsm_message(code: i32, api: &str) -> String {
     {
         return msg.to_string();
     }
+    if api.starts_with(FILE_STATION_PREFIX)
+        && let Some(msg) = file_station_message(code)
+    {
+        return msg.to_string();
+    }
     match common_message(code) {
         Some(msg) => msg.to_string(),
         None => format!("unrecognized DSM error code {code}"),
     }
 }
+
+/// Every File Station API name starts with this.
+const FILE_STATION_PREFIX: &str = "SYNO.FileStation";
 
 /// Codes that mean the same thing for every DSM API.
 fn common_message(code: i32) -> Option<&'static str> {
@@ -273,6 +281,34 @@ fn common_message(code: i32) -> Option<&'static str> {
         106 => "session timeout",
         107 => "session interrupted by duplicate login",
         119 => "invalid session ID (SID)",
+        _ => return None,
+    })
+}
+
+/// `SYNO.FileStation.*`-specific codes.
+///
+/// These reuse the 400 range for something completely different from the auth
+/// table, and they are what the delete path actually surfaces: without this,
+/// a permission-denied existence check reads as "unrecognized DSM error code
+/// 403" — a message that tells the user nothing about the one operation in
+/// this program that can lose data.
+fn file_station_message(code: i32) -> Option<&'static str> {
+    Some(match code {
+        400 => "invalid parameter for the File Station request",
+        401 => "unknown File Station error",
+        402 => "the File Station system is too busy",
+        403 => "permission denied — this DSM account may not read or write that path",
+        404 => "the shared folder is in the recycle bin",
+        405 => "cannot accept a request from another user",
+        406 => "the shared folder does not have a quota, or the quota is exceeded",
+        407 => "the operation failed because the path is in use",
+        408 => "no such file or directory",
+        409 => "the volume does not support this operation",
+        410 => "the operation failed — no such task on the NAS",
+        411 => "the destination is read-only",
+        412 => "the file already exists at the destination",
+        413 => "the destination folder is a subfolder of the source",
+        414 => "the destination folder does not exist",
         _ => return None,
     })
 }

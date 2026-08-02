@@ -35,14 +35,24 @@ use crate::error::{Error, Result};
 pub const FS_LIST_API: &str = "SYNO.FileStation.List";
 /// Version range this client implements for `SYNO.FileStation.List`.
 ///
-/// Only `path`, `name`, `isdir` and the per-path `code` are read, and those are
-/// stable across v1 and v2.
-pub const FS_LIST_SUPPORTED: VersionRange = (1, 2);
+/// **Pinned to v1**, for the same reason
+/// [`crate::api::download_station::DS_TASK_SUPPORTED`] is: only the v1 response
+/// shape has been seen from a real NAS. Only `path`, `isdir` and the per-path
+/// `code` are read and those are *believed* stable across v1 and v2, but this
+/// is the API that authorizes an irreversible recursive delete, and a v2
+/// `getinfo` whose shape does not deserialize into [`GetInfo`] would yield an
+/// empty entry list. Widen it once a v2 response has actually been captured.
+pub const FS_LIST_SUPPORTED: VersionRange = (1, 1);
 
 /// File deletion.
 pub const FS_DELETE_API: &str = "SYNO.FileStation.Delete";
 /// Version range this client implements for `SYNO.FileStation.Delete`.
-pub const FS_DELETE_SUPPORTED: VersionRange = (1, 2);
+///
+/// Pinned to v1 alongside [`FS_LIST_SUPPORTED`]: [`classify_delete_status`]
+/// reads `finished` and `path_err_num`, and a v2 `status` payload that spells
+/// either of those differently would read as "finished, no errors" for a
+/// delete that removed nothing.
+pub const FS_DELETE_SUPPORTED: VersionRange = (1, 1);
 
 /// File Station's "no such file or directory".
 pub const FS_NO_SUCH_FILE: i32 = 408;
@@ -124,7 +134,10 @@ pub struct GetInfo {
 /// What the NAS knows about a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathInfo {
-    /// Nothing there. **Not an error** — see the module docs.
+    /// The NAS said, in so many words, that there is nothing there — a per-entry
+    /// [`FS_NO_SUCH_FILE`], or an entry with neither an `isdir` nor an error
+    /// code, which is how some builds answer a failed stat. **Not an error** —
+    /// see the module docs.
     Missing,
     /// It exists.
     Found { is_dir: bool },
@@ -133,6 +146,16 @@ pub enum PathInfo {
     /// [`PathInfo::Missing`]: "I am not allowed to look" must not be read as
     /// "there is nothing to delete", which would orphan the files.
     Error(i32),
+    /// The response carried **no entry that can be attributed to the requested
+    /// path** — an absent or empty `files` array, or several entries none of
+    /// which names the path we asked about.
+    ///
+    /// This is the shape a `getinfo` whose payload this client cannot read
+    /// produces, since [`GetInfo::files`] defaults to empty. It must never be
+    /// collapsed into [`PathInfo::Missing`]: doing so would report "the files
+    /// were already gone" for every item of a batch and delete every DSM task
+    /// while nothing at all was reclaimed.
+    Unknown,
 }
 
 /// Read a `getinfo` payload for one path.
@@ -142,15 +165,28 @@ pub enum PathInfo {
 /// as absent: it is the shape some builds use for a path they could not stat,
 /// and "assume it is not there" is the direction that issues no destructive
 /// call.
+///
+/// **The entry has to be attributable to the path that was asked about.** An
+/// exact match on `path` is preferred; a *lone* entry is accepted even when it
+/// does not match, because exactly one path was requested and DSM sometimes
+/// echoes it in a different form (a trailing slash, a resolved `/volumeN/…`).
+/// Several entries with no match, or no entries at all, is
+/// [`PathInfo::Unknown`] — reading someone else's entry would let a
+/// `Found { is_dir: true }` for a *different* directory authorize the recursive
+/// delete of this one.
 pub fn classify_getinfo(info: &GetInfo, path: &str) -> PathInfo {
+    let lone_entry = match info.files.as_slice() {
+        [only] => Some(only),
+        _ => None,
+    };
     let entry = info
         .files
         .iter()
         .find(|entry| entry.path == path)
-        .or_else(|| info.files.first());
+        .or(lone_entry);
 
     let Some(entry) = entry else {
-        return PathInfo::Missing;
+        return PathInfo::Unknown;
     };
 
     match entry.code {
@@ -445,15 +481,60 @@ mod tests {
     }
 
     #[test]
-    fn no_entry_at_all_means_gone() {
+    fn no_entry_at_all_is_unknown_never_gone() {
+        // The shape a payload this client cannot read produces, since `files`
+        // is `#[serde(default)]`. Calling it `Missing` would report "the files
+        // were already gone" for every item of a batch, delete every DSM task,
+        // and reclaim nothing.
         let info = getinfo(r#"{"success": true, "data": {"files": []}}"#);
         assert_eq!(
             classify_getinfo(&info, "/downloads/Gone"),
-            PathInfo::Missing
+            PathInfo::Unknown
         );
         assert_eq!(
             classify_getinfo(&GetInfo::default(), "/downloads/Gone"),
-            PathInfo::Missing
+            PathInfo::Unknown
+        );
+        // A `data` object with no `files` key at all — the getinfo shape
+        // mismatch this variant exists for.
+        let info = getinfo(r#"{"success": true, "data": {"total": 1}}"#);
+        assert_eq!(
+            classify_getinfo(&info, "/downloads/Gone"),
+            PathInfo::Unknown
+        );
+    }
+
+    #[test]
+    fn a_lone_entry_answers_for_the_one_path_that_was_asked_about() {
+        // Exactly one path is ever requested, so a single entry is that path
+        // however DSM chose to spell it back — a trailing slash here.
+        let info = getinfo(
+            r#"{"success": true, "data": {"files": [
+                {"path": "/downloads/Some.Release/", "name": "Some.Release", "isdir": true}
+            ]}}"#,
+        );
+        assert_eq!(
+            classify_getinfo(&info, "/downloads/Some.Release"),
+            PathInfo::Found { is_dir: true }
+        );
+    }
+
+    #[test]
+    fn an_entry_for_a_different_path_never_authorizes_deleting_this_one() {
+        // The hazard the lone-entry fallback would otherwise open: a
+        // `Found { is_dir: true }` belonging to some *other* directory is what
+        // the caller acts on, and the recursive delete goes ahead against a
+        // path nothing confirmed.
+        let info = getinfo(
+            r#"{"success": true, "data": {"files": [
+                {"path": "/downloads/A", "name": "A", "isdir": true},
+                {"path": "/downloads/B", "name": "B", "isdir": true}
+            ]}}"#,
+        );
+        assert_eq!(
+            classify_getinfo(&info, "/downloads/C"),
+            PathInfo::Unknown,
+            "an unmatched path among several entries must not borrow one of them"
         );
     }
 
@@ -562,7 +643,55 @@ mod tests {
         );
     }
 
+    // ---- delete_paths ------------------------------------------------------
+
+    #[tokio::test]
+    async fn deleting_an_empty_list_of_paths_issues_no_request_at_all() {
+        // The guard that makes an all-refused batch cost nothing. The client
+        // below has an empty API map (`discover()` was never called), so any
+        // request would fail in `endpoint()` — `Ok(())` is therefore positive
+        // proof that the early return fired.
+        let config = crate::config::ResolvedConfig {
+            host: "nas.invalid".to_string(),
+            port: 5001,
+            https: true,
+            insecure: false,
+            username: "tester".to_string(),
+            refresh_secs: 3,
+            delete_files: true,
+            dry_run: true,
+            logout: false,
+        };
+        let client = SynoClient::new(&config).expect("building a client issues no request");
+        delete_paths(&client, &[])
+            .await
+            .expect("no paths means no call");
+    }
+
     // ---- constants ---------------------------------------------------------
+
+    #[test]
+    fn the_two_file_station_apis_are_pinned_to_the_shape_that_has_been_seen() {
+        // Both drive the one irreversible operation in this program, and the
+        // v2 response shapes have never been captured from a real NAS. Widening
+        // either without a captured response is how `classify_getinfo` starts
+        // answering `Unknown` for everything — or, worse, how
+        // `classify_delete_status` starts reading a renamed error count as zero.
+        assert_eq!(FS_LIST_SUPPORTED, (1, 1));
+        assert_eq!(FS_DELETE_SUPPORTED, (1, 1));
+    }
+
+    #[test]
+    fn a_file_station_error_code_reads_as_words_not_as_a_number() {
+        // 403 on File Station is a permission problem, and it is the code the
+        // delete path is most likely to surface. The common table has no entry
+        // for it, so without the File Station table this said "unrecognized DSM
+        // error code 403".
+        let rendered = Error::dsm(403, FS_LIST_API).to_string();
+        assert!(rendered.contains("permission denied"), "{rendered}");
+        let rendered = Error::dsm(FS_NO_SUCH_FILE, FS_DELETE_API).to_string();
+        assert!(rendered.contains("no such file"), "{rendered}");
+    }
 
     #[test]
     fn the_delete_wait_is_bounded_and_longer_than_one_poll() {

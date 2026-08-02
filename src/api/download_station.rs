@@ -134,10 +134,31 @@ pub struct TaskOpResult {
 ///
 /// The first non-zero code wins; there is nothing useful to do with the rest,
 /// and the caller acts on one task at a time anyway.
+///
+/// ⚠️ **An empty slice is `Ok`**, which is only correct when the caller has
+/// already established that the slice covers the task it asked about. Callers
+/// acting on a specific id want [`check_task_result`] instead.
 pub fn check_task_results(results: &[TaskOpResult]) -> Result<()> {
     match results.iter().find(|result| result.error != 0) {
         Some(failed) => Err(Error::dsm(failed.error, DS_TASK_API)),
         None => Ok(()),
+    }
+}
+
+/// What the per-task result array says about **one specific id**.
+///
+/// The distinction from [`check_task_results`] is the whole point: DSM
+/// answering `{"success": true, "data": []}` says nothing about the task that
+/// was requested, and reading that as success reports a delete that did not
+/// happen — by which time the *files* are already gone, so the task is left
+/// pointing at nothing and the user is told it was removed. An id the NAS
+/// reported nothing for is therefore a failure.
+pub fn check_task_result(id: &str, results: &[TaskOpResult]) -> Result<()> {
+    match results.iter().find(|result| result.id == id) {
+        Some(result) => check_task_results(std::slice::from_ref(result)),
+        None => Err(Error::Io(std::io::Error::other(format!(
+            "DSM reported no result for task {id}"
+        )))),
     }
 }
 
@@ -337,8 +358,42 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_result_array_is_not_a_failure() {
-        assert!(results(r#"{"success": true, "data": []}"#).is_empty());
-        check_task_results(&[]).expect("nothing to fail");
+    fn an_empty_result_array_says_nothing_about_the_task_that_was_asked_about() {
+        // `check_task_results` over an empty slice is vacuously fine — there is
+        // no non-zero code in it. That is exactly why a caller acting on one id
+        // must not use it: for a *delete*, "success" here means the files have
+        // already gone and the task that still points at them is reported as
+        // removed.
+        let parsed = results(r#"{"success": true, "data": []}"#);
+        assert!(parsed.is_empty());
+        check_task_results(&parsed).expect("no non-zero code to find");
+
+        let err = check_task_result("dbid_001", &parsed).expect_err("nothing was reported");
+        assert!(err.to_string().contains("no result"), "{err}");
+    }
+
+    #[test]
+    fn a_result_array_naming_other_tasks_is_a_failure_for_the_one_requested() {
+        // The same trap one step subtler: DSM answers about a task that was not
+        // asked about. Scanning for "any non-zero code" would pass.
+        let parsed = results(r#"{"success": true, "data": [{"id": "dbid_999", "error": 0}]}"#);
+        let err = check_task_result("dbid_001", &parsed).expect_err("wrong task");
+        assert!(err.to_string().contains("no result"), "{err}");
+    }
+
+    #[test]
+    fn the_matching_entry_is_the_one_that_decides() {
+        let parsed = results(
+            r#"{"success": true, "data": [
+                {"id": "dbid_001", "error": 0},
+                {"id": "dbid_002", "error": 544}
+            ]}"#,
+        );
+        check_task_result("dbid_001", &parsed).expect("this one succeeded");
+        let err = check_task_result("dbid_002", &parsed).expect_err("this one did not");
+        assert!(
+            matches!(err, crate::error::Error::Dsm { code: 544, .. }),
+            "{err:?}"
+        );
     }
 }

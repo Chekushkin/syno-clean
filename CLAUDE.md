@@ -148,6 +148,13 @@ library, where it is testable.
 the log file, and holds the `tracing_appender::WorkerGuard` for the whole of
 `main` — dropping it early silently discards buffered lines.
 
+**The log level is hardcoded.** `config::init_logging` sets
+`with_max_level(tracing::Level::INFO)` and never consults `RUST_LOG`; there is no
+`--verbose` flag either. Every `tracing::debug!` and `trace!` in the crate is
+therefore dead at runtime — write them for a future level switch, but never rely
+on one for a diagnostic a user is expected to send in. Anything a bug report
+needs must be `info!` or higher. `--log-file` changes only *where* the file goes.
+
 ### First run
 
 - **A missing config *file* is never an error.** Only values still unresolved
@@ -230,21 +237,37 @@ the log file, and holds the `tracing_appender::WorkerGuard` for the whole of
 - Never build a URL or pick a version by hand. Call
   `client.call::<T>(api, method, SUPPORTED, &params)` — it resolves the
   endpoint from the discovery map, attaches `_sid`, and owns the re-login
-  retry. `call_no_data` is the variant for methods that answer with a bare
-  `{"success": true}`. `SynoClient::send` is the no-retry escape hatch and
-  exists for `auth::login`, which must not recurse into the retry that called
-  it.
+  retry. `SynoClient::send` is the no-retry escape hatch, and
+  `SynoClient::post_form` is the **POST** one: both exist for `auth::login`,
+  which must not recurse into the retry that called it. Login is the only POST
+  in the program, and it is a POST for a reason — a DSM query string is written
+  in full to the NAS's nginx access log, so `passwd=` there would persist the
+  account password to disk on every login. Only `api`/`version`/`method` ride in
+  the query.
 - Each API module declares its own `SUPPORTED: VersionRange` const (inclusive
   `(min, max)`); `pick_version_in` takes the top of the overlap with what the
   NAS advertises and errors naming both ranges when there is none.
-- Three envelope readers: `parse_envelope` (payload required),
-  `parse_envelope_optional` (payload may be absent), `check_envelope` (success
-  only, payload ignored). Logout, pause and resume answer with a bare
-  `{"success": true}`, and the retry path has to classify a response before
-  committing to a payload type — hence three, not one.
+- Two envelope readers: `parse_envelope` (payload required) and
+  `check_envelope` (success only, payload ignored). Logout, pause and resume
+  answer with a bare `{"success": true}`, and the retry path has to classify a
+  response before committing to a payload type — hence two, not one.
+  `Envelope::into_result` is the third, lower-level form when an absent payload
+  needs to stay an `Option`.
+- **A per-task result array is read for the id that was asked about**, never
+  scanned. `download_station::check_task_result(id, results)` treats an id DSM
+  reported nothing for as a *failure*; `check_task_results` (plural) is the
+  "any non-zero code" collapse behind it and is vacuously `Ok` on an empty
+  slice, which is only ever correct once the caller knows the slice covers its
+  task. For a delete, getting this wrong means the files are already gone and
+  the surviving task is reported as removed.
 - Credentials are redacted in a hand-written `Debug`. Keep it that way:
   `SynoClient` derives `Debug` and holds them, so one `{:?}` would otherwise put
   a password in the log file.
+- **The redaction guarantee covers the password, not the `sid`.** `SynoClient`'s
+  derived `Debug` prints its `sid` field, and a sid is a bearer credential (it is
+  why the session cache is `0600`). Never `{:?}` a `SynoClient` or log a raw
+  request URL, and do not tell users the log is credential-free — say the
+  password is redacted and the sid may not be.
 
 ### Two DSM shapes that are easy to get wrong
 
@@ -406,13 +429,40 @@ deleted.
   **keep new ordering logic in `delete.rs`, not in the executor.**
   `DeleteOptions` is a *parameter* rather than a field of `DeletePlan` because
   `delete_files` / `dry_run` are session state with a different lifetime from the
-  snapshot; the status the ordering keys on already lives on `DeleteItem`.
+  snapshot. `DeleteItem::status` is carried for *display* only — see below.
 - `delete::requires_pause` treats **everything except Paused / Finished / Error
   as active**, which is where `filehosting_waiting` and any `Unknown(_)` land:
   pausing an idle task costs a round trip, not pausing a live one risks DS
-  writing into the directory mid-delete. The cost is that an unrecognized status
-  whose pause DSM rejects can never be deleted by this tool — the fail-closed
-  direction.
+  writing into the directory mid-delete.
+- ⚠️ **`requires_pause` is only ever applied to a live status.**
+  `plan_delete_ops` emits `Op::Pause` unconditionally whenever files are being
+  deleted, and `event::pause_and_confirm` re-reads the task with `getinfo`
+  before deciding. `DeleteItem::status` is a snapshot as old as the confirmation
+  dialog plus the item's place in the batch queue: filtering on it meant a task
+  DSM's bandwidth schedule resumed mid-dialog was never paused, and File Station
+  then recursed through a directory DS was writing into. The live read also
+  skips the pause *call* for a genuinely idle task, so DSM's "already paused"
+  per-task error cannot fail an otherwise good delete.
+- **`DeleteItem::name_source` records where the on-disk name came from**
+  (`FileList` or `Title`), and the executor needs it: an *absent* path is only
+  read as "already cleaned up" for a file-list path. For a name guessed from the
+  display title, absence is at least as likely to mean the guess missed, and
+  removing the DSM task would destroy the only pointer to data still on the
+  volume — so it is a failure. See `event::decide_file_phase`.
+- **The existence check has four answers, not three.** `PathInfo::Unknown` is a
+  `getinfo` response carrying no entry attributable to the requested path — an
+  empty `files` array (which is what a shape this client cannot parse produces,
+  since the field is `#[serde(default)]`), or several entries none of which
+  match. It must never collapse into `Missing`: that would report "the files
+  were already gone" for every item of a batch and delete every task while
+  reclaiming nothing. For the same reason `classify_getinfo` only borrows a
+  non-matching entry when it is the *only* one.
+- **The recursive delete is confirmed by a second `path_info`**, not by
+  `path_err_num` alone. That field is `#[serde(default)]` and no real NAS
+  response has been captured to check the spelling, so a rename would make a
+  delete that removed nothing look finished and clean. Anything other than
+  "gone" — including a lookup that errors — fails the item and leaves the task
+  pointing at its data.
 - **`delete_files = false` drops the file phase *and* the pause.** The pause
   exists only to keep DS out of the way of the file delete; with no file delete a
   failed pause would block a task-only removal for nothing.
@@ -566,8 +616,13 @@ deleted.
 ### The help overlay (`dialog::HELP_SECTIONS`)
 
 - It is the keymap's public face, and it is **data, not formatted text**: a test
-  tokenizes every `keys` field and asserts each key `App` binds appears there —
-  add a binding, add a row, or the suite names the one you forgot.
+  tokenizes every `keys` field and asserts each key in a **hand-written literal
+  list** appears there. That list is *not* derived from `App`'s match arms — it
+  mirrors `handle_normal_key`, `handle_search_key` and `handle_confirm_key` by
+  hand. A new binding therefore lands in three places: the handler,
+  `HELP_SECTIONS`, and the list in
+  `dialog::tests::the_overlay_documents_every_key_the_app_binds`. Forget the
+  overlay and the test names the key; forget the test's list and nothing does.
 - The *implementation* is the source of truth for what it says (notably: `Enter`
   presses the focused button in the confirmation, and commits an already-live
   query in the search box). The README transcribes the overlay and says so, so

@@ -5,8 +5,9 @@
 //! 1. **Discovery is a special case.** `SYNO.API.Info` is served from a fixed
 //!    `/webapi/query.cgi`, *not* from the `entry.cgi` that everything else uses.
 //!    Every later URL is `{base}/webapi/{discovered path}`.
-//! 2. **No hardcoded API versions.** A caller states the version range *it*
-//!    understands; [`ApiInfoMap::pick_version`] intersects that with the range
+//! 2. **No hardcoded API versions**, bar the two deliberate pins in
+//!    `download_station` and `file_station`. A caller states the version range
+//!    *it* understands; [`ApiInfoMap::endpoint`] intersects that with the range
 //!    the NAS advertises and picks the highest version in the overlap. A
 //!    missing API is reported by DSM package name, not as a bare 102.
 //! 3. **One transparent retry.** On DSM 106 / 107 / 119 (see
@@ -16,7 +17,7 @@
 //! Testing note: per the plan there is deliberately no mock HTTP server and no
 //! trait over `reqwest`. The tested surface is therefore the pure part —
 //! envelope deserialization from JSON strings, the API-info map lookup,
-//! `pick_version`, and URL/parameter construction. The `async fn`s that
+//! `pick_version_in`, and URL/parameter construction. The `async fn`s that
 //! actually talk to a NAS are verified by running the binary.
 
 use std::collections::BTreeMap;
@@ -111,7 +112,17 @@ impl<T> Envelope<T> {
             return Ok(self.data);
         }
         match self.error {
-            Some(err) => Err(Error::dsm(err.code, api)),
+            Some(err) => {
+                // The per-item detail is the only place a File Station failure
+                // says *which* path it was about, and `Error::Dsm` carries just
+                // the code. Logged rather than folded into the message: it is
+                // free-form JSON with no shape this client can rely on, but a
+                // bug report needs it.
+                if !err.errors.is_empty() {
+                    tracing::warn!(api, code = err.code, detail = ?err.errors, "DSM per-item errors");
+                }
+                Err(Error::dsm(err.code, api))
+            }
             // A NAS that reports failure without saying why is a protocol
             // violation, not a DSM error code we can translate.
             None => Err(protocol_error(format!(
@@ -127,12 +138,6 @@ pub fn parse_envelope<T: DeserializeOwned>(body: &str, api: &str) -> Result<T> {
     envelope
         .into_result(api)?
         .ok_or_else(|| protocol_error(format!("{api} reported success but returned no data")))
-}
-
-/// Deserialize an envelope, keeping an absent payload as `None`.
-pub fn parse_envelope_optional<T: DeserializeOwned>(body: &str, api: &str) -> Result<Option<T>> {
-    let envelope: Envelope<T> = serde_json::from_str(body)?;
-    envelope.into_result(api)
 }
 
 /// Check only whether a response succeeded, ignoring any payload.
@@ -206,17 +211,13 @@ impl ApiInfoMap {
         self.apis.iter()
     }
 
-    /// The highest version both this client and the NAS understand.
-    ///
-    /// `supported` is the range *this* client implements. The result is the
-    /// top of the overlap; a non-overlapping range is an error naming both,
-    /// which is the only actionable thing to say about it.
-    pub fn pick_version(&self, api: &str, supported: VersionRange) -> Result<u32> {
-        let info = self.get(api)?;
-        pick_version_in(api, (info.min_version, info.max_version), supported)
-    }
-
     /// Everything needed to issue a request: URL, negotiated version, API name.
+    ///
+    /// The version is the highest both this client and the NAS understand:
+    /// `supported` is the range *this* client implements, and the result is the
+    /// top of its overlap with what the NAS advertises. A non-overlapping range
+    /// is an error naming both, which is the only actionable thing to say
+    /// about it.
     pub fn endpoint(&self, base_url: &str, api: &str, supported: VersionRange) -> Result<Endpoint> {
         let info = self.get(api)?;
         let version = pick_version_in(api, (info.min_version, info.max_version), supported)?;
@@ -230,7 +231,7 @@ impl ApiInfoMap {
 
 /// Intersect two inclusive version ranges and take the top of the overlap.
 ///
-/// Split out from [`ApiInfoMap::pick_version`] so the arithmetic is testable
+/// Split out from [`ApiInfoMap::endpoint`] so the arithmetic is testable
 /// without building a map.
 pub fn pick_version_in(api: &str, nas: VersionRange, supported: VersionRange) -> Result<u32> {
     let low = nas.0.max(supported.0);
@@ -304,10 +305,6 @@ impl SynoClient {
         &self.base_url
     }
 
-    pub fn apis(&self) -> &ApiInfoMap {
-        &self.apis
-    }
-
     /// The current session ID, if the client has one.
     pub fn sid(&self) -> Option<String> {
         self.read_sid().clone()
@@ -334,12 +331,7 @@ impl SynoClient {
     /// Called once at startup. Everything afterwards resolves its URL and
     /// version out of this map, so no version is ever hardcoded.
     pub async fn discover(&mut self) -> Result<()> {
-        let url = webapi_url(&self.base_url, QUERY_CGI);
-        let mut params = build_base_params(API_INFO, API_INFO_VERSION, "query");
-        params.push(("query", "all".to_string()));
-
-        let body = self.fetch_text(&url, &params).await?;
-        self.apis = ApiInfoMap::from_response(&body)?;
+        self.apis = ApiInfoMap::from_response(&self.discovery_json().await?)?;
         tracing::info!(count = self.apis.len(), "discovered DSM APIs");
         Ok(())
     }
@@ -369,18 +361,6 @@ impl SynoClient {
     ) -> Result<T> {
         let body = self.call_text(api, method, supported, params).await?;
         parse_envelope(&body, api)
-    }
-
-    /// As [`Self::call`], for methods that answer with no `data`.
-    pub async fn call_no_data(
-        &self,
-        api: &str,
-        method: &str,
-        supported: VersionRange,
-        params: &[(&str, String)],
-    ) -> Result<()> {
-        let body = self.call_text(api, method, supported, params).await?;
-        check_envelope(&body, api)
     }
 
     /// The retry seam: fetch the body, and if DSM rejected the session,
@@ -413,6 +393,33 @@ impl SynoClient {
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// One **POST** against an already-resolved endpoint, carrying `params` in
+    /// the form body instead of the query string.
+    ///
+    /// Exists for exactly one caller: [`crate::api::auth::login`]. A DSM query
+    /// string is written verbatim to the NAS's nginx access log (and to any
+    /// proxy's in between), so a `passwd=` there is the account password
+    /// persisted to disk on every login. Only the routing triple —
+    /// `api`, `version`, `method` — stays in the query.
+    pub async fn post_form(
+        &self,
+        endpoint: &Endpoint,
+        method: &str,
+        params: &[(&str, String)],
+    ) -> Result<String> {
+        let query = build_base_params(&endpoint.api, endpoint.version, method);
+        tracing::debug!(url = %endpoint.url, method, "POST");
+        let response = self
+            .http
+            .post(&endpoint.url)
+            .query(&query)
+            .form(params)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(response.text().await?)
     }
 
     /// One request against an already-resolved endpoint. No retry, no envelope
@@ -475,6 +482,11 @@ mod tests {
             min_version: min,
             max_version: max,
         }
+    }
+
+    /// Negotiate a version through the one production entry point.
+    fn sample_endpoint(map: &ApiInfoMap, api: &str, supported: VersionRange) -> Result<Endpoint> {
+        map.endpoint("https://nas.local:5001", api, supported)
     }
 
     fn sample_map() -> ApiInfoMap {
@@ -556,15 +568,13 @@ mod tests {
     fn success_without_data_is_fine_for_no_data_methods() {
         // logout / pause / resume answer with a bare `{"success": true}`.
         check_envelope(r#"{"success": true}"#, DS_TASK).expect("no-data success");
-        assert_eq!(
-            parse_envelope_optional::<Payload>(r#"{"success": true}"#, DS_TASK).expect("optional"),
-            None
-        );
-        assert_eq!(
-            parse_envelope_optional::<Payload>(r#"{"success": true, "data": null}"#, DS_TASK)
-                .expect("explicit null"),
-            None
-        );
+        check_envelope(r#"{"success": true, "data": null}"#, DS_TASK).expect("explicit null");
+
+        // The envelope itself keeps the absent payload as `None` rather than
+        // inventing one — `parse_envelope` is what turns that into an error.
+        let envelope: Envelope<Payload> =
+            serde_json::from_str(r#"{"success": true}"#).expect("valid JSON");
+        assert_eq!(envelope.into_result(DS_TASK).expect("optional"), None);
     }
 
     #[test]
@@ -650,14 +660,24 @@ mod tests {
     fn pick_version_clamps_to_the_nas_max() {
         // NAS tops out at 3, we would go to 5 — take 3.
         let map = sample_map();
-        assert_eq!(map.pick_version(DS_TASK, (1, 5)).expect("overlap"), 3);
+        assert_eq!(
+            sample_endpoint(&map, DS_TASK, (1, 5))
+                .expect("overlap")
+                .version,
+            3
+        );
     }
 
     #[test]
     fn pick_version_clamps_to_the_supported_max() {
         // The NAS offers 3 but this client only implements up to 1.
         let map = sample_map();
-        assert_eq!(map.pick_version(DS_TASK, (1, 1)).expect("overlap"), 1);
+        assert_eq!(
+            sample_endpoint(&map, DS_TASK, (1, 1))
+                .expect("overlap")
+                .version,
+            1
+        );
     }
 
     #[test]
@@ -705,9 +725,7 @@ mod tests {
 
     #[test]
     fn pick_version_on_a_missing_api_reports_the_api_not_the_range() {
-        let err = ApiInfoMap::default()
-            .pick_version(FS_LIST, (1, 2))
-            .expect_err("absent API");
+        let err = sample_endpoint(&ApiInfoMap::default(), FS_LIST, (1, 2)).expect_err("absent API");
         assert!(err.to_string().contains("not installed"), "{err}");
     }
 
@@ -757,6 +775,53 @@ mod tests {
             .endpoint("https://nas.local:5001", "SYNO.FileStation.Delete", (1, 2))
             .expect_err("absent API");
         assert!(matches!(err, Error::ApiUnavailable { .. }), "{err:?}");
+    }
+
+    // ---- the sid ----------------------------------------------------------
+
+    fn offline_client() -> SynoClient {
+        let config = ResolvedConfig {
+            host: "nas.invalid".to_string(),
+            port: 5001,
+            https: true,
+            insecure: false,
+            username: "tester".to_string(),
+            refresh_secs: 3,
+            delete_files: true,
+            dry_run: true,
+            logout: false,
+        };
+        SynoClient::new(&config).expect("building a client issues no request")
+    }
+
+    #[test]
+    fn a_fresh_client_carries_no_session_and_cannot_repair_one() {
+        let client = offline_client();
+        assert_eq!(client.sid(), None);
+        // No credentials: a rejected session has to fail rather than loop.
+        assert!(!client.can_relogin());
+        assert!(client.base_url().starts_with("https://nas.invalid:5001"));
+    }
+
+    #[test]
+    fn a_sid_can_be_seeded_replaced_and_cleared() {
+        let client = offline_client().with_sid("cached");
+        assert_eq!(client.sid().as_deref(), Some("cached"));
+
+        // The re-login path replaces rather than appends.
+        client.set_sid("renewed");
+        assert_eq!(client.sid().as_deref(), Some("renewed"));
+
+        client.clear_sid();
+        assert_eq!(client.sid(), None);
+    }
+
+    #[test]
+    fn credentials_are_what_make_the_transparent_retry_possible() {
+        let client = offline_client().with_credentials(Credentials::new("eduard", "hunter2"));
+        assert!(client.can_relogin());
+        // And the password is not reachable through the derived `Debug`.
+        assert!(!format!("{client:?}").contains("hunter2"));
     }
 
     #[test]

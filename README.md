@@ -62,8 +62,11 @@ undo in this program and no prompt beyond the one confirmation dialog.
 
 Two things to know before the first real run:
 
-- **Try `--dry-run` first.** It shows exactly the same confirmation dialog and issues
-  no destructive call at all — not even the existence check.
+- **Try `--dry-run` first.** It walks the same flow and shows the same list of tasks
+  and resolved paths, but the dialog is labelled as a dry run — `DRY RUN · ` in the
+  title, a yellow border instead of a red one, and "Dry run: nothing is deleted"
+  instead of "This cannot be undone" — and it issues no destructive call at all, not
+  even the existence check.
 - **If the share has the DSM Recycle Bin enabled, deleted data may land in `#recycle`
   and free no space.** That is a DSM setting this program does not control. Check the
   share's settings if a delete does not reclaim what you expected.
@@ -81,8 +84,11 @@ The safety model is described in [Delete safety model](#delete-safety-model) bel
   (`SYNO.FileStation.List` and `SYNO.FileStation.Delete`). Without it the tasks are
   still listed, but a delete will fail at the file phase and deliberately leave the
   task in place rather than orphan the data.
-- No API versions are hardcoded: `SYNO.API.Info` is queried at startup and each call
-  uses the newest version inside the range both the NAS and this client support.
+- API versions are negotiated, not assumed: `SYNO.API.Info` is queried at startup and
+  each call uses the newest version inside the range both the NAS and this client
+  support. The one deliberate pin is `SYNO.DownloadStation.Task`, held at **v1**
+  because the newer `DownloadStation2` shape is undocumented and encodes statuses
+  differently.
 
 ## Install
 
@@ -110,8 +116,11 @@ VERSION=0.1.0
 TARGET=aarch64-apple-darwin
 curl -fsSLO "https://github.com/emacarov/syno-clean/releases/download/v${VERSION}/syno-clean-${VERSION}-${TARGET}.tar.gz"
 tar xzf "syno-clean-${VERSION}-${TARGET}.tar.gz"
-install -m 0755 syno-clean ~/.local/bin/
+install -m 0755 "syno-clean-${VERSION}-${TARGET}/syno-clean" ~/.local/bin/
 ```
+
+Each archive unpacks into a directory of its own name holding the binary plus
+`README.md`, `LICENSE` and `CHANGELOG.md`.
 
 A single `SHA256SUMS` file covering every archive is attached to the same release, and
 its contents are repeated in the release notes.
@@ -147,7 +156,7 @@ Paths use **XDG semantics on every platform, macOS included**:
 |---|---|
 | Config | `$XDG_CONFIG_HOME/syno-clean/config.toml` (default `~/.config/syno-clean/config.toml`) |
 | Log file | `$XDG_CACHE_HOME/syno-clean/syno-clean.log` (default `~/.cache/syno-clean/syno-clean.log`) |
-| Session cache | `~/.cache/syno-clean/session.json`, mode `0600` |
+| Session cache | `$XDG_CACHE_HOME/syno-clean/session.json` (default `~/.cache/syno-clean/session.json`), mode `0600` |
 
 Logs never go to stdout — the TUI owns the terminal — so the log file is the place to
 look when something misbehaves, and the right thing to attach to a bug report.
@@ -254,8 +263,10 @@ cursor when there is not.
 | `/` | search titles |
 
 Sort keys: Name, Status, Size, Progress, ↓ Speed, ↑ Speed, Ratio, Added. That is eight
-keys against eleven columns — Seeds/Peers, ETA and Destination are **not** sortable, and
-`Added` sorts by a value that has no column of its own. Post-v1 if it is missed.
+keys against the table's ten headed columns (the table has eleven in all; the first is
+the headerless selection marker) — Seeds/Peers, ETA and Destination are **not**
+sortable, and `Added` sorts by a value that has no column of its own. Post-v1 if it is
+missed.
 
 Status filters: **All**, **Downloading**, **Seeding**, **Finished**, **Paused**,
 **Error**. `Downloading` means "in progress" and covers `downloading`, `waiting`,
@@ -282,7 +293,9 @@ applying it. Every other printable key is text — `q` types a `q`.
 | `n` `Esc` `q` | cancel |
 | `Enter` | press the **focused** button |
 | `Tab` `←` `→` `h` `l` | switch button |
-| `↑` `↓` `k` `j` | scroll the list |
+| `↑` `↓` `k` `j` | scroll the list a line |
+| `PgUp` `PgDn` | scroll the list a page |
+| `Home` `End` | jump to the first / last line |
 
 **Cancel has the focus when the dialog opens**, so a reflexive `Enter` cancels. `y` is
 the deliberate one-key confirm. `q` closes the dialog rather than the program.
@@ -311,6 +324,9 @@ tool could destroy the wrong data, so it is built to **refuse rather than guess*
    used.
 4. The destination is normalized (a leading `/volumeN` stripped, surrounding slashes
    trimmed) and joined as `/{destination}/{name}`.
+5. The normalized destination is **empty** → **the task is refused**. With no
+   destination there is no share to root the path at, and `/{name}` would name a share
+   rather than a directory inside one.
 
 ### 2. Syntactic guards
 
@@ -393,13 +409,17 @@ one.
 - **A failure *during* a session is non-fatal**: a red banner appears in the footer and
   clears itself on the next successful refresh.
 - The log file (see [Configuration](#configuration)) has the details for everything
-  above.
+  above. **It is written at `INFO` and above, and that level is fixed** — there is no
+  `--verbose` flag and `RUST_LOG` is ignored, so debug-level lines never appear. If the
+  log does not explain what happened, the only way to get more is a local build with
+  the level raised in `config::init_logging`.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). In short: `cargo fmt --all`, `cargo clippy
---all-targets -- -D warnings` and `cargo test` must all be clean, and the UI can be
-exercised offline against a captured response with no NAS in reach.
+See [CONTRIBUTING.md](CONTRIBUTING.md). In short: `cargo fmt --all -- --check`, `cargo
+clippy --all-targets -- -D warnings` and `cargo test --all` must all be clean — the
+three commands CI runs — and the UI can be exercised offline against a captured
+response with no NAS in reach.
 
 ## License
 
