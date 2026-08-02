@@ -18,11 +18,22 @@
 //!   the *overall* wait ([`DELETE_TIMEOUT`]) instead of each round trip.
 //!
 //! The existence check ([`path_info`]) is the plan's **semantic guard**: before
-//! anything is deleted, the resolved path is looked up, and a path that is not
-//! there is reported as *skipped* rather than as an error the user has to chase.
-//! For an incomplete task that is the expected answer — Download Station cleans
-//! up its own partial data — and for a finished one it usually means the folder
-//! was already removed by hand.
+//! anything is deleted, the resolved path is looked up, and what came back
+//! decides whether the recursive delete is issued at all. This module only
+//! *classifies* the answer ([`PathInfo`]); what each answer means for a
+//! particular task is `event::decide_file_phase`'s question, and the answers are
+//! not symmetric:
+//!
+//! * an **absent** path is benign only for a task whose payload need not be
+//!   there — an incomplete download, whose partial data Download Station cleans
+//!   up after itself. For a task that finished (or whose counters say it
+//!   downloaded everything) an absent path fails the item, because a payload
+//!   that demonstrably existed and is not at the resolved path means the
+//!   resolution is wrong, and removing the DSM task would orphan it;
+//! * a **present** path is only accepted when [`FileEntry::isdir`] agrees with
+//!   the kind the task resolved to, since `recursive=true` on the wrong kind of
+//!   object removes something that is not this task's payload;
+//! * an **error** or an unattributable answer is never read as absence.
 
 use std::time::{Duration, Instant};
 

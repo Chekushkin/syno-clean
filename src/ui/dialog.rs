@@ -166,7 +166,7 @@ impl Discarded {
         plan.items
             .iter()
             .filter(|item| delete::will_act(item, options))
-            .filter(|item| !delete::payload_survives_task_delete(&item.status))
+            .filter(|item| !delete::payload_survives_task_delete(&item.payload_state()))
             .fold(Self::default(), |acc, item| Self {
                 count: acc.count + 1,
                 size: acc.size + item.size,
@@ -251,7 +251,7 @@ fn item_lines(item: &DeleteItem, options: DeleteOptions) -> [SummaryLine; 2] {
                 format!(
                     "    {}  DSM task only — its on-disk location is unknown, and {}",
                     format::bytes(item.size),
-                    if delete::payload_survives_task_delete(&item.status) {
+                    if delete::payload_survives_task_delete(&item.payload_state()) {
                         "no file is touched"
                     } else {
                         "DSM discards its partial data"
@@ -1144,7 +1144,9 @@ mod tests {
             dry_run: false,
         };
         let downloading = task("dbid_001");
-        assert!(!delete::payload_survives_task_delete(&downloading.status));
+        assert!(!delete::payload_survives_task_delete(
+            &delete::PayloadState::of_task(&downloading)
+        ));
 
         let summary = build_confirmation(&plan(&["dbid_001"]), options);
         assert!(
@@ -1183,7 +1185,9 @@ mod tests {
             dry_run: false,
         };
         let waiting = task("dbid_010");
-        assert!(!delete::payload_survives_task_delete(&waiting.status));
+        assert!(!delete::payload_survives_task_delete(
+            &delete::PayloadState::of_task(&waiting)
+        ));
         assert!(
             DeletePlan::snapshot([&waiting].into_iter()).items[0].is_refused(),
             "the fixture row must be one the resolver refuses"
@@ -1205,7 +1209,7 @@ mod tests {
             dry_run: false,
         };
         assert!(delete::payload_survives_task_delete(
-            &task("dbid_013").status
+            &delete::PayloadState::of_task(&task("dbid_013"))
         ));
 
         let summary = build_confirmation(&plan(&["dbid_013"]), options);

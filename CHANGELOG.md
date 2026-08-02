@@ -50,14 +50,18 @@ version to have changed anything from.
   through Download Station. Cancel holds the focus when the dialog opens, so a reflexive
   `Enter` cancels; `y` is the one-key confirm.
 - Delete-path resolution that **refuses rather than guesses**: a torrent whose file list
-  has no single common top-level component is skipped and reported, never resolved from
-  its title.
+  has no single common top-level component — or which reports no file list at all, which
+  for a torrent is an anomaly — is skipped and reported, never resolved from its title.
 - Syntactic path guards rejecting a path that is empty, relative, the filesystem root, a
   share root, or that contains a `.`/`..` component, an empty or whitespace-only
   component, or a control character — each of which could otherwise turn into a
   recursive delete of a whole share.
 - A File Station existence check before any recursive delete, distinguishing "already
-  gone" (skip the files, still remove the task) from "an error" (touch nothing).
+  gone" (skip the files, still remove the task) from "an error" (touch nothing) — and
+  checking *what* is there, not only that something is: a path whose kind disagrees with
+  what the task resolved to is refused rather than removed recursively. A payload that
+  should exist (a finished task, or one whose counters say it downloaded everything) and
+  does not keeps its task, judged from a live read rather than the dialog's snapshot.
 - Three-phase delete ordered for recoverability: pause an active task and **confirm by
   re-reading it** that it actually stopped, then delete the files, then delete the task.
   Any phase failing skips every later phase, so a task is never removed while its data

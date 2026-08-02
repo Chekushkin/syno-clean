@@ -68,7 +68,9 @@ use tokio::task::JoinHandle;
 use crate::api::client::SynoClient;
 use crate::api::download_station;
 use crate::api::file_station::{self, PathInfo};
-use crate::delete::{self, DeleteItem, DeleteOptions, DeletePlan, NameSource, Op};
+use crate::delete::{
+    self, DeleteItem, DeleteOptions, DeletePlan, ExpectedKind, NameSource, Op, PayloadState,
+};
 use crate::error::{Error, Result};
 use crate::model::Task;
 
@@ -438,9 +440,15 @@ async fn delete_one(
     }
 
     let mut files_were_already_gone = false;
+    // Filled in by the pause phase, which reads the task's *current* state one
+    // instant before the file phase needs it. The snapshot on `item` is as old
+    // as the dialog plus this item's place in the queue — minutes, for a batch
+    // of twenty — and a task that finished in that window would otherwise have
+    // an absent payload waved through as ordinary partial data.
+    let mut live: Option<delete::PayloadState> = None;
 
     for (index, op) in ops.iter().enumerate() {
-        match run_op(client, item, op, options, deleted).await {
+        match run_op(client, item, op, options, deleted, &mut live).await {
             OpOutcome::Done => {}
             OpOutcome::NothingThere => files_were_already_gone = true,
             OpOutcome::Failed(why) => {
@@ -479,6 +487,29 @@ enum OpOutcome {
     Failed(String),
 }
 
+/// What resolution worked out about the path being checked: where the name came
+/// from, and what should be found there.
+///
+/// The two are carried together because they are the two halves of the same
+/// question — [`NameSource`] says how to read an *absent* answer,
+/// [`ExpectedKind`] how to read a *present* one — and because a five-argument
+/// decision function invites a caller to line the wrong ones up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileTarget {
+    name_source: Option<NameSource>,
+    expected_kind: ExpectedKind,
+}
+
+impl FileTarget {
+    /// What the snapshot resolved for this item.
+    fn of_item(item: &DeleteItem) -> Self {
+        FileTarget {
+            name_source: item.name_source,
+            expected_kind: item.expected_kind,
+        }
+    }
+}
+
 /// What the pre-delete existence check means for the file phase.
 ///
 /// Pure, and separated from the I/O for exactly one reason: the difference
@@ -505,15 +536,62 @@ enum OpOutcome {
 ///   *destination* rather than at a cleanup — see
 ///   [`crate::delete::payload_should_exist`]. Both keep the task, so the data
 ///   stays reachable; both name `--no-delete-files` as the way out.
+///
+/// **A path that exists is not automatically the right path.** The lookup
+/// reports what *kind* of object is there, and resolution knows what kind it
+/// resolved ([`ExpectedKind`]): a multi-file torrent's root is a directory, a
+/// single-file one's is the file. A file where a directory was expected — or
+/// the reverse — means the name matched something that is not this task's
+/// payload, and the delete that follows is `recursive=true`. That is refused,
+/// because the alternative is removing an unrelated tree.
+///
+/// The state the payload questions are asked of is [`PayloadState`], which the
+/// caller fills from the **live** read taken by the pause phase, falling back to
+/// the confirmation snapshot only when there was no live read.
 fn decide_file_phase(
     info: PathInfo,
     path: &str,
-    name_source: Option<NameSource>,
-    status: &crate::model::TaskStatus,
+    target: FileTarget,
+    payload: &PayloadState,
     already_deleted: bool,
 ) -> OpOutcome {
+    let FileTarget {
+        name_source,
+        expected_kind,
+    } = target;
+
     match info {
-        PathInfo::Found { .. } => OpOutcome::Done,
+        PathInfo::Found { is_dir } if expected_kind.accepts(is_dir) => {
+            if expected_kind == ExpectedKind::Unknown {
+                // Rule 3 resolved this name from the title, so nothing said
+                // which kind to expect. Accepted deliberately — see
+                // `ExpectedKind::Unknown` — but logged, because a directory
+                // where a downloaded file was expected is the shape of a name
+                // collision.
+                tracing::info!(
+                    path,
+                    is_dir,
+                    "the expected kind is unknown for a title-named path; accepting what is there"
+                );
+            }
+            OpOutcome::Done
+        }
+        PathInfo::Found { is_dir } => {
+            tracing::warn!(
+                path,
+                is_dir,
+                expected = expected_kind.label(),
+                "the object at the resolved path is not the kind the task resolved to"
+            );
+            OpOutcome::Failed(format!(
+                "{path} is {}, but this task's files say it should be {} — the path is not \
+                 this task's payload, and deleting it recursively would remove something \
+                 else; refusing (use --no-delete-files to remove the task without touching \
+                 the volume)",
+                if is_dir { "a directory" } else { "a file" },
+                expected_kind.label()
+            ))
+        }
 
         PathInfo::Missing if already_deleted => {
             tracing::info!(path, "already deleted by this run; treating as gone");
@@ -527,9 +605,9 @@ fn decide_file_phase(
              the task anyway)"
             ))
         }
-        PathInfo::Missing if delete::payload_should_exist(status) => OpOutcome::Failed(format!(
-            "nothing at {path}, but this task has finished, so its data should be there — \
-             the resolved location is more likely wrong than the files already gone; \
+        PathInfo::Missing if delete::payload_should_exist(payload) => OpOutcome::Failed(format!(
+            "nothing at {path}, but this task has finished downloading, so its data should be \
+             there — the resolved location is more likely wrong than the files already gone; \
              refusing to delete the task, which would leave no pointer to the payload \
              (use --no-delete-files to remove the task anyway)"
         )),
@@ -549,13 +627,35 @@ fn decide_file_phase(
     }
 }
 
+/// Which read of the task the file phase asks "should the payload be there".
+///
+/// **The live one whenever there is one.** The pause phase fetched the task's
+/// state moments ago; [`DeleteItem::status`] was frozen when the confirmation
+/// dialog opened, and for the twentieth item of a batch that can be minutes
+/// old — long enough for a task that was downloading to finish. Judged from the
+/// stale read, that task's absent payload looks like ordinary partial data and
+/// the DSM task is removed; judged from the live one, it fails and the row
+/// survives to point at data that is still somewhere.
+///
+/// The snapshot is the fallback for the case with no live read at all: a pause
+/// that answered with no entry for this id, or a dry run (which never reaches
+/// the lookup anyway).
+fn payload_for_file_phase(live: Option<&PayloadState>, item: &DeleteItem) -> PayloadState {
+    live.cloned().unwrap_or_else(|| item.payload_state())
+}
+
 /// Carry out one phase.
+///
+/// `live` is the pause phase's output and the file phase's input: whatever DSM
+/// said about the task when the pause phase looked, or `None` if it never did
+/// (a dry run, or a pause that failed before the read). See [`delete_one`].
 async fn run_op(
     client: &SynoClient,
     item: &DeleteItem,
     op: &Op,
     options: DeleteOptions,
     deleted: &DeletedPaths,
+    live: &mut Option<PayloadState>,
 ) -> OpOutcome {
     match op {
         Op::Pause => {
@@ -564,7 +664,10 @@ async fn run_op(
                 return OpOutcome::Done;
             }
             match pause_and_confirm(client, &item.id).await {
-                Ok(()) => OpOutcome::Done,
+                Ok(state) => {
+                    *live = state;
+                    OpOutcome::Done
+                }
                 Err(err) => OpOutcome::Failed(format!("could not pause it: {err}")),
             }
         }
@@ -588,11 +691,13 @@ async fn run_op(
                 Err(err) => return OpOutcome::Failed(format!("could not check {path}: {err}")),
             };
 
+            let payload = payload_for_file_phase(live.as_ref(), item);
+
             match decide_file_phase(
                 info,
                 path,
-                item.name_source,
-                &item.status,
+                FileTarget::of_item(item),
+                &payload,
                 deleted.contains(path),
             ) {
                 OpOutcome::Done => {}
@@ -774,16 +879,27 @@ fn task_with_id<'a>(tasks: &'a [Task], id: &str) -> Option<&'a Task> {
 /// recursed through while it was writing. An idle task costs one `getinfo` and
 /// no pause call — which also avoids DSM's "already paused" per-task error
 /// turning a perfectly good delete into a failure.
-async fn pause_and_confirm(client: &SynoClient, id: &str) -> Result<()> {
+///
+/// **The same read is handed back for the file phase to use**, as the freshest
+/// answer available to "should this task's payload be on the volume". It is the
+/// state read *before* any pause was issued, deliberately: pausing a seeding
+/// task and then reporting `Paused` would turn a task whose payload must exist
+/// into one whose absence looks ordinary — the check would defeat itself.
+///
+/// `Ok(None)` means the read carried no entry for this id (the fail-safe case
+/// [`pause_needed`] documents): the task was paused anyway, and the file phase
+/// falls back to the snapshot rather than to a state DSM never described.
+async fn pause_and_confirm(client: &SynoClient, id: &str) -> Result<Option<PayloadState>> {
     let ids = [id.to_string()];
 
     let current = download_station::task_info(client, &ids).await?;
+    let live = task_with_id(&current, id).map(PayloadState::of_task);
     if !pause_needed(task_with_id(&current, id)) {
         // `info!`, not `debug!`: the log level is hardcoded to INFO, and
         // "this task was never paused" is exactly the line a bug report about a
         // directory deleted mid-write would need.
         tracing::info!(id, "the task is already inactive; no pause is needed");
-        return Ok(());
+        return Ok(live);
     }
 
     let results = download_station::pause_tasks(client, &ids).await?;
@@ -793,7 +909,7 @@ async fn pause_and_confirm(client: &SynoClient, id: &str) -> Result<()> {
     loop {
         let current = download_station::task_info(client, &ids).await?;
         if !pause_needed(task_with_id(&current, id)) {
-            return Ok(());
+            return Ok(live);
         }
 
         if Instant::now() + PAUSE_CONFIRM_INTERVAL >= deadline {
@@ -1095,7 +1211,7 @@ mod tests {
     // the per-task result array.
 
     use crate::api::download_station::TaskOpResult;
-    use crate::testutil::{fixture_tasks, offline_client};
+    use crate::testutil::{fixture_task, fixture_tasks, offline_client};
 
     /// A client that cannot reach anything; see [`crate::testutil::offline_client`]
     /// for why an empty API map is what makes the no-call assertions below
@@ -1370,11 +1486,13 @@ mod tests {
             id: "dbid_001".to_string(),
             title: "Corrupted.Plan".to_string(),
             size: 1024,
+            downloaded: 1024,
             status: crate::model::TaskStatus::Finished,
             // A share root: `resolve_delete_target` can never produce one, so the
             // only way it arrives here is a bug between the snapshot and now.
             target: delete::Target::Path("/downloads".to_string()),
             name_source: Some(NameSource::FileList),
+            expected_kind: ExpectedKind::Dir,
         };
         let plan = DeletePlan { items: vec![item] };
 
@@ -1412,14 +1530,32 @@ mod tests {
     // reclaimed, somebody had already reclaimed it, or the files are still
     // there and the task pointing at them is about to be destroyed.
 
+    /// A path named from the file list, expected to be a directory — what a
+    /// multi-file torrent resolves to, and the ordinary shape.
+    fn dir_from_file_list() -> FileTarget {
+        FileTarget {
+            name_source: Some(NameSource::FileList),
+            expected_kind: ExpectedKind::Dir,
+        }
+    }
+
+    /// A task that has written some but not all of its payload.
+    fn partial(status: TaskStatus) -> PayloadState {
+        PayloadState {
+            status,
+            downloaded: 512,
+            size: 1024,
+        }
+    }
+
     /// The pre-delete decision for an incomplete task whose path came from its
     /// file list — the ordinary case, with no memory of an earlier delete.
     fn file_phase(info: PathInfo) -> OpOutcome {
         decide_file_phase(
             info,
             "/downloads/X",
-            Some(NameSource::FileList),
-            &TaskStatus::Downloading,
+            dir_from_file_list(),
+            &partial(TaskStatus::Downloading),
             false,
         )
     }
@@ -1430,6 +1566,102 @@ mod tests {
             file_phase(PathInfo::Found { is_dir: true }),
             OpOutcome::Done
         );
+    }
+
+    #[test]
+    fn a_file_where_the_task_wrote_a_directory_is_refused() {
+        // The gap every "does the path exist" check leaves: the path exists,
+        // but it is not the object this task resolved to. A multi-file torrent
+        // wrote a *directory*; if a file of that name is what is there, the
+        // resolution matched something else — and the delete that follows is
+        // recursive.
+        let outcome = decide_file_phase(
+            PathInfo::Found { is_dir: false },
+            "/downloads/X",
+            dir_from_file_list(),
+            &partial(TaskStatus::Seeding),
+            false,
+        );
+        assert!(
+            matches!(&outcome, OpOutcome::Failed(why)
+                if why.contains("a file") && why.contains("a directory")
+                    && why.contains("--no-delete-files")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_directory_where_the_task_wrote_a_file_is_refused() {
+        // The other direction, and the one that costs the most: a single-file
+        // torrent resolves to the file itself, so a *directory* of that name is
+        // somebody else's folder about to be removed recursively.
+        let outcome = decide_file_phase(
+            PathInfo::Found { is_dir: true },
+            "/downloads/X.iso",
+            FileTarget {
+                name_source: Some(NameSource::FileList),
+                expected_kind: ExpectedKind::File,
+            },
+            &partial(TaskStatus::Finished),
+            false,
+        );
+        assert!(
+            matches!(&outcome, OpOutcome::Failed(why)
+                if why.contains("a directory") && why.contains("a file")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_matching_kind_is_deleted_in_both_directions() {
+        assert_eq!(
+            decide_file_phase(
+                PathInfo::Found { is_dir: true },
+                "/downloads/X",
+                dir_from_file_list(),
+                &partial(TaskStatus::Seeding),
+                false,
+            ),
+            OpOutcome::Done
+        );
+        assert_eq!(
+            decide_file_phase(
+                PathInfo::Found { is_dir: false },
+                "/downloads/X.iso",
+                FileTarget {
+                    name_source: Some(NameSource::FileList),
+                    expected_kind: ExpectedKind::File,
+                },
+                &partial(TaskStatus::Seeding),
+                false,
+            ),
+            OpOutcome::Done
+        );
+    }
+
+    #[test]
+    fn a_title_named_path_accepts_either_kind() {
+        // Rule 3 has no file list to say which kind to expect, and refusing on
+        // a guess about DSM's unpack behaviour would strand every HTTP/NZB task
+        // this fallback exists for. Deliberate, documented, and logged — not an
+        // oversight. The strictness for these paths lives on the *absent*
+        // branch instead.
+        for is_dir in [true, false] {
+            assert_eq!(
+                decide_file_phase(
+                    PathInfo::Found { is_dir },
+                    "/downloads/X",
+                    FileTarget {
+                        name_source: Some(NameSource::Title),
+                        expected_kind: ExpectedKind::Unknown,
+                    },
+                    &partial(TaskStatus::Finished),
+                    false,
+                ),
+                OpOutcome::Done,
+                "is_dir={is_dir}"
+            );
+        }
     }
 
     #[test]
@@ -1447,8 +1679,8 @@ mod tests {
                 decide_file_phase(
                     PathInfo::Missing,
                     "/downloads/X",
-                    Some(NameSource::FileList),
-                    &status,
+                    dir_from_file_list(),
+                    &partial(status.clone()),
                     false
                 ),
                 OpOutcome::NothingThere,
@@ -1471,13 +1703,38 @@ mod tests {
             let outcome = decide_file_phase(
                 PathInfo::Missing,
                 "/downloads/X",
-                Some(NameSource::FileList),
-                &status,
+                dir_from_file_list(),
+                &partial(status.clone()),
                 false,
             );
             assert!(
                 matches!(&outcome, OpOutcome::Failed(why)
                     if why.contains("finished") && why.contains("--no-delete-files")),
+                "{status}: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_path_on_a_fully_downloaded_task_keeps_the_task_whatever_its_status() {
+        // Status alone is a poor proxy for "did this task write a payload": a
+        // task paused at 100%, or one that errored after completing, has the
+        // whole thing on disk. Reading the status set alone called both of
+        // these benign and removed the task.
+        for status in [TaskStatus::Paused, TaskStatus::Error] {
+            let outcome = decide_file_phase(
+                PathInfo::Missing,
+                "/downloads/X",
+                dir_from_file_list(),
+                &PayloadState {
+                    status: status.clone(),
+                    downloaded: 1024,
+                    size: 1024,
+                },
+                false,
+            );
+            assert!(
+                matches!(&outcome, OpOutcome::Failed(why) if why.contains("--no-delete-files")),
                 "{status}: {outcome:?}"
             );
         }
@@ -1493,8 +1750,11 @@ mod tests {
                 decide_file_phase(
                     PathInfo::Missing,
                     "/downloads/X",
-                    Some(source),
-                    &TaskStatus::Finished,
+                    FileTarget {
+                        name_source: Some(source),
+                        expected_kind: ExpectedKind::Dir,
+                    },
+                    &partial(TaskStatus::Finished),
                     true
                 ),
                 OpOutcome::NothingThere,
@@ -1512,8 +1772,11 @@ mod tests {
         let outcome = decide_file_phase(
             PathInfo::Missing,
             "/downloads/X",
-            Some(NameSource::Title),
-            &TaskStatus::Downloading,
+            FileTarget {
+                name_source: Some(NameSource::Title),
+                expected_kind: ExpectedKind::Unknown,
+            },
+            &partial(TaskStatus::Downloading),
             false,
         );
         assert!(
@@ -1525,12 +1788,76 @@ mod tests {
             decide_file_phase(
                 PathInfo::Missing,
                 "/downloads/X",
-                None,
-                &TaskStatus::Downloading,
+                FileTarget {
+                    name_source: None,
+                    expected_kind: ExpectedKind::Unknown,
+                },
+                &partial(TaskStatus::Downloading),
                 false
             ),
             OpOutcome::Failed(_)
         ));
+    }
+
+    // ---- which read of the task the file phase judges from ------------------
+
+    #[test]
+    fn a_live_read_beats_the_confirmation_snapshot() {
+        // The staleness that deletes a task: the dialog opened while dbid_001
+        // was downloading, the batch took minutes to reach it, and by the time
+        // the pause phase looked it had finished. Judged from the snapshot an
+        // absent payload is ordinary partial data and the row goes; judged from
+        // the live read it is a resolution that missed, and the row stays.
+        let item = &DeletePlan::snapshot([&fixture_task("dbid_001")]).items[0];
+        assert_eq!(item.status, TaskStatus::Downloading);
+        assert!(!delete::payload_should_exist(&item.payload_state()));
+
+        let live = PayloadState {
+            status: TaskStatus::Finished,
+            downloaded: item.size,
+            size: item.size,
+        };
+        let chosen = payload_for_file_phase(Some(&live), item);
+        assert_eq!(chosen, live);
+        assert!(delete::payload_should_exist(&chosen));
+
+        let outcome = decide_file_phase(
+            PathInfo::Missing,
+            "/downloads/X",
+            FileTarget::of_item(item),
+            &chosen,
+            false,
+        );
+        assert!(
+            matches!(&outcome, OpOutcome::Failed(why) if why.contains("--no-delete-files")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn the_snapshot_is_used_only_when_no_live_read_was_taken() {
+        // A `getinfo` that carried no entry for this id, or a dry run: there is
+        // nothing fresher to judge from, and the snapshot is still better than
+        // nothing.
+        let item = &DeletePlan::snapshot([&fixture_task("dbid_003")]).items[0];
+        assert_eq!(
+            payload_for_file_phase(None, item),
+            item.payload_state(),
+            "a missing live read falls back rather than assuming anything"
+        );
+    }
+
+    #[test]
+    fn a_live_state_is_read_off_the_task_dsm_answered_with() {
+        let task = fixture_task("dbid_001");
+        assert_eq!(
+            PayloadState::of_task(&task),
+            PayloadState {
+                status: task.status.clone(),
+                downloaded: task.downloaded,
+                size: task.size,
+            }
+        );
     }
 
     #[test]

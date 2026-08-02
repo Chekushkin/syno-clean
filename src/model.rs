@@ -123,6 +123,110 @@ impl std::fmt::Display for TaskStatus {
     }
 }
 
+/// The v1 `type` field — which protocol Download Station used to fetch the
+/// task.
+///
+/// It is not display data: `delete.rs` reads it to decide whether an **absent
+/// file list** is ordinary or anomalous. An HTTP, FTP, NZB or eMule task has no
+/// `additional.file` block at all, so its on-disk name can only come from the
+/// title; a BitTorrent task always has one, so a BT task that arrives without
+/// it is a task this client cannot safely name a directory for. See
+/// [`crate::delete::resolve_delete_target`].
+///
+/// [`TaskType::Unknown`] keeps the raw string, and — like [`TaskStatus`] — a
+/// type this client cannot name never drops a row.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(from = "String")]
+pub enum TaskType {
+    /// BitTorrent. **The one type whose file list is mandatory.**
+    BitTorrent,
+    Http,
+    Https,
+    Ftp,
+    Ftps,
+    Nzb,
+    Emule,
+    /// A type string this client does not recognize, kept verbatim. Also what
+    /// a task listed with no `type` at all becomes (the empty string).
+    Unknown(String),
+}
+
+impl TaskType {
+    /// Map a DSM type string onto a variant. Case and surrounding whitespace
+    /// are ignored, exactly as for [`TaskStatus::from_dsm_str`].
+    pub fn from_dsm_str(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "bt" => TaskType::BitTorrent,
+            "http" => TaskType::Http,
+            "https" => TaskType::Https,
+            "ftp" => TaskType::Ftp,
+            "ftps" => TaskType::Ftps,
+            "nzb" => TaskType::Nzb,
+            "emule" => TaskType::Emule,
+            _ => TaskType::Unknown(raw.trim().to_string()),
+        }
+    }
+
+    /// The DSM spelling of this type. Round-trips [`Self::from_dsm_str`].
+    pub fn as_dsm_str(&self) -> &str {
+        match self {
+            TaskType::BitTorrent => "bt",
+            TaskType::Http => "http",
+            TaskType::Https => "https",
+            TaskType::Ftp => "ftp",
+            TaskType::Ftps => "ftps",
+            TaskType::Nzb => "nzb",
+            TaskType::Emule => "emule",
+            TaskType::Unknown(raw) => raw,
+        }
+    }
+
+    /// Whether DSM should always have sent a file list for this task.
+    ///
+    /// **Only BitTorrent answers yes**, and only BitTorrent is treated as
+    /// anomalous when the list is missing: a torrent's `additional.file` block
+    /// is the metadata the client downloaded before it wrote anything, so it is
+    /// there for every BT task DSM knows about. Every other type — including an
+    /// unrecognized one — is left to the title fallback, because refusing a
+    /// type this client has simply never heard of would strand tasks over a
+    /// string comparison.
+    pub fn file_list_is_mandatory(&self) -> bool {
+        matches!(self, TaskType::BitTorrent)
+    }
+
+    /// Every recognized variant, so a test can walk them rather than trusting
+    /// two `match` arms to stay in step.
+    pub const KNOWN: [TaskType; 7] = [
+        TaskType::BitTorrent,
+        TaskType::Http,
+        TaskType::Https,
+        TaskType::Ftp,
+        TaskType::Ftps,
+        TaskType::Nzb,
+        TaskType::Emule,
+    ];
+}
+
+impl Default for TaskType {
+    /// A task listed with no `type` — the same reasoning as
+    /// [`TaskStatus::default`]: one absent field must not reject the response.
+    fn default() -> Self {
+        TaskType::Unknown(String::new())
+    }
+}
+
+impl From<String> for TaskType {
+    fn from(raw: String) -> Self {
+        TaskType::from_dsm_str(&raw)
+    }
+}
+
+impl std::fmt::Display for TaskType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_dsm_str())
+    }
+}
+
 /// One entry of `additional.file`.
 ///
 /// The v1 API returns **objects**, not bare filename strings, and `filename`
@@ -151,6 +255,9 @@ pub struct Task {
     pub id: String,
     pub title: String,
     pub status: TaskStatus,
+    /// Which protocol fetched this task. Read by the delete path, not by the
+    /// table; see [`TaskType`].
+    pub task_type: TaskType,
     /// Total size of the task in bytes, as DSM reports it.
     pub size: u64,
     pub downloaded: u64,
@@ -231,6 +338,8 @@ struct RawTask {
     title: String,
     #[serde(default)]
     status: TaskStatus,
+    #[serde(default, rename = "type")]
+    task_type: TaskType,
     #[serde(default, deserialize_with = "de_u64")]
     size: u64,
     /// Absent whenever the caller did not ask for `additional`, and absent per
@@ -284,6 +393,7 @@ impl From<RawTask> for Task {
             id: raw.id,
             title: raw.title,
             status: raw.status,
+            task_type: raw.task_type,
             size: raw.size,
             downloaded: transfer.size_downloaded,
             uploaded: transfer.size_uploaded,
@@ -516,6 +626,62 @@ mod tests {
         let unknown = TaskStatus::Unknown("captcha_needed".into());
         assert_eq!(TaskStatus::from_dsm_str("captcha_needed"), unknown);
         assert_eq!(unknown.to_string(), "captcha_needed");
+    }
+
+    // ---- types ------------------------------------------------------------
+
+    #[test]
+    fn the_task_type_is_parsed_off_the_wire() {
+        // Not decoration: `delete.rs` refuses a BitTorrent task whose file list
+        // is missing, and can only tell which those are from this field.
+        assert_eq!(task("dbid_001").task_type, TaskType::BitTorrent);
+        assert_eq!(task("dbid_007").task_type, TaskType::Http);
+        assert_eq!(task("dbid_010").task_type, TaskType::Nzb);
+    }
+
+    #[test]
+    fn every_type_string_round_trips() {
+        for task_type in TaskType::KNOWN {
+            assert_eq!(
+                TaskType::from_dsm_str(task_type.as_dsm_str()),
+                task_type,
+                "{task_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_type_is_kept_verbatim_rather_than_assumed_to_be_a_torrent() {
+        // The direction matters: guessing BitTorrent for a type this client has
+        // never seen would refuse every such task's delete.
+        let invented = TaskType::from_dsm_str("magnet_v3");
+        assert_eq!(invented, TaskType::Unknown("magnet_v3".into()));
+        assert!(!invented.file_list_is_mandatory());
+        assert_eq!(invented.to_string(), "magnet_v3");
+    }
+
+    #[test]
+    fn a_task_listed_with_no_type_parses_and_is_not_treated_as_a_torrent() {
+        let task = task_from(r#"{"id": "x", "title": "t"}"#);
+        assert_eq!(task.task_type, TaskType::default());
+        assert!(!task.task_type.file_list_is_mandatory());
+    }
+
+    #[test]
+    fn only_bittorrent_must_have_a_file_list() {
+        for task_type in TaskType::KNOWN {
+            assert_eq!(
+                task_type.file_list_is_mandatory(),
+                task_type == TaskType::BitTorrent,
+                "{task_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn type_parsing_ignores_case_and_surrounding_whitespace() {
+        assert_eq!(TaskType::from_dsm_str(" BT "), TaskType::BitTorrent);
+        assert_eq!(TaskType::from_dsm_str("NZB"), TaskType::Nzb);
     }
 
     #[test]
