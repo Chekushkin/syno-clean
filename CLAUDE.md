@@ -240,6 +240,57 @@ nothing about what the NAS sends.
 - For **incomplete** tasks, "path not found" during the file phase counts as
   success — Download Station cleans up its own partial data.
 
+### How the ordering is expressed (`delete.rs` + `event.rs`)
+
+- The **rules are pure**: `delete::plan_delete_ops(item, options) -> Vec<Op>`
+  is the table above as data, and `delete::ops_cancelled_by(ops, failed_at)` is
+  the "a failed phase cancels every later phase" half. Both are unit-tested with
+  no network. `event::spawn_delete` is the I/O and the accounting around them —
+  keep new ordering logic in `delete.rs`, not in the executor.
+- `delete::requires_pause` treats **everything except Paused / Finished / Error
+  as active**. The plan's table names only nine of the ten statuses, so
+  `filehosting_waiting` and any `Unknown(_)` fall here: pausing an idle task
+  costs a round trip, not pausing a live one risks DS writing into the directory
+  mid-delete.
+- **`delete_files = false` drops the file phase *and* the pause.** The pause
+  exists only to keep DS out of the way of the file delete; with no file delete
+  a failed pause would block a task-only removal for nothing.
+- **A refused item (`Target::Refused`) gets an empty op list** — not even the
+  DSM task goes. The dialog already showed the row as SKIPPED, and removing the
+  task would orphan precisely the data whose location is in doubt.
+- **`validate_path` is re-run immediately before every File Station call**, on
+  top of having run when the snapshot was taken. The value crossed a task
+  boundary in between and the next call has no undo.
+- **`--dry-run` issues no call at all** — not even the `getinfo` existence
+  check. Every phase logs what it would do and the item is reported as a *skip*,
+  so the footer can never read "3 succeeded" for a run that deleted nothing.
+
+### Two DSM shapes that are easy to get wrong
+
+- **`delete` / `pause` / `resume` report failure per task, not in the
+  envelope**: `{"success": true, "data": [{"id": …, "error": 544}]}`. Always run
+  the result array through `download_station::check_task_results`; reading only
+  `success` reports a failed delete as a success.
+- **`getinfo` distinguishes three answers, and so does `PathInfo`**: `Missing`
+  (skip the file phase, still delete the task), `Found`, and `Error(code)` —
+  a permission problem is *not* absence, and collapsing the two would delete the
+  task and strand the files. A pause is likewise confirmed by re-reading the
+  task (`download_station::task_info`), because DSM accepting a `pause` is not
+  the same as the task having stopped.
+- A File Station failure with no DSM code behind it (a `status` poll reporting
+  `path_err_num > 0`, or the bounded wait running out) reuses `Error::Io`,
+  the same way protocol violations reuse `Error::Parse`. Do not add variants.
+
+### Op tasks (`event::OpContext`)
+
+Anything long-running gets an `OpContext { client, tx, refresh }`, runs off the
+loop, reports per item with `AppEvent::OpProgress` and once at the end with
+`OpDone`, and then pokes `refresh` — one refresh per batch, not per item. `App`
+renders the report through `app::op_summary`, which names only the non-zero
+categories and marks any batch containing a failure. **The report goes in
+`status_message`, never the error banner**: the batch's own refresh would clear
+the banner a moment after it appeared.
+
 ## Path-safety invariants (the dangerous part)
 
 Resolution order in `delete.rs`, and it **refuses rather than guesses**:
