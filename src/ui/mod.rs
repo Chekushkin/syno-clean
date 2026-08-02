@@ -44,11 +44,11 @@ use crate::view::{StatusFilter, View};
 pub type Backend = CrosstermBackend<Stdout>;
 
 /// Footer hints in [`crate::app::Mode::Normal`]. The full list is the `?`
-/// overlay (Task 17); this is the reminder that it exists.
+/// overlay ([`dialog::HELP_SECTIONS`]); this is the reminder that it exists.
 const NORMAL_HINTS: &str = "d delete · p/u pause/resume · r refresh · q quit · ? help";
 
 /// Footer hints while the search box has focus.
-const SEARCH_HINTS: &str = "Enter apply · Esc cancel";
+const SEARCH_HINTS: &str = "Enter commit · Esc cancel";
 
 /// Prefix on the non-fatal error banner, so a failure is recognizable as one
 /// even where colour is unavailable.
@@ -198,11 +198,15 @@ pub fn render(frame: &mut Frame, app: &App) {
     ])
     .areas(frame.area());
 
-    render_title_bar(frame, app, header);
-    if app.visible_count() == 0 {
+    // One [`App::visible`] for the whole frame. It filters, searches and sorts
+    // on every call, and the title bar, the empty-state test and the table all
+    // ask the same question.
+    let visible = app.visible();
+    render_title_bar(frame, app, header, visible.len());
+    if visible.is_empty() {
         frame.render_widget(empty_state(app), body);
     } else {
-        table::render(frame, app, body);
+        table::render(frame, app, body, &visible);
     }
     frame.render_widget(footer_bar(app), footer);
 
@@ -230,7 +234,12 @@ pub fn render(frame: &mut Frame, app: &App) {
 /// The title bar: what this is on the left, how much of it is on screen on the
 /// right, drawn as two halves of one reversed line so the bar stays solid
 /// across the full width.
-fn render_title_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+fn render_title_bar(
+    frame: &mut Frame,
+    app: &App,
+    area: ratatui::layout::Rect,
+    visible_count: usize,
+) {
     let style = Style::default().add_modifier(Modifier::REVERSED);
     frame.render_widget(Block::default().style(style), area);
 
@@ -240,7 +249,7 @@ fn render_title_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let title = format!(" {} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     frame.render_widget(Paragraph::new(Line::from(title)).style(style), left);
 
-    let counts = format!("{} / {} tasks ", app.visible_count(), app.tasks.len());
+    let counts = format!("{visible_count} / {} tasks ", app.tasks.len());
     frame.render_widget(
         Paragraph::new(Line::from(counts))
             .style(style)
@@ -262,8 +271,10 @@ fn render_title_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 ///   [`narrowing_summary`]), then name the keys that widen it again
 ///
 /// The test for which one to draw is [`App::tasks`] being empty, *not*
-/// [`View::is_narrowed`]: with zero tasks and a filter set, both are true and
-/// only the first is the user's actual problem.
+/// whether the view narrows anything: with zero tasks and a filter set both are
+/// true, and only the first is the user's actual problem. That is why no
+/// `View::is_narrowed` predicate exists — the one caller it would have had must
+/// not use it.
 ///
 /// There is a **third** state in front of both: before the first poll has come
 /// back — and permanently, if every poll fails — there is no list to describe.
@@ -427,17 +438,9 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
-    use crate::api::client::parse_envelope;
-    use crate::model::{Task, TaskList};
+    use crate::model::Task;
+    use crate::testutil::fixture_tasks;
     use crate::view::StatusFilter;
-
-    const FIXTURE: &str = include_str!("../../tests/fixtures/task_list.json");
-
-    fn fixture_tasks() -> Vec<Task> {
-        parse_envelope::<TaskList>(FIXTURE, "SYNO.DownloadStation.Task")
-            .expect("the fixture must parse")
-            .tasks
-    }
 
     /// Render one frame at `width` x `height` and return it as plain text, one
     /// `String` per row.
@@ -773,7 +776,6 @@ mod tests {
         let mut app = loaded_empty();
         app.view.filter = StatusFilter::Seeding;
         app.view.search = "anything".to_string();
-        assert!(app.view.is_narrowed());
 
         let text = frame_words(&app, 90, 8);
         assert!(text.contains("No Download Station tasks"), "{text}");

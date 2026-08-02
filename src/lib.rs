@@ -17,3 +17,8 @@ pub mod format;
 pub mod model;
 pub mod ui;
 pub mod view;
+
+/// Fixtures and stubs shared by the unit tests; compiled only under `cargo
+/// test` on this crate.
+#[cfg(test)]
+pub mod testutil;

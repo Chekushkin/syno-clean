@@ -69,7 +69,7 @@ use crate::api::client::SynoClient;
 use crate::api::download_station;
 use crate::api::file_station::{self, PathInfo};
 use crate::delete::{self, DeleteItem, DeleteOptions, DeletePlan, NameSource, Op};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::model::Task;
 
 /// How many events may queue before a sender has to wait.
@@ -116,7 +116,8 @@ pub enum AppEvent {
     Tasks(Vec<Task>),
     /// A non-fatal failure to report in the footer. The program keeps running.
     Error(String),
-    /// One step of a multi-task operation finished (Tasks 15 and 16).
+    /// One step of a multi-task operation finished — see [`spawn_delete`] and
+    /// [`spawn_task_op`].
     OpProgress {
         op: OpKind,
         /// How many items of the batch are done.
@@ -126,7 +127,7 @@ pub enum AppEvent {
         /// What just happened, ready to show in the footer.
         detail: String,
     },
-    /// A whole operation finished (Tasks 15 and 16).
+    /// A whole operation finished — see [`spawn_delete`] and [`spawn_task_op`].
     OpDone {
         op: OpKind,
         succeeded: usize,
@@ -778,7 +779,10 @@ async fn pause_and_confirm(client: &SynoClient, id: &str) -> Result<()> {
 
     let current = download_station::task_info(client, &ids).await?;
     if !pause_needed(task_with_id(&current, id)) {
-        tracing::debug!(id, "the task is already inactive; no pause is needed");
+        // `info!`, not `debug!`: the log level is hardcoded to INFO, and
+        // "this task was never paused" is exactly the line a bug report about a
+        // directory deleted mid-write would need.
+        tracing::info!(id, "the task is already inactive; no pause is needed");
         return Ok(());
     }
 
@@ -793,14 +797,10 @@ async fn pause_and_confirm(client: &SynoClient, id: &str) -> Result<()> {
         }
 
         if Instant::now() + PAUSE_CONFIRM_INTERVAL >= deadline {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!(
-                    "task {id} did not report itself paused within {}s",
-                    PAUSE_CONFIRM_TIMEOUT.as_secs()
-                ),
-            )
-            .into());
+            return Err(Error::timed_out(format!(
+                "task {id} did not report itself paused within {}s",
+                PAUSE_CONFIRM_TIMEOUT.as_secs()
+            )));
         }
         tokio::time::sleep(PAUSE_CONFIRM_INTERVAL).await;
     }
@@ -1095,31 +1095,13 @@ mod tests {
     // the per-task result array.
 
     use crate::api::download_station::TaskOpResult;
-    use crate::config::ResolvedConfig;
+    use crate::testutil::{fixture_tasks, offline_client};
 
-    /// A client that cannot reach anything.
-    ///
-    /// Constructing it opens no connection, and — the property the tests below
-    /// actually lean on — its [`ApiInfoMap`] is **empty** because `discover()`
-    /// was never called. Every request therefore fails in `endpoint()`, before
-    /// a socket is opened, so a test asserting `failed: 0` is asserting that no
-    /// request was even attempted rather than that the network happened to be
-    /// slow. (The host does not resolve either, but that is the second line of
-    /// defence, not the mechanism: pre-populating the API map would silently
-    /// turn these into real-network tests with a 10-second connect timeout.)
+    /// A client that cannot reach anything; see [`crate::testutil::offline_client`]
+    /// for why an empty API map is what makes the no-call assertions below
+    /// meaningful.
     fn uncalled_client() -> Arc<SynoClient> {
-        let config = ResolvedConfig {
-            host: "nas.invalid".to_string(),
-            port: 5001,
-            https: true,
-            insecure: false,
-            username: "tester".to_string(),
-            refresh_secs: 3,
-            delete_files: true,
-            dry_run: true,
-            logout: false,
-        };
-        Arc::new(SynoClient::new(&config).expect("building a client issues no request"))
+        Arc::new(offline_client())
     }
 
     fn result(id: &str, error: i32) -> TaskOpResult {
@@ -1240,17 +1222,6 @@ mod tests {
     // phase issued a request the call would fail and the item would be reported
     // as `failed`, so `failed: 0` is a positive assertion that **nothing was
     // sent** — not merely that nothing broke.
-
-    const FIXTURE: &str = include_str!("../tests/fixtures/task_list.json");
-
-    fn fixture_tasks() -> Vec<Task> {
-        crate::api::client::parse_envelope::<crate::model::TaskList>(
-            FIXTURE,
-            "SYNO.DownloadStation.Task",
-        )
-        .expect("the fixture must parse")
-        .tasks
-    }
 
     #[tokio::test]
     async fn a_dry_run_delete_issues_no_call_at_all_and_claims_no_successes() {
@@ -1400,7 +1371,7 @@ mod tests {
             title: "Corrupted.Plan".to_string(),
             size: 1024,
             status: crate::model::TaskStatus::Finished,
-            // A share root: `resolve_delete_path` can never produce one, so the
+            // A share root: `resolve_delete_target` can never produce one, so the
             // only way it arrives here is a bug between the snapshot and now.
             target: delete::Target::Path("/downloads".to_string()),
             name_source: Some(NameSource::FileList),

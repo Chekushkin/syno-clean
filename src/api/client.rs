@@ -194,21 +194,12 @@ impl ApiInfoMap {
         self.apis.get(api).ok_or_else(|| Error::api_missing(api))
     }
 
-    /// True when the NAS listed this API at all.
-    pub fn contains(&self, api: &str) -> bool {
-        self.apis.contains_key(api)
-    }
-
     pub fn len(&self) -> usize {
         self.apis.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.apis.is_empty()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &ApiInfo)> {
-        self.apis.iter()
     }
 
     /// Everything needed to issue a request: URL, negotiated version, API name.
@@ -472,6 +463,7 @@ impl SynoClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::offline_client;
 
     const DS_TASK: &str = "SYNO.DownloadStation.Task";
     const FS_LIST: &str = "SYNO.FileStation.List";
@@ -628,7 +620,7 @@ mod tests {
     #[test]
     fn looking_up_a_present_api_succeeds() {
         let map = sample_map();
-        assert!(map.contains(DS_TASK));
+        assert!(map.get(DS_TASK).is_ok());
         assert_eq!(map.get(FS_LIST).expect("present").path, "entry.cgi");
         assert!(!map.is_empty());
     }
@@ -636,7 +628,6 @@ mod tests {
     #[test]
     fn looking_up_a_missing_api_names_the_dsm_package() {
         let map = ApiInfoMap::from_entries([(DS_TASK.to_string(), info("task.cgi", 1, 3))]);
-        assert!(!map.contains(FS_LIST));
         let err = map.get(FS_LIST).expect_err("absent API");
         assert!(matches!(err, Error::ApiUnavailable { .. }), "{err:?}");
         assert!(
@@ -651,7 +642,6 @@ mod tests {
         assert!(map.is_empty());
         assert_eq!(map.len(), 0);
         assert!(map.get(DS_TASK).is_err());
-        assert_eq!(map.iter().count(), 0);
     }
 
     // ---- pick_version -----------------------------------------------------
@@ -778,21 +768,6 @@ mod tests {
     }
 
     // ---- the sid ----------------------------------------------------------
-
-    fn offline_client() -> SynoClient {
-        let config = ResolvedConfig {
-            host: "nas.invalid".to_string(),
-            port: 5001,
-            https: true,
-            insecure: false,
-            username: "tester".to_string(),
-            refresh_secs: 3,
-            delete_files: true,
-            dry_run: true,
-            logout: false,
-        };
-        SynoClient::new(&config).expect("building a client issues no request")
-    }
 
     #[test]
     fn a_fresh_client_carries_no_session_and_cannot_repair_one() {

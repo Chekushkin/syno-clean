@@ -51,8 +51,8 @@
 //!   use; incidental leading/trailing spaces inside a real name are left alone.
 //!
 //! The *semantic* guard (a `SYNO.FileStation.List` `getinfo` existence check
-//! before the delete) belongs to the executor in Task 15 — it needs the
-//! network. Everything here is pure.
+//! before the delete) belongs to the executor in [`crate::event::spawn_delete`]
+//! — it needs the network. Everything here is pure.
 //!
 //! ## Snapshot semantics
 //!
@@ -129,7 +129,7 @@ impl DeleteOptions {
 /// Returns `None` — meaning **refuse**, never "guess from the title" — when:
 ///
 /// * the list is empty (the caller distinguishes this case first; see
-///   [`resolve_delete_path`]),
+///   [`resolve_delete_target`]),
 /// * two entries disagree about their first component (comparison is exact:
 ///   the NAS filesystem is case-sensitive, and two roots differing only in case
 ///   are two directories), or
@@ -241,23 +241,19 @@ pub enum NameSource {
     Title,
 }
 
-/// The absolute File Station path holding a task's data.
+/// The absolute File Station path holding a task's data, and the rule that
+/// named it.
 ///
 /// This is the only function permitted to answer "what does deleting this task
-/// remove from the volume", and it answers with an error far more readily than
-/// with a path. See the module docs for the resolution order; the short version
-/// is that a file list which disagrees with itself is refused outright rather
-/// than resolved from the title.
+/// remove from the volume" — [`DeleteItem::for_task`] is its one production
+/// caller — and it answers with an error far more readily than with a path. See
+/// the module docs for the resolution order; the short version is that a file
+/// list which disagrees with itself is refused outright rather than resolved
+/// from the title.
 ///
 /// The returned path has already been through [`validate_path`]. It is
 /// re-validated immediately before the File Station call anyway — the check is
 /// free and the value crosses a task boundary in between.
-pub fn resolve_delete_path(task: &Task) -> Result<String> {
-    resolve_delete_target(task).map(|(path, _)| path)
-}
-
-/// As [`resolve_delete_path`], also reporting which resolution rule produced
-/// the on-disk name.
 pub fn resolve_delete_target(task: &Task) -> Result<(String, NameSource)> {
     let (name, source) = resolve_name(task)?;
 
@@ -709,24 +705,13 @@ pub fn ops_cancelled_by(ops: &[Op], failed_at: usize) -> &[Op] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::client::parse_envelope;
     use crate::config::ResolvedConfig;
-    use crate::model::TaskList;
+    use crate::testutil::{fixture_task as task, fixture_tasks};
 
-    const FIXTURE: &str = include_str!("../tests/fixtures/task_list.json");
-
-    fn fixture_tasks() -> Vec<Task> {
-        parse_envelope::<TaskList>(FIXTURE, "SYNO.DownloadStation.Task")
-            .expect("the fixture must parse")
-            .tasks
-    }
-
-    /// One fixture task by id.
-    fn task(id: &str) -> Task {
-        fixture_tasks()
-            .into_iter()
-            .find(|task| task.id == id)
-            .unwrap_or_else(|| panic!("fixture has no task {id}"))
+    /// The path half of [`resolve_delete_target`], which is all most of the
+    /// resolution tests below are asking about.
+    fn resolve_delete_path(task: &Task) -> Result<String> {
+        resolve_delete_target(task).map(|(path, _)| path)
     }
 
     /// A minimal synthetic task; the fields each test cares about are
@@ -1693,6 +1678,19 @@ mod tests {
     // describe_ops
     // -----------------------------------------------------------------------
 
+    #[test]
+    fn an_op_list_reads_as_a_sentence_for_the_dry_run_report() {
+        let ops = plan_delete_ops(
+            &item_with(TaskStatus::Downloading),
+            DeleteOptions::dry_run(),
+        );
+        assert_eq!(
+            describe_ops(&ops),
+            "pause the task, then delete /downloads/Some.Release, then delete the DSM task"
+        );
+        assert_eq!(describe_ops(&[]), "nothing");
+    }
+
     // -----------------------------------------------------------------------
     // DeleteOptions::from_config — the only translation of the CLI flags
     // -----------------------------------------------------------------------
@@ -1700,15 +1698,9 @@ mod tests {
     /// A resolved configuration with the two delete-affecting settings set.
     fn config_with(delete_files: bool, dry_run: bool) -> ResolvedConfig {
         ResolvedConfig {
-            host: "nas.invalid".to_string(),
-            port: 5001,
-            https: true,
-            insecure: false,
-            username: "tester".to_string(),
-            refresh_secs: 3,
             delete_files,
             dry_run,
-            logout: false,
+            ..crate::testutil::offline_config()
         }
     }
 
@@ -1811,18 +1803,5 @@ mod tests {
         let described = describe_roots(&files);
         assert!(!described.contains('…'), "{described}");
         assert_eq!(described.matches("root").count(), 4, "{described}");
-    }
-
-    #[test]
-    fn an_op_list_reads_as_a_sentence_for_the_dry_run_report() {
-        let ops = plan_delete_ops(
-            &item_with(TaskStatus::Downloading),
-            DeleteOptions::dry_run(),
-        );
-        assert_eq!(
-            describe_ops(&ops),
-            "pause the task, then delete /downloads/Some.Release, then delete the DSM task"
-        );
-        assert_eq!(describe_ops(&[]), "nothing");
     }
 }

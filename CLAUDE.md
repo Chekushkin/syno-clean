@@ -131,8 +131,16 @@ library, where it is testable.
   hammer the NAS and is far more likely a typo than an intent.
 - An unparseable env value (`SYNO_CLEAN_PORT=abc`) is an error naming the
   variable, not a silent fall-through to the file value.
+- **A blank env var is unset, at every var.** `Config::from_env` filters on
+  `trim().is_empty()` exactly as `parse_env` does, so an exported-but-empty
+  `SYNO_CLEAN_HOST` falls through to the config file. A blank from the *CLI*
+  does not fall through — `config::first_set` trims it to nothing and leaves the
+  value unresolved, because `--host "  "` is a mistake to report rather than a
+  reason to connect somewhere the user did not name.
 - There is deliberately **no `SYNO_CLEAN_DELETE_FILES`**: an environment variable
-  that silently disables the program's main function is a footgun.
+  that silently disables the program's main function is a footgun. `merge` does
+  not consult an env layer for it either — a branch that can never be taken is
+  a claim that the var exists.
 - The password is never written to the config file. It comes from
   `SYNO_CLEAN_PASSWORD` or an interactive `rpassword` prompt, taken **before**
   the alternate screen is entered. 2FA likewise via `SYNO_CLEAN_OTP` or a prompt
@@ -185,19 +193,26 @@ needs must be `info!` or higher. `--log-file` changes only *where* the file goes
 - **The variant list is closed in practice.** Three classes of failure
   deliberately reuse an existing variant rather than growing it: protocol
   violations (success with no data, failure with no code, a body that is not an
-  envelope) are `Error::Parse` built with `serde::de::Error::custom`; File
-  Station failures with no DSM code behind them (`path_err_num > 0`, a bounded
-  wait expiring) are `Error::Io`; unresolved required config is `Error::Config`.
+  envelope) are `Error::Parse` built with `serde::de::Error::custom`; failures
+  with no DSM code behind them (`path_err_num > 0`, an id the per-task result
+  array never mentioned, a bounded wait expiring) are `Error::Io`; unresolved
+  required config is `Error::Config`.
   Adding a variant for these is the change to argue for, not to make quietly.
+  The `Error::Io` reuse has **one spelling each**: `Error::operation_failed(msg)`
+  and `Error::timed_out(msg)` in `error.rs`. Three sites reached for it
+  independently before, and hand-rolling a fourth is how the kinds drift.
 - `anyhow` is for the top of `main` only; library code returns
   `error::Result<T>`.
 - DSM reports failures as a bare integer, so `dsm_message(code, api) -> String`
   owns the translation. It returns `String`, not `&'static str`, because the
   fallback has to embed the unrecognized number. The 100-119 codes are common to
-  every API; the 400-range is **API-specific**, and only the `SYNO.API.Auth`
-  table is implemented — a 400 from Download Station must *not* render as
-  "incorrect password", so unknown `(code, api)` pairs fall back to a message
-  naming the raw number.
+  every API; the 400-range is **API-specific**, and two tables are implemented —
+  `SYNO.API.Auth` and, selected by the `SYNO.FileStation` prefix,
+  `SYNO.FileStation.*`. The same number means different things in each (403 is
+  "permission denied" on File Station and "2-step verification required" on
+  Auth), and a 400 from Download Station — which has no table — must *not*
+  render as "incorrect password", so every other `(code, api)` pair falls
+  through to the common codes and then to a message naming the raw number.
 - `error::is_session_error(code)` is the single definition of "re-login and
   retry once" (106 / 107 / 119). `OTP_REQUIRED_CODE` (403) drives the 2FA prompt.
 - Missing APIs are reported by DSM *package* ("File Station is not installed on
@@ -684,10 +699,13 @@ deleted.
 
 ### Empty states
 
-Chosen by `App::tasks` being empty, **not** by `View::is_narrowed`: with zero
-tasks and a filter set both are true, and blaming the filter sends the user
-pressing `f` at a NAS that has nothing to show. The narrowed state names how many
-rows are hidden and by what, so the fix is on screen rather than guessed at.
+Chosen by `App::tasks` being empty, **not** by whether the view narrows
+anything: with zero tasks and a filter set both are true, and blaming the filter
+sends the user pressing `f` at a NAS that has nothing to show. `View` therefore
+has no `is_narrowed` predicate — the only caller it could have had is the one
+place it must not be used. The narrowed state names how many rows are hidden and
+by what (`ui::narrowing_summary`), so the fix is on screen rather than guessed
+at.
 
 ### Terminal lifecycle (`ui`)
 
@@ -784,9 +802,12 @@ the banner a moment after it appeared.
 - Neither pause nor resume is confirmed by a modal: each is undone by the other
   key, and a modal in front of a reversible operation only trains the user to
   dismiss modals.
-- `spawn_task_op` given `OpKind::Delete` logs an error and does nothing rather
-  than panicking — the three-phase ordering belongs to `spawn_delete`, and a
-  panic in an op task would take the terminal down with it.
+- `spawn_task_op` takes `TaskOp`, a two-variant enum (`Pause` / `Resume`) with
+  **no `Delete` variant**, so a delete asked for here is unrepresentable rather
+  than a runtime check. A delete carries an ordering and belongs to
+  `spawn_delete`; an unreachable `match` arm here would have answered with an
+  empty result array and reported every item of the batch as "DSM reported no
+  result for this task".
 
 ## Formatting
 

@@ -327,8 +327,8 @@ pub fn row_cells(task: &Task, selected: bool) -> [String; COLUMNS.len()] {
 ///
 /// The marker is appended without a space so the widest header plus its arrow
 /// still fits the declared column width. [`crate::view::SortKey::Added`] has no
-/// column of its own, so sorting by it simply shows no marker — the status bar
-/// (Task 12) is where that state is spelled out.
+/// column of its own, so sorting by it simply shows no marker — the footer's
+/// `ui::view_summary` is where that state is spelled out.
 pub fn header_cells(view: &View) -> [String; COLUMNS.len()] {
     let active = view.sort_key.label();
     let arrow = view.sort_dir.arrow();
@@ -389,9 +389,11 @@ pub fn header_line(view: &View, widths: &[usize]) -> Line<'static> {
 
 /// Draw the table into `area`: one header row, then as many task rows as fit.
 ///
-/// The caller ([`crate::ui::render`]) handles the empty case, so `area` is only
-/// ever given a non-empty visible list here.
-pub fn render(frame: &mut Frame, app: &App, area: Rect) {
+/// `visible` is [`App::visible`], computed once by the caller
+/// ([`crate::ui::render`]) and passed down rather than asked for again here —
+/// it is a filter, a search and a sort per call. The caller also handles the
+/// empty case, so `visible` is never empty here.
+pub fn render(frame: &mut Frame, app: &App, area: Rect, visible: &[usize]) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -402,11 +404,10 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(Paragraph::new(header_line(&app.view, &widths)), header_area);
 
-    let visible = app.visible();
     let height = body_area.height as usize;
     // Clamped against *this* frame's height, which the app may not have been
     // told about yet — a resize is seen here one draw before `set_page_size`.
-    let offset = app.scroll_offset(height);
+    let offset = app.scroll_offset_for(visible.len(), height);
     let rows: Vec<Line> = visible
         .iter()
         .enumerate()
@@ -425,24 +426,8 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::client::parse_envelope;
-    use crate::model::TaskList;
+    use crate::testutil::{fixture_task as task, fixture_tasks};
     use crate::view::{SortDir, SortKey};
-
-    const FIXTURE: &str = include_str!("../../tests/fixtures/task_list.json");
-
-    fn fixture_tasks() -> Vec<Task> {
-        parse_envelope::<TaskList>(FIXTURE, "SYNO.DownloadStation.Task")
-            .expect("the fixture must parse")
-            .tasks
-    }
-
-    fn task(id: &str) -> Task {
-        fixture_tasks()
-            .into_iter()
-            .find(|t| t.id == id)
-            .unwrap_or_else(|| panic!("fixture has no task {id}"))
-    }
 
     // ---- column widths ----------------------------------------------------
 

@@ -392,16 +392,11 @@ mod tests {
     // width handling is exercised against data of the shape a real NAS sends,
     // not just against hand-picked strings.
 
-    use crate::api::client::parse_envelope;
-    use crate::model::TaskList;
-
     fn fixture_titles() -> Vec<String> {
-        let list: TaskList = parse_envelope(
-            include_str!("../tests/fixtures/task_list.json"),
-            "SYNO.DownloadStation.Task",
-        )
-        .expect("the fixture must parse");
-        list.tasks.into_iter().map(|t| t.title).collect()
+        crate::testutil::fixture_tasks()
+            .into_iter()
+            .map(|t| t.title)
+            .collect()
     }
 
     #[test]
