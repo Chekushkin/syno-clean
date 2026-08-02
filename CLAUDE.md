@@ -47,7 +47,8 @@ All four must be clean before the next task starts. Warnings are errors.
 
 ```
 src/
-  main.rs                  entrypoint, runtime setup, terminal guard
+  main.rs                  thin binary: entrypoint, runtime setup, terminal guard
+  lib.rs                   library root, declares every module below
   cli.rs                   clap definitions
   config.rs                TOML config, env overrides, validation, sid cache
   error.rs                 Error enum + DSM code mapping
@@ -61,6 +62,30 @@ src/
   api/{mod,client,auth,download_station,file_station}.rs
 tests/fixtures/task_list.json
 ```
+
+**Why both `lib.rs` and `main.rs`:** the crate is built up module by module, and
+in a bin-only crate every `pub` item that main cannot reach yet is a `dead_code`
+warning — which `-D warnings` turns into a hard failure on every task before the
+module is wired in. Splitting the library out removes that friction without
+switching the lint off, and lets `tests/` reach the code. Add new modules to
+`lib.rs`; keep `main.rs` a thin shell that calls into `syno_clean::`.
+
+## Error handling
+
+- One crate-wide `Error` enum in `error.rs` (`thiserror`) plus a
+  `Result<T>` alias. Variants: `Http`, `Dsm { code, api }`, `Config`, `Io`,
+  `Parse`, `Auth`, `UnsafePath { path, reason }`, `ApiUnavailable { api, reason }`.
+- `anyhow` is for the top of `main` only; library code returns
+  `error::Result<T>`.
+- DSM reports failures as a bare integer, so `dsm_message(code, api) -> String`
+  owns the translation. The 100-119 codes are common to every API; the 400-range
+  is **API-specific**, and only the `SYNO.API.Auth` table is implemented — a 400
+  from Download Station must *not* render as "incorrect password", so unknown
+  (code, api) pairs fall back to a message naming the raw number.
+- `error::is_session_error(code)` is the single definition of "re-login and
+  retry once" (106 / 107 / 119). `OTP_REQUIRED_CODE` (403) drives the 2FA prompt.
+- Missing APIs are reported by DSM *package* ("File Station is not installed on
+  this NAS"), not by raw API name, via `Error::api_missing`.
 
 ## Configuration precedence
 
