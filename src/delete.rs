@@ -172,9 +172,11 @@ fn first_component(filename: &str) -> Option<&str> {
 /// of those in place produced a File Station path that cannot exist
 /// (`/volumeUSB1/usbshare1-2/x`) — and "it fails the existence check later" is
 /// not the harmless outcome it sounds like, since an absent path is one of the
-/// answers the executor is allowed to read as "already cleaned up". An
-/// *unrecognized* absolute first component is still passed through untouched:
-/// a share-rooted `/downloads` is a legitimate destination.
+/// answers the executor is allowed to read as "already cleaned up". Recognition
+/// is by **shape** ([`is_volume_component`]), not by a `volume` prefix: an
+/// absolute first component that is not a mount point is passed through
+/// untouched, because a share-rooted `/downloads` — or `/volumes/movies` — is a
+/// legitimate destination.
 pub fn normalize_destination(destination: &str) -> String {
     strip_volume_prefix(destination)
         .trim_matches('/')
@@ -194,15 +196,33 @@ fn strip_volume_prefix(destination: &str) -> &str {
     }
 }
 
-/// True for every DSM mount point spelling — `volume1`, `volume12`, `volume`,
-/// `volumeUSB1`, `volumeSATA2`; false for `video` or `vol1`.
+/// True for every DSM mount point spelling — `volume`, `volume1`, `volume12`,
+/// `volumeUSB1`, `volumeSATA2`; false for `video`, `vol1`, and for a *share*
+/// whose name merely starts with the text: `volumes`, `volume-media`,
+/// `volume_archive`, `volumeX`.
 ///
-/// Deliberately "anything beginning with `volume`": the set of mount points DSM
-/// invents is open-ended (USB, eSATA, and whatever comes next), and this is only
-/// ever asked about the **first component of an absolute path**, which on DSM is
-/// always a mount point and never a share.
+/// The **shape** is matched, not the prefix, because the first component of an
+/// absolute destination is not always a mount point: this module's contract
+/// explicitly allows a share-rooted `/downloads`, so a share-rooted
+/// `/volumes/movies` reaches here too. Eating that first component would re-root
+/// a *recursive* delete into a different share — `/movies/<name>`, which is
+/// either an unrelated directory or (for a non-finished task) an absent path the
+/// executor is allowed to read as "already cleaned up", orphaning the payload.
+/// Every real mount is `volume`, `volume<N>`, `volumeUSB<N>` or `volumeSATA<N>`,
+/// so nothing legitimate is lost by insisting on it.
 fn is_volume_component(component: &str) -> bool {
-    component.starts_with("volume")
+    let Some(suffix) = component.strip_prefix("volume") else {
+        return false;
+    };
+    // The bare `/volume/…` some builds report.
+    if suffix.is_empty() {
+        return true;
+    }
+    let index = suffix
+        .strip_prefix("USB")
+        .or_else(|| suffix.strip_prefix("SATA"))
+        .unwrap_or(suffix);
+    !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Where the on-disk name in a resolved path came from.
@@ -596,6 +616,25 @@ pub fn payload_should_exist(status: &TaskStatus) -> bool {
     )
 }
 
+/// Whether removing **only the DSM task** leaves this task's data on the volume.
+///
+/// The question `--no-delete-files` raises. That mode issues nothing but
+/// [`Op::DeleteTask`], and `download_station::build_delete_params` sends
+/// `force_complete=false` — DSM's "do *not* keep the uncompleted download
+/// files". For a task DSM considers complete there is nothing uncompleted to
+/// throw away and the payload stays exactly where it is; for one still
+/// downloading, waiting, paused or errored, DSM discards the partial data along
+/// with the task.
+///
+/// So the confirmation dialog must **not** promise those rows that their files
+/// are left in place. Same rule as [`payload_should_exist`] — a task whose
+/// payload must exist is a task DSM considers complete — named separately
+/// because it answers a different question and the two must be free to diverge
+/// if DSM's behaviour ever does.
+pub fn payload_survives_task_delete(status: &TaskStatus) -> bool {
+    payload_should_exist(status)
+}
+
 /// The ordered phases for one snapshotted item — the plan's ordering table,
 /// expressed as pure data so it can be tested without a NAS.
 ///
@@ -886,6 +925,44 @@ mod tests {
         assert_eq!(normalize_destination("/video/movies"), "video/movies");
         assert_eq!(normalize_destination("/downloads"), "downloads");
         assert_eq!(normalize_destination("/vol1/downloads"), "vol1/downloads");
+    }
+
+    #[test]
+    fn a_share_named_like_a_volume_keeps_its_first_component() {
+        // The dangerous case: the first component of an *absolute* destination
+        // is not always a mount point (this module accepts a share-rooted
+        // "/downloads"), so a share called "volumes" must not be eaten —
+        // "/volumes/movies" -> "movies" would re-root a recursive delete into a
+        // different share entirely.
+        assert_eq!(normalize_destination("/volumes/movies"), "volumes/movies");
+        assert_eq!(normalize_destination("/volume-media/tv"), "volume-media/tv");
+        assert_eq!(
+            normalize_destination("/volume_archive/2019"),
+            "volume_archive/2019"
+        );
+        assert_eq!(
+            normalize_destination("/volumeX/downloads"),
+            "volumeX/downloads"
+        );
+        // Mount-point spellings that exist have an index; these do not.
+        assert_eq!(normalize_destination("/volumeUSB/x"), "volumeUSB/x");
+        assert_eq!(normalize_destination("/volumeSATA/x"), "volumeSATA/x");
+        assert_eq!(normalize_destination("/volume1a/x"), "volume1a/x");
+    }
+
+    #[test]
+    fn a_volume_shaped_share_resolves_to_a_path_inside_itself() {
+        // End to end, because the failure this guards is a *resolved path* one
+        // share to the left of where it was aimed.
+        let task = Task {
+            destination: "/volumes/movies".to_string(),
+            files: vec![file("Some.Release/a.mkv")],
+            ..bare()
+        };
+        assert_eq!(
+            resolve_delete_path(&task).unwrap(),
+            "/volumes/movies/Some.Release"
+        );
     }
 
     #[test]

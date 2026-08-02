@@ -28,9 +28,13 @@
 //!   dialog says exactly that. Which it is comes from `delete::will_act`, the
 //!   same rule the executor runs on, so the two cannot disagree.
 //! * **The modal says what will actually happen.** With `delete_files = false`
-//!   only the DSM task goes and the files stay; under `--dry-run` nothing goes
-//!   at all. Both are stated in the title *and* in the effect line, because
-//!   these are the cases where the user's mental model is most likely wrong.
+//!   only the DSM task goes and the finished files stay; under `--dry-run`
+//!   nothing goes at all. Both are stated in the title *and* in the effect line,
+//!   because these are the cases where the user's mental model is most likely
+//!   wrong. "Finished" is load-bearing: DSM deletes an *unfinished* task's
+//!   partial data along with the task (`force_complete=false`), so the effect
+//!   line, the row and the totals all say so rather than promising files that
+//!   are about to go — see [`delete::payload_survives_task_delete`].
 //! * **Cancel is the default.** [`ConfirmFocus::default`] is
 //!   [`ConfirmFocus::Cancel`], the Cancel button is the one drawn focused, and
 //!   `Enter` on an untouched dialog therefore cancels. `y` is the deliberate
@@ -122,6 +126,10 @@ pub struct ConfirmSummary {
     pub skipped_count: usize,
     /// Bytes the acted-on items add up to; items nothing happens to are
     /// excluded.
+    ///
+    /// The *whole* of what is acted on. Under `--no-delete-files` the totals
+    /// line reports a smaller "left on disk" figure, because DSM discards the
+    /// partial data of the unfinished rows — see [`totals`].
     pub total_size: u64,
     pub dry_run: bool,
     pub delete_files: bool,
@@ -131,6 +139,38 @@ impl ConfirmSummary {
     /// How many body lines there are, for the scroll clamp.
     pub fn line_count(&self) -> usize {
         self.lines.len()
+    }
+}
+
+/// The rows whose on-disk data does **not** survive what is about to happen,
+/// even though no file delete is being issued for them.
+///
+/// Only ever non-zero under `--no-delete-files`: that mode removes the DSM task
+/// with `force_complete=false`, and DSM discards the partial data of a task that
+/// has not finished. With `delete_files = true` the files are going anyway and
+/// the dialog already says so, so there is nothing extra to qualify.
+#[derive(Debug, Clone, Copy, Default)]
+struct Discarded {
+    /// How many acted-on rows lose their data this way.
+    count: usize,
+    /// Their reported bytes, which must be kept out of the "left on disk"
+    /// figure.
+    size: u64,
+}
+
+impl Discarded {
+    fn of(plan: &DeletePlan, options: DeleteOptions) -> Self {
+        if options.delete_files {
+            return Self::default();
+        }
+        plan.items
+            .iter()
+            .filter(|item| delete::will_act(item, options))
+            .filter(|item| !delete::payload_survives_task_delete(&item.status))
+            .fold(Self::default(), |acc, item| Self {
+                count: acc.count + 1,
+                size: acc.size + item.size,
+            })
     }
 }
 
@@ -162,6 +202,12 @@ pub fn build_confirmation(plan: &DeletePlan, options: DeleteOptions) -> ConfirmS
         .map(|item| item.size)
         .sum();
 
+    // `--no-delete-files` deletes the DSM task with `force_complete=false`, so
+    // DSM throws away the partial data of a task that has not finished. Those
+    // rows cannot be told their files are left in place — see
+    // `delete::payload_survives_task_delete`.
+    let discarded = Discarded::of(plan, options);
+
     let mut lines = Vec::with_capacity(plan.len() * 2);
     for item in &plan.items {
         lines.extend(item_lines(item, options));
@@ -169,9 +215,9 @@ pub fn build_confirmation(plan: &DeletePlan, options: DeleteOptions) -> ConfirmS
 
     ConfirmSummary {
         title: title(delete_count, options),
-        effect: effect(options),
+        effect: effect(options, discarded.count > 0),
         lines,
-        totals: totals(delete_count, skipped_count, total_size, options),
+        totals: totals(delete_count, skipped_count, total_size, discarded, options),
         delete_count,
         skipped_count,
         total_size,
@@ -193,16 +239,23 @@ fn item_lines(item: &DeleteItem, options: DeleteOptions) -> [SummaryLine; 2] {
             ),
         ],
         // Refused, but nothing about to be deleted needs the path: the row goes
-        // and the files stay wherever they are. Said in place of the path,
-        // because that is the line the user reads to check the aim.
+        // and — if the task finished — the files stay wherever they are. Said in
+        // place of the path, because that is the line the user reads to check
+        // the aim. An *unfinished* task gets the opposite sentence: DSM discards
+        // its partial data along with the task, and promising otherwise here is
+        // promising the user data that is about to go.
         (None, _) if !options.delete_files => [
             deleted,
             SummaryLine::new(
                 LineKind::Path,
                 format!(
-                    "    {}  DSM task only — its on-disk location is unknown, and no file \
-                     is touched",
-                    format::bytes(item.size)
+                    "    {}  DSM task only — its on-disk location is unknown, and {}",
+                    format::bytes(item.size),
+                    if delete::payload_survives_task_delete(&item.status) {
+                        "no file is touched"
+                    } else {
+                        "DSM discards its partial data"
+                    }
                 ),
             ),
         ],
@@ -229,11 +282,19 @@ fn title(delete_count: usize, options: DeleteOptions) -> String {
 }
 
 /// The sentence that has to be right: what confirming removes.
-fn effect(options: DeleteOptions) -> String {
-    let scope = if options.delete_files {
-        "the Download Station task and its files on the NAS"
-    } else {
-        "the Download Station task only — the files on the NAS are left in place"
+///
+/// `any_discarded` is the one qualification the task-only wording needs: DSM
+/// deletes an unfinished task's partial data with the task
+/// (`force_complete=false`), so "the files are left in place" is true of
+/// finished tasks and false of the rest.
+fn effect(options: DeleteOptions, any_discarded: bool) -> String {
+    let scope = match (options.delete_files, any_discarded) {
+        (true, _) => "the Download Station task and its files on the NAS",
+        (false, false) => "the Download Station task only — the files on the NAS are left in place",
+        (false, true) => {
+            "the Download Station task only — finished files are left in place, but DSM \
+             discards the partial data of any task that has not finished"
+        }
     };
 
     if options.dry_run {
@@ -248,6 +309,7 @@ fn totals(
     delete_count: usize,
     skipped_count: usize,
     total_size: u64,
+    discarded: Discarded,
     options: DeleteOptions,
 ) -> String {
     let mut totals = if delete_count == 0 {
@@ -260,11 +322,24 @@ fn totals(
             format::bytes(total_size)
         )
     } else {
-        format!(
+        // Only what DSM actually leaves behind is "left on disk": the partial
+        // data of an unfinished task goes with the task, so its bytes are
+        // reported as discarded rather than counted as kept.
+        let mut line = format!(
             "{delete_count} {} · {} left on disk",
             tasks(delete_count),
-            format::bytes(total_size)
-        )
+            format::bytes(total_size.saturating_sub(discarded.size))
+        );
+        if discarded.count > 0 {
+            // No byte figure: what DSM throws away is the *downloaded* part,
+            // and the snapshot carries the task's total size, so any number
+            // here would be the wrong one.
+            line.push_str(&format!(
+                " · {} unfinished, partial data discarded",
+                discarded.count
+            ));
+        }
+        line
     };
 
     if skipped_count > 0 {
@@ -1031,16 +1106,22 @@ mod tests {
 
     #[test]
     fn no_delete_files_says_the_files_stay_and_promises_no_space_back() {
+        // dbid_003 has finished, so its payload really is left in place.
         let options = DeleteOptions {
             delete_files: false,
             dry_run: false,
         };
-        let summary = build_confirmation(&plan(&["dbid_001"]), options);
+        let summary = build_confirmation(&plan(&["dbid_003"]), options);
 
         assert!(summary.effect.contains("task only"), "{:?}", summary.effect);
         assert!(
             summary.effect.contains("left in place"),
             "{:?}",
+            summary.effect
+        );
+        assert!(
+            !summary.effect.contains("partial data"),
+            "a finished task loses nothing: {:?}",
             summary.effect
         );
         assert!(
@@ -1050,6 +1131,123 @@ mod tests {
         );
         assert!(
             summary.totals.contains("left on disk"),
+            "{:?}",
+            summary.totals
+        );
+        assert!(
+            summary
+                .totals
+                .contains(&format::bytes(task("dbid_003").size)),
+            "a finished task's bytes stay on disk: {:?}",
+            summary.totals
+        );
+        assert!(
+            !summary.totals.contains("discarded"),
+            "{:?}",
+            summary.totals
+        );
+    }
+
+    #[test]
+    fn no_delete_files_does_not_promise_an_unfinished_task_its_partial_data() {
+        // The lie this guards against: `--no-delete-files` issues only
+        // Op::DeleteTask, and `build_delete_params` sends force_complete=false,
+        // which is DSM's "do NOT keep the uncompleted download files". dbid_001
+        // is still downloading, so confirming throws its partial data away.
+        let options = DeleteOptions {
+            delete_files: false,
+            dry_run: false,
+        };
+        let downloading = task("dbid_001");
+        assert!(!delete::payload_survives_task_delete(&downloading.status));
+
+        let summary = build_confirmation(&plan(&["dbid_001"]), options);
+        assert!(
+            summary.effect.contains("partial data"),
+            "the effect line must not promise the files stay: {:?}",
+            summary.effect
+        );
+        assert!(
+            summary
+                .totals
+                .contains("1 unfinished, partial data discarded"),
+            "{:?}",
+            summary.totals
+        );
+        // Its bytes are not "left on disk" — nothing of it is.
+        assert!(
+            summary.totals.contains(&format::bytes(0)),
+            "{:?}",
+            summary.totals
+        );
+        assert!(
+            !summary.totals.contains(&format::bytes(downloading.size)),
+            "an unfinished task's bytes are not left on disk: {:?}",
+            summary.totals
+        );
+    }
+
+    #[test]
+    fn a_refused_unfinished_row_says_its_partial_data_goes_rather_than_stays() {
+        // The per-row half. dbid_010 reports no destination, so the resolver
+        // refuses it; under this flag it is still deleted as a DSM row — and it
+        // has not finished, so its partial data goes with it. The row must not
+        // describe that as "no file is touched".
+        let options = DeleteOptions {
+            delete_files: false,
+            dry_run: false,
+        };
+        let waiting = task("dbid_010");
+        assert!(!delete::payload_survives_task_delete(&waiting.status));
+        assert!(
+            DeletePlan::snapshot([&waiting].into_iter()).items[0].is_refused(),
+            "the fixture row must be one the resolver refuses"
+        );
+
+        let summary = build_confirmation(&plan(&["dbid_010"]), options);
+        let body = body(&summary);
+        assert!(body.contains("DSM discards its partial data"), "{body}");
+        assert!(!body.contains("no file is touched"), "{body}");
+    }
+
+    #[test]
+    fn a_refused_finished_row_still_says_no_file_is_touched() {
+        // The other half of the same rule, so the qualification cannot creep
+        // onto rows whose payload really does survive. dbid_013 is seeding —
+        // complete — and its file list has no single root, so it is refused.
+        let options = DeleteOptions {
+            delete_files: false,
+            dry_run: false,
+        };
+        assert!(delete::payload_survives_task_delete(
+            &task("dbid_013").status
+        ));
+
+        let summary = build_confirmation(&plan(&["dbid_013"]), options);
+        assert!(
+            body(&summary).contains("no file is touched"),
+            "{}",
+            body(&summary)
+        );
+        assert!(
+            !summary.effect.contains("partial data"),
+            "{:?}",
+            summary.effect
+        );
+    }
+
+    #[test]
+    fn deleting_the_files_never_mentions_partial_data() {
+        // With the files in scope the dialog already says they go; the
+        // unfinished-task qualification is a `--no-delete-files` concern only.
+        let summary = summary(&["dbid_001"]);
+        assert!(
+            !summary.effect.contains("partial data"),
+            "{:?}",
+            summary.effect
+        );
+        assert!(
+            !summary.totals.contains("discarded"),
             "{:?}",
             summary.totals
         );

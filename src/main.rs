@@ -14,8 +14,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ratatui::crossterm::event::{self as terminal_event, Event};
 use syno_clean::api::auth::{self, Credentials};
-use syno_clean::api::client::SynoClient;
+use syno_clean::api::client::{REQUEST_TIMEOUT, SynoClient};
 use syno_clean::api::download_station;
+use syno_clean::api::file_station::DELETE_TIMEOUT;
 use syno_clean::app::App;
 use syno_clean::cli::Cli;
 use syno_clean::config::{self, Config, Paths, ResolvedConfig, SessionCache};
@@ -429,21 +430,50 @@ async fn event_loop(
     Ok(())
 }
 
+/// Round trips one delete item makes **outside** the two bounded waits below:
+/// the `getinfo` and the `pause` that bracket the pause confirmation, the
+/// existence check before the file delete, the re-check after it, and the task
+/// delete itself. Each is bounded by
+/// [`REQUEST_TIMEOUT`](syno_clean::api::client::REQUEST_TIMEOUT).
+const IN_FLIGHT_ROUND_TRIPS: u64 = 5;
+
 /// How long a still-running batch may go **without reporting progress** before
 /// the wait gives up on it.
 ///
 /// Per item, not per batch: every item of a delete sends an
 /// [`AppEvent::OpProgress`] as it finishes, and each one restarts this clock, so
 /// a twenty-item batch quit part-way is allowed twenty times this rather than
-/// being cut at item seven. Sized as long as a single File Station delete may
-/// itself take ([`syno_clean::api::file_station::DELETE_TIMEOUT`]), which is the
-/// longest one item can legitimately be silent for.
+/// being cut at item seven.
+///
+/// **Derived, never a bare number**, because it has to be *strictly greater*
+/// than the longest an item can legitimately be silent for — and one item's
+/// silence spans the whole of `pause_and_confirm`
+/// ([`PAUSE_CONFIRM_TIMEOUT`](syno_clean::event::PAUSE_CONFIRM_TIMEOUT)), the
+/// File Station delete ([`DELETE_TIMEOUT`]) *and* the round trips around them,
+/// since `OpProgress` is only sent once the item is completely done. A grace
+/// merely *equal* to `DELETE_TIMEOUT` cuts a healthy 290-second recursive
+/// delete at exactly the point this wait exists to protect — possibly after
+/// File Station finished but before the DSM task went — and `DeletedPaths` is
+/// process-local, so the next run then refuses the retry.
 ///
 /// Finite, because a wait that cannot end is indistinguishable to the user from
 /// the hang it replaced, and `Ctrl-C` out of it abandons the batch in exactly
 /// the place this code exists to protect. When it does expire the process says
 /// what was still running and **exits non-zero**.
-const IN_FLIGHT_GRACE: Duration = Duration::from_secs(300);
+const IN_FLIGHT_GRACE: Duration = Duration::from_secs(
+    DELETE_TIMEOUT.as_secs()
+        + event::PAUSE_CONFIRM_TIMEOUT.as_secs()
+        + REQUEST_TIMEOUT.as_secs() * IN_FLIGHT_ROUND_TRIPS,
+);
+
+/// The relationship the grace exists for, checked at compile time so that
+/// raising either timeout cannot silently re-break it.
+const _: () = assert!(
+    IN_FLIGHT_GRACE.as_secs() > DELETE_TIMEOUT.as_secs() + event::PAUSE_CONFIRM_TIMEOUT.as_secs(),
+    "IN_FLIGHT_GRACE must exceed the longest legitimate silence of one item \
+     (a File Station delete plus a pause confirmation), or quitting cuts a healthy batch \
+     mid-item"
+);
 
 /// Stop the background work, in the one order that cannot deadlock.
 ///
@@ -888,6 +918,26 @@ mod tests {
         // A poller task list says nothing about progress and must not restart
         // the clock's *report* — the poller is aborted first anyway.
         assert!(progress_line(&AppEvent::Tasks(Vec::new())).is_none());
+    }
+
+    #[test]
+    fn the_grace_outlasts_the_longest_silence_of_a_single_item() {
+        // One item is silent from the moment it starts until it is completely
+        // done: `OpProgress` is sent after the pause confirmation, the File
+        // Station delete and the task delete. A grace merely *equal* to
+        // DELETE_TIMEOUT therefore cuts a healthy 290-second recursive delete
+        // between "the files are gone" and "the task is gone".
+        let longest_silence = DELETE_TIMEOUT + event::PAUSE_CONFIRM_TIMEOUT;
+        assert!(
+            IN_FLIGHT_GRACE > longest_silence,
+            "{IN_FLIGHT_GRACE:?} must strictly exceed {longest_silence:?}"
+        );
+        // ...with room for the round trips that bracket those two waits, none
+        // of which report progress either.
+        assert!(
+            IN_FLIGHT_GRACE >= longest_silence + REQUEST_TIMEOUT * 3,
+            "{IN_FLIGHT_GRACE:?} leaves no margin for the extra round trips"
+        );
     }
 
     #[tokio::test]
