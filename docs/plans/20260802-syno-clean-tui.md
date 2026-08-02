@@ -387,12 +387,23 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 **Files:**
 - Create: `src/view.rs`
 
-- [ ] define `SortKey` (Name, Status, Size, Progress, DownSpeed, UpSpeed, Ratio, Added), `SortDir`, and `StatusFilter` (All, Downloading, Seeding, Finished, Paused, Error)
-- [ ] implement `View { sort_key, sort_dir, filter, search }` with `cycle_sort()`, `toggle_dir()`, `cycle_filter()`
-- [ ] implement `visible_indices(&[Task], &View) -> Vec<usize>` applying filter → case-insensitive substring search → stable sort
-- [ ] write tests for each sort key ascending and descending, including a tie-break that proves stability
-- [ ] write tests for each status filter and for search (case-insensitivity, no match, empty query returns everything)
-- [ ] run `cargo test` — must pass before task 8
+- [x] define `SortKey` (Name, Status, Size, Progress, DownSpeed, UpSpeed, Ratio, Added), `SortDir`, and `StatusFilter` (All, Downloading, Seeding, Finished, Paused, Error)
+- [x] implement `View { sort_key, sort_dir, filter, search }` with `cycle_sort()`, `toggle_dir()`, `cycle_filter()`
+- [x] implement `visible_indices(&[Task], &View) -> Vec<usize>` applying filter → case-insensitive substring search → stable sort
+- [x] write tests for each sort key ascending and descending, including a tie-break that proves stability
+- [x] write tests for each status filter and for search (case-insensitivity, no match, empty query returns everything)
+- [x] run `cargo test` — must pass before task 8 — 166 tests pass
+
+⚠️ **Decisions taken during Task 7** (plan text above kept verbatim; actuals recorded here):
+- **`StatusFilter::Downloading` means "in progress", not the single `downloading` status.** It also matches `waiting`, `finishing`, `hash_checking`, `extracting` and `filehosting_waiting`. The plan names five filters but ten statuses exist; exact-matching would have left five statuses reachable only under `All`, which silently hides rows from a user who thinks they are filtering. The other four filters are exact single-status matches. A test asserts the non-`All` filters partition the fixture with no overlap.
+- **A `TaskStatus::Unknown(_)` task is visible only under `All`** — deliberately. It cannot be classified without guessing, and filing it under `Error` would mislabel a task that may be perfectly healthy. Asserted by its own test so the choice cannot be made accidentally later.
+- **Descending reverses the `Ordering`, never the result `Vec`.** `sort_by` is stable, so reversing the comparison preserves the incoming order of tied rows in *both* directions; reversing the vector would shuffle ties every time `S` is pressed. Three tests cover it: tied fixture pairs hold their order in both directions, `asc.reverse() != desc`, and an all-tied list keeps input order across every key × direction pair.
+- Name comparison and search are **case-insensitive via `char::to_lowercase` over iterators**, not `to_lowercase()` per comparison — the comparator runs O(n log n) times per re-sort and would otherwise allocate two `String`s per call.
+- `f64` keys (Progress, Ratio) use **`total_cmp`**, not `partial_cmp().unwrap()`. The values are guarded upstream, but a `NaN` must never panic mid-frame.
+- **`Added` uses the derived `Option<i64>` ordering**, so a task DSM gave no `create_time` for (`dbid_010`, `dbid_011`) leads the ascending list rather than being treated as brand new.
+- `cycle_sort()` **leaves the direction alone** — stepping across columns hunting for the largest task should not flip the sort underneath the user.
+- ➕ Added `SortKey::label()`, `StatusFilter::label()`, `SortDir::arrow()` and `View::is_narrowed()` here rather than in Tasks 9/12/17: the column names come from this plan's Technical Details, and the sort header, the status bar and the "filter hides everything" empty state all need one definition of them.
+- ➕ Added `SortKey::ALL` / `StatusFilter::ALL` (cycle order) and `SortKey::compare` / `StatusFilter::matches` as public pure functions, so the cycling and the predicates are testable without going through `visible_indices`.
 
 ### Task 8: Terminal bootstrap and ratatui skeleton
 
