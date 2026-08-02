@@ -217,6 +217,14 @@ exit. They are `hide = true` — debugging aids, not advertised interface.
 `--dump-api-info` deliberately does **not** log in, since discovery needs no
 session and that is exactly the case where a login is what is broken.
 
+`--fixture <path>` runs the whole TUI over a captured `list` response with no
+network call and — deliberately — **no configuration at all**: it short-circuits
+`main` before the config merge, so it works on a machine with no config file,
+no host and no password. The file is a full DSM envelope, read through the same
+`parse_envelope::<TaskList>` the live path uses (`app::parse_fixture`), never a
+second, laxer parser: a fixture only the fixture loader can read would prove
+nothing about what the NAS sends.
+
 ## Delete ordering (three phases, ordered for recoverability)
 
 | Task status | Ordering |
@@ -294,6 +302,28 @@ call, so what the user read on screen is exactly what gets deleted.
   because crossterm's `event-stream` feature is unavailable through ratatui's
   re-export. Exactly one read is ever in flight, so nothing lingers on the
   blocking pool at shutdown.
+
+### The task table (`ui::table`)
+
+- The table is laid out **by hand**, not with ratatui's `Table` widget: every
+  cell is truncated and padded through `format::truncate_ellipsis` /
+  `display_width` so a CJK or emoji title cannot shear the columns to its
+  right, and each row is emitted as one pre-composed `Line`.
+- `COLUMNS` is the single definition of the column order, headers, fixed widths
+  and alignment. **Name is the only flexible column** — it absorbs all the
+  slack down to `MIN_NAME_WIDTH`; on a terminal narrower than `ideal_width()`
+  the rightmost columns are clipped by the buffer, because responsive column
+  *dropping* is deferred past v1.
+- Column headers are spelled exactly like `view::SortKey::label()`, and the
+  sort marker is placed by comparing the two. Do not introduce a second
+  key→column mapping. `SortKey::Added` has no column and so shows no marker.
+- **The scroll offset is derived, never stored** (`table::scroll_offset`): a
+  pure function of cursor, row count and viewport height, so no second piece of
+  state can disagree with a cursor that a refresh moved. `App` holds only the
+  cursor; the event loop pushes the body height in via `App::set_page_size`
+  after each draw so `PageUp`/`PageDown` move a real screenful.
+- Cursor movement **clamps and never wraps** — a `j` held at the bottom of a
+  long list wrapping to the top is how the wrong row gets deleted.
 
 ## Testing philosophy
 

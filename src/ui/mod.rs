@@ -16,8 +16,9 @@
 //! re-export — see `CLAUDE.md`; adding it as a direct dependency would put two
 //! incompatible crossterms in the tree.
 //!
-//! The task table and the modals land in `ui::table` (Task 9) and `ui::dialog`
-//! (Task 14); for now the body is a bordered placeholder.
+//! The modals land in `ui::dialog` (Task 14); the task table is [`table`].
+
+pub mod table;
 
 use std::io::{self, Stdout, stdout};
 use std::sync::Once;
@@ -32,7 +33,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Padding, Paragraph};
 
 use crate::app::App;
 
@@ -42,6 +43,10 @@ pub type Backend = CrosstermBackend<Stdout>;
 /// Footer hints in [`crate::app::Mode::Normal`]. The full list is the `?`
 /// overlay (Task 17); this is the reminder that it exists.
 const NORMAL_HINTS: &str = "q quit · ? help";
+
+/// Rows the frame spends on chrome: the title bar, the table header and the
+/// footer.
+const CHROME_ROWS: u16 = 3;
 
 /// Owns the terminal for as long as the TUI is running.
 ///
@@ -92,6 +97,23 @@ impl TerminalGuard {
         self.terminal.draw(|frame| render(frame, app))?;
         Ok(())
     }
+
+    /// Rows a `PageUp`/`PageDown` should move on this terminal.
+    ///
+    /// The event loop feeds this to [`App::set_page_size`] after each draw, so
+    /// a page is a screenful of the table rather than a fixed guess — and the
+    /// app stays free of any dependency on the terminal.
+    pub fn page_size(&self) -> io::Result<usize> {
+        Ok(table_page_size(self.terminal.size()?.height))
+    }
+}
+
+/// Height of the table body inside a terminal `terminal_height` rows tall.
+///
+/// At least one row: a terminal too short for the chrome still has to let the
+/// user move.
+pub fn table_page_size(terminal_height: u16) -> usize {
+    usize::from(terminal_height.saturating_sub(CHROME_ROWS)).max(1)
 }
 
 impl Drop for TerminalGuard {
@@ -140,7 +162,9 @@ pub fn install_panic_hook() {
 /// Draw the whole frame. A pure function of `&App`.
 ///
 /// Three bands: a one-line title bar, the body, and a one-line footer. The body
-/// is a bordered placeholder until the table lands in Task 9.
+/// is the task table, or a message when there is nothing to put in it — the
+/// table draws its own header row, so an empty table would be a header over
+/// blank space with no explanation.
 pub fn render(frame: &mut Frame, app: &App) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
@@ -150,7 +174,11 @@ pub fn render(frame: &mut Frame, app: &App) {
     .areas(frame.area());
 
     render_title_bar(frame, app, header);
-    frame.render_widget(body_placeholder(app), body);
+    if app.visible_count() == 0 {
+        frame.render_widget(empty_state(app), body);
+    } else {
+        table::render(frame, app, body);
+    }
     frame.render_widget(footer_bar(app), footer);
 }
 
@@ -176,20 +204,21 @@ fn render_title_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     );
 }
 
-/// The body. Task 9 replaces this with the task table.
-fn body_placeholder(app: &App) -> Paragraph<'static> {
-    let message = if !app.tasks.is_empty() {
-        // The table itself lands in Task 9; until then, say what is loaded.
-        format!("{} tasks loaded", app.tasks.len())
-    } else if app.view.is_narrowed() {
-        "No tasks match the current filter".to_string()
+/// The body when the table has no rows to show.
+///
+/// "There is nothing on the NAS" and "your filter hides everything" are
+/// different problems with different fixes, so they read differently. Task 17
+/// owns the polished wording.
+fn empty_state(app: &App) -> Paragraph<'static> {
+    let message = if app.view.is_narrowed() {
+        "No tasks match the current filter"
     } else {
-        "No tasks".to_string()
+        "No tasks"
     };
 
     Paragraph::new(message)
         .centered()
-        .block(Block::bordered().title(" Tasks "))
+        .block(Block::new().padding(Padding::top(1)))
 }
 
 /// The footer: the last status message, or the key hints when there is none.
@@ -250,18 +279,71 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_app_renders_a_title_bar_a_bordered_body_and_a_footer() {
+    fn an_empty_app_renders_a_title_bar_an_empty_state_and_a_footer() {
         let lines = frame_lines(&App::default(), 60, 8);
         assert_eq!(lines.len(), 8);
 
         assert!(lines[0].contains(env!("CARGO_PKG_NAME")), "{:?}", lines[0]);
         assert!(lines[0].contains("0 / 0 tasks"), "{:?}", lines[0]);
-        // The body is bordered on all four sides.
-        assert!(lines[1].starts_with('┌') && lines[1].ends_with('┐'));
-        assert!(lines[6].starts_with('└') && lines[6].ends_with('┘'));
-        assert!(lines[1].contains("Tasks"));
         assert!(lines.iter().any(|line| line.contains("No tasks")));
+        // No table header when there is no table.
+        assert!(!lines.iter().any(|line| line.contains("Destination")));
         assert!(lines[7].contains(NORMAL_HINTS), "{:?}", lines[7]);
+    }
+
+    #[test]
+    fn a_populated_app_renders_the_table_with_its_header_row() {
+        let lines = frame_lines(&App::new(fixture_tasks()), 140, 20);
+        // The header sits directly under the title bar and names every column.
+        for header in [
+            "Name",
+            "Status",
+            "Size",
+            "Progress",
+            "↓ Speed",
+            "↑ Speed",
+            "Ratio",
+            "Seeds/Peers",
+            "ETA",
+            "Destination",
+        ] {
+            assert!(
+                lines[1].contains(header),
+                "{header} missing: {:?}",
+                lines[1]
+            );
+        }
+        // ...and the rows below it are tasks, formatted.
+        let body = lines[2..].join("\n");
+        assert!(body.contains("Ubuntu.24.04.3.LTS.Desktop.amd64"), "{body}");
+        assert!(body.contains("downloading"), "{body}");
+        assert!(body.contains("8.5 MiB/s"), "{body}");
+        assert!(!body.contains("No tasks"), "{body}");
+    }
+
+    #[test]
+    fn the_header_marks_the_sorted_column() {
+        let mut app = App::new(fixture_tasks());
+        app.view.sort_key = crate::view::SortKey::Size;
+        assert!(frame_lines(&app, 140, 20)[1].contains("Size▲"));
+        app.view.toggle_dir();
+        assert!(frame_lines(&app, 140, 20)[1].contains("Size▼"));
+    }
+
+    #[test]
+    fn the_cursor_row_scrolls_into_view_on_a_short_terminal() {
+        // Four body rows for fourteen tasks: the last task is only reachable
+        // by scrolling, and jumping to it must bring it on screen.
+        let mut app = App::new(fixture_tasks());
+        app.view.sort_key = crate::view::SortKey::Added;
+        app.cursor_to_last();
+        let last = app
+            .cursor_task()
+            .expect("a row under the cursor")
+            .title
+            .clone();
+        let text = frame_text(&app, 140, 7);
+        assert!(text.contains(&last), "{last} is off screen:\n{text}");
     }
 
     #[test]
