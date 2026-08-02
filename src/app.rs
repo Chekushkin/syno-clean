@@ -28,7 +28,7 @@ use crate::delete::{DeleteOptions, DeletePlan};
 use crate::error::Result;
 use crate::event::{AppEvent, OpKind, TaskOp, TaskRef};
 use crate::model::{Task, TaskList};
-use crate::ui::dialog;
+use crate::ui::{dialog, table};
 use crate::view::{self, View};
 
 /// Rows a `PageUp`/`PageDown` moves before the first frame has been drawn.
@@ -110,6 +110,15 @@ pub struct App {
     /// Cursor position **within the visible list**, not an index into
     /// [`App::tasks`].
     pub cursor: usize,
+    /// First visible table row.
+    ///
+    /// Stored, because scrolling is edge-triggered: the window follows the
+    /// cursor only when the cursor would leave it, and a window derived from
+    /// the cursor alone can do nothing but pin the cursor to one row of the
+    /// viewport. It is never trusted raw — [`App::scroll_offset`] re-clamps it
+    /// against the live cursor, row count and viewport height on every read, so
+    /// a value left over from a longer list or a moved cursor corrects itself.
+    scroll: usize,
     /// Task IDs the user has selected. IDs rather than rows, deliberately.
     pub selected: HashSet<String>,
     pub mode: Mode,
@@ -190,6 +199,7 @@ impl Default for App {
             tasks: Vec::new(),
             view: View::default(),
             cursor: 0,
+            scroll: 0,
             selected: HashSet::new(),
             mode: Mode::Normal,
             delete_options: DeleteOptions::default(),
@@ -791,7 +801,9 @@ impl App {
         if let Some(plan) = self.pending_delete.take() {
             tracing::info!(
                 items = plan.len(),
-                deletable = plan.deletable().count(),
+                // "resolved", not "deletable": with `--no-delete-files` a
+                // refused item is deleted too — see `delete::will_act`.
+                resolved = plan.deletable().count(),
                 refused = plan.refused().count(),
                 dry_run = self.delete_options.dry_run,
                 delete_files = self.delete_options.delete_files,
@@ -817,6 +829,28 @@ impl App {
     /// the key silently dead.
     pub fn set_page_size(&mut self, rows: usize) {
         self.page_size = rows.max(1);
+        self.follow_cursor();
+    }
+
+    /// The first table row to draw in a viewport `height` rows tall.
+    ///
+    /// The stored offset, re-clamped: see [`App::scroll`] and
+    /// [`crate::ui::table::scroll_offset`]. `render` is the caller, and it
+    /// knows the real height of the frame it is drawing, which the app may not
+    /// have been told about yet.
+    pub fn scroll_offset(&self, height: usize) -> usize {
+        table::scroll_offset(self.scroll, self.cursor, self.visible_count(), height)
+    }
+
+    /// Re-seat the window around the cursor, in the height the last frame had.
+    ///
+    /// Called by everything that moves the cursor or resizes the table. It is
+    /// only ever an *approximation* of the next frame — the clamp in
+    /// [`App::scroll_offset`] is what makes the drawn window correct — but
+    /// keeping the stored value in step here is what makes the scrolling
+    /// edge-triggered rather than one-row-at-a-time.
+    fn follow_cursor(&mut self) {
+        self.scroll = self.scroll_offset(self.page_size);
     }
 
     /// Pull the cursor back inside the visible list.
@@ -826,6 +860,7 @@ impl App {
     /// [`App::cursor`] is never a position that does not exist.
     pub fn clamp_cursor(&mut self) {
         self.cursor = self.cursor.min(self.visible_count().saturating_sub(1));
+        self.follow_cursor();
     }
 
     /// Move the cursor by `delta` rows, clamped to the ends of the list.
@@ -836,19 +871,23 @@ impl App {
         let rows = self.visible_count();
         if rows == 0 {
             self.cursor = 0;
+            self.scroll = 0;
             return;
         }
         self.cursor = shift(self.cursor, delta, rows.saturating_sub(1));
+        self.follow_cursor();
     }
 
     /// Jump to the first visible row (`Home`, `g`).
     pub fn cursor_to_first(&mut self) {
         self.cursor = 0;
+        self.follow_cursor();
     }
 
     /// Jump to the last visible row (`End`, `G`).
     pub fn cursor_to_last(&mut self) {
         self.cursor = self.visible_count().saturating_sub(1);
+        self.follow_cursor();
     }
 
     /// Up one screenful (`PageUp`).

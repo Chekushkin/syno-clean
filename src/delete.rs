@@ -161,19 +161,27 @@ fn first_component(filename: &str) -> Option<&str> {
 /// Turn `additional.detail.destination` into a share-rooted, slash-free
 /// fragment: `/volume1/downloads/` and `downloads` both become `downloads`.
 ///
-/// Only the **absolute** `/volumeN` form is stripped. A destination that
-/// merely *starts with* the text `volume1` is left alone: a share may legally
-/// be named that, and mangling a relative path is how a delete ends up one
-/// directory away from where it was aimed. Anything unrecognized is likewise
-/// passed through untouched — a path that does not exist fails the executor's
-/// existence check and is skipped, which is the safe direction.
+/// Only an **absolute** destination has its mount point stripped. A relative
+/// destination that merely *starts with* the text `volume1` is left alone: a
+/// share may legally be named that, and mangling a relative path is how a
+/// delete ends up one directory away from where it was aimed.
+///
+/// Every DSM mount point is recognized, not just `/volumeN`: internal volumes
+/// (`/volume1`), USB and eSATA shares (`/volumeUSB1/usbshare1-2`,
+/// `/volumeSATA1/…`) and the bare `/volume/…` some builds report. Leaving one
+/// of those in place produced a File Station path that cannot exist
+/// (`/volumeUSB1/usbshare1-2/x`) — and "it fails the existence check later" is
+/// not the harmless outcome it sounds like, since an absent path is one of the
+/// answers the executor is allowed to read as "already cleaned up". An
+/// *unrecognized* absolute first component is still passed through untouched:
+/// a share-rooted `/downloads` is a legitimate destination.
 pub fn normalize_destination(destination: &str) -> String {
     strip_volume_prefix(destination)
         .trim_matches('/')
         .to_string()
 }
 
-/// Drop a leading `/volumeN` component (`N` being one or more digits).
+/// Drop a leading volume mount component from an absolute destination.
 fn strip_volume_prefix(destination: &str) -> &str {
     let Some(rest) = destination.strip_prefix('/') else {
         return destination;
@@ -186,11 +194,15 @@ fn strip_volume_prefix(destination: &str) -> &str {
     }
 }
 
-/// True for `volume1`, `volume12`; false for `volume`, `volumeUSB1`, `video`.
+/// True for every DSM mount point spelling — `volume1`, `volume12`, `volume`,
+/// `volumeUSB1`, `volumeSATA2`; false for `video` or `vol1`.
+///
+/// Deliberately "anything beginning with `volume`": the set of mount points DSM
+/// invents is open-ended (USB, eSATA, and whatever comes next), and this is only
+/// ever asked about the **first component of an absolute path**, which on DSM is
+/// always a mount point and never a share.
 fn is_volume_component(component: &str) -> bool {
-    component
-        .strip_prefix("volume")
-        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    component.starts_with("volume")
 }
 
 /// Where the on-disk name in a resolved path came from.
@@ -392,12 +404,21 @@ pub struct DeleteItem {
     pub size: u64,
     /// Status **at snapshot time**.
     ///
-    /// For display only. It is deliberately *not* what decides whether the task
-    /// is paused before its files go: by the time the executor reaches this
-    /// item the value is as old as the confirmation dialog plus the item's
-    /// place in the batch queue, and a task that DSM's bandwidth schedule
-    /// resumed in that window would be written into mid-delete. The live check
-    /// lives in `event::pause_and_confirm`.
+    /// It is deliberately *not* what decides whether the task is paused before
+    /// its files go: by the time the executor reaches this item the value is as
+    /// old as the confirmation dialog plus the item's place in the batch queue,
+    /// and a task that DSM's bandwidth schedule resumed in that window would be
+    /// written into mid-delete. The live check lives in
+    /// `event::pause_and_confirm`.
+    ///
+    /// It *is* what decides whether an **absent** path is benign
+    /// ([`payload_should_exist`], `event::decide_file_phase`), and staleness is
+    /// harmless there in the direction that matters: a status can go stale by
+    /// completing, and a task this snapshot calls finished is one that finished
+    /// before the dialog opened — the strict answer. The reverse (a task that
+    /// finished while the dialog was up) at worst reads a genuinely absent
+    /// payload as cleaned-up partial data, which is what the pre-fix code did
+    /// for every task.
     pub status: TaskStatus,
     pub target: Target,
     /// Which resolution rule produced the on-disk name, or `None` for a refused
@@ -553,6 +574,28 @@ pub fn requires_pause(status: &TaskStatus) -> bool {
     )
 }
 
+/// Whether a task in this state **must** have its payload on the volume.
+///
+/// This is what makes an *absent* resolved path readable. Download Station
+/// removes its own partial data when an incomplete task goes away, so finding
+/// nothing at the path of a downloading, waiting, paused or errored task is
+/// ordinary — that is the case the plan's "Missing ⇒ still delete the task"
+/// rule was written for. A task that **finished** is a different statement: its
+/// payload demonstrably existed, so an absent path does not say "somebody
+/// tidied up", it says *this program is looking in the wrong place* — a
+/// mis-resolved destination, most likely — and deleting the DSM task on that
+/// evidence orphans the very data the user wanted reclaimed.
+///
+/// `Extracting` counts as finished: DSM unpacks into the destination, so the
+/// payload is there. `Finishing` does not — the data may still be in a temp
+/// location being moved into place.
+pub fn payload_should_exist(status: &TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Finished | TaskStatus::Seeding | TaskStatus::Extracting
+    )
+}
+
 /// The ordered phases for one snapshotted item — the plan's ordering table,
 /// expressed as pure data so it can be tested without a NAS.
 ///
@@ -561,12 +604,17 @@ pub fn requires_pause(status: &TaskStatus) -> bool {
 /// orphaned and the user can retry. Reversing them would leave a volume full of
 /// directories nothing references.
 ///
-/// Three cases produce no ops at all or a shortened list:
+/// Two cases produce no ops at all or a shortened list:
 ///
-/// * **A refused item gets an empty list.** `Target::Refused` means the on-disk
-///   location could not be determined, and the confirmation dialog already told
-///   the user the row would be skipped. Deleting the DSM task anyway would
-///   silently orphan exactly the data whose location is in doubt.
+/// * **A refused item gets an empty list — but only while files are being
+///   deleted.** `Target::Refused` means the on-disk location could not be
+///   determined; removing the DSM task on top of a *recursive delete that could
+///   not be aimed* would silently orphan exactly the data whose location is in
+///   doubt. Under `delete_files = false` there is no recursive delete and the
+///   path is never used at all, so the refusal has nothing to protect: those
+///   tasks are removed like any other. They are precisely the tasks
+///   `--no-delete-files` exists for — before this, a torrent whose file list has
+///   several top-level roots could not be removed by this tool by any route.
 /// * **`delete_files = false` drops the file phase — and the pause with it.**
 ///   The pause exists only to keep Download Station out of the way of the file
 ///   delete; with no file delete there is nothing to keep it out of, and a
@@ -585,17 +633,27 @@ pub fn requires_pause(status: &TaskStatus) -> bool {
 /// `dry_run` deliberately does **not** shorten the list: a dry run has to be
 /// able to report the operations it is declining to perform.
 pub fn plan_delete_ops(item: &DeleteItem, options: DeleteOptions) -> Vec<Op> {
+    if !options.delete_files {
+        // No path is used, so a path that could not be resolved is no reason to
+        // refuse: `--no-delete-files` removes the row and nothing else.
+        return vec![Op::DeleteTask];
+    }
+
     let Some(path) = item.path() else {
         return Vec::new();
     };
 
-    let mut ops = Vec::new();
-    if options.delete_files {
-        ops.push(Op::Pause);
-        ops.push(Op::DeleteFiles(path.to_string()));
-    }
-    ops.push(Op::DeleteTask);
-    ops
+    vec![Op::Pause, Op::DeleteFiles(path.to_string()), Op::DeleteTask]
+}
+
+/// Whether this item will be acted on at all, given the session's options.
+///
+/// The confirmation dialog and the executor must agree about this — a dialog
+/// that says `SKIPPED` for a row the executor then deletes (or the reverse) is
+/// worse than either behaviour on its own — so both read it from
+/// [`plan_delete_ops`], which is the only place the rule lives.
+pub fn will_act(item: &DeleteItem, options: DeleteOptions) -> bool {
+    !plan_delete_ops(item, options).is_empty()
 }
 
 /// The phases an executor **does not** issue because the one at `failed_at`
@@ -792,23 +850,58 @@ mod tests {
     }
 
     #[test]
-    fn only_the_absolute_volume_form_is_stripped() {
+    fn only_an_absolute_destination_has_its_volume_stripped() {
         // A share may legally be named "volume1"; mangling a relative path is
         // how a delete lands one directory away from where it was aimed.
         assert_eq!(
             normalize_destination("volume1/downloads"),
             "volume1/downloads"
         );
-        // Not /volumeN: neither is touched.
+        assert_eq!(normalize_destination("volumeUSB1/x"), "volumeUSB1/x");
+    }
+
+    #[test]
+    fn every_dsm_mount_point_spelling_is_stripped() {
+        // USB and eSATA shares are the ones this used to miss, and the result
+        // was a File Station path that cannot exist — which is *not* harmless,
+        // because an absent path is one of the answers the executor may read as
+        // "already cleaned up".
         assert_eq!(
-            normalize_destination("/volumeUSB1/usbshare1"),
-            "volumeUSB1/usbshare1"
+            normalize_destination("/volumeUSB1/usbshare1-2/download"),
+            "usbshare1-2/download"
         );
         assert_eq!(
-            normalize_destination("/volume/downloads"),
-            "volume/downloads"
+            normalize_destination("/volumeSATA1/satashare1-1"),
+            "satashare1-1"
         );
+        assert_eq!(normalize_destination("/volume/downloads"), "downloads");
+        assert_eq!(normalize_destination("/volume12/downloads"), "downloads");
+    }
+
+    #[test]
+    fn an_absolute_destination_that_is_not_a_mount_point_is_left_alone() {
+        // A share-rooted "/downloads" is a legitimate destination, and
+        // swallowing its first component would aim the delete at a share that
+        // does not exist.
         assert_eq!(normalize_destination("/video/movies"), "video/movies");
+        assert_eq!(normalize_destination("/downloads"), "downloads");
+        assert_eq!(normalize_destination("/vol1/downloads"), "vol1/downloads");
+    }
+
+    #[test]
+    fn a_usb_destination_resolves_to_a_share_rooted_path() {
+        // End to end, because the join is where the missed prefix showed up:
+        // "/volumeUSB1/usbshare1-2/download/X" is a path File Station has never
+        // heard of.
+        let task = Task {
+            destination: "/volumeUSB1/usbshare1-2/download".to_string(),
+            files: vec![file("X/a.mkv")],
+            ..bare()
+        };
+        assert_eq!(
+            resolve_delete_path(&task).unwrap(),
+            "/usbshare1-2/download/X"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1409,7 +1502,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_item_is_touched_by_nothing_at_all() {
+    fn a_refused_item_is_touched_by_nothing_at_all_while_files_are_being_deleted() {
         // Not even the DSM task: the row was shown to the user as SKIPPED, and
         // deleting the task would orphan precisely the data whose location is
         // in doubt.
@@ -1417,16 +1510,30 @@ mod tests {
         assert!(refused.is_refused());
         assert_eq!(plan_delete_ops(&refused, DeleteOptions::default()), vec![]);
         assert_eq!(plan_delete_ops(&refused, DeleteOptions::dry_run()), vec![]);
-        assert_eq!(
-            plan_delete_ops(
-                &refused,
-                DeleteOptions {
-                    delete_files: false,
-                    dry_run: false
-                }
-            ),
-            vec![]
-        );
+        assert!(!will_act(&refused, DeleteOptions::default()));
+    }
+
+    #[test]
+    fn no_delete_files_can_remove_a_refused_item_because_no_path_is_used() {
+        // The tasks that need `--no-delete-files` most are exactly the ones the
+        // resolver refuses — a torrent with several top-level roots, or one with
+        // no destination at all. Refusing those here too left them unremovable
+        // by this tool by any route, while the README promised the flag
+        // "removes the Download Station task only".
+        let options = DeleteOptions {
+            delete_files: false,
+            dry_run: false,
+        };
+        for id in ["dbid_010", "dbid_011", "dbid_013"] {
+            let refused = DeleteItem::for_task(&task(id));
+            assert!(refused.is_refused(), "{id} is meant to be refused");
+            assert_eq!(
+                plan_delete_ops(&refused, options),
+                vec![Op::DeleteTask],
+                "{id}"
+            );
+            assert!(will_act(&refused, options), "{id}");
+        }
     }
 
     #[test]

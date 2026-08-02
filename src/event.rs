@@ -32,18 +32,21 @@
 //!   it is free to run again on the near side of the one call that cannot be
 //!   undone;
 //! * a path that is **not there** is a *skip*, not a failure, and the DSM task
-//!   is still removed — **but only when the path came from the task's file
-//!   list**. For a name guessed from the display title, absence is at least as
-//!   likely to mean the guess was wrong as to mean somebody already tidied up,
-//!   and removing the task would destroy the only pointer to data still on the
-//!   volume. See [`decide_file_phase`];
+//!   is still removed — **but only when the absence is explained**: this run
+//!   deleted that path already, or the path came from the task's file list *and*
+//!   the task never finished, so Download Station cleaned up its own partial
+//!   data. A name guessed from the display title, or a finished task whose
+//!   payload demonstrably existed, keeps its task instead: removing it would
+//!   destroy the only pointer to data still on the volume. See
+//!   [`decide_file_phase`];
 //! * after the recursive delete reports success the path is looked up **once
 //!   more**, and a path that is *still there* fails the item — the `status`
 //!   payload's error count is the only other signal, and no real NAS response
 //!   has been captured to confirm this client is reading it under the right
-//!   name. A re-check that cannot be read is **not** a failure, though: see
-//!   [`decide_confirm_phase`] for why the same answer means opposite things
-//!   before and after the delete;
+//!   name. A re-check that **errors, or does not answer at all**, fails the item
+//!   too; only an answer this client cannot attribute to the path is read as
+//!   confirmation — see [`decide_confirm_phase`] for why that one answer means
+//!   opposite things before and after the delete;
 //! * the pause phase resolves against a **live** status read rather than the
 //!   snapshot's, because the snapshot's is as old as the confirmation dialog —
 //!   and a live read that says nothing about the id asked for is read as
@@ -236,12 +239,15 @@ const PAUSE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
 const PAUSE_CONFIRM_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Everything a spawned operation needs: something to call, somewhere to
-/// report, and the poller poke that refreshes the table when it is done.
+/// report, the poller poke that refreshes the table when it is done — and what
+/// this process has already deleted.
 #[derive(Debug, Clone)]
 pub struct OpContext {
     pub client: Arc<SynoClient>,
     pub tx: Sender,
     pub refresh: RefreshHandle,
+    /// Shared across every batch of the run; see [`DeletedPaths`].
+    pub deleted: DeletedPaths,
 }
 
 impl OpContext {
@@ -250,7 +256,46 @@ impl OpContext {
             client,
             tx,
             refresh,
+            deleted: DeletedPaths::default(),
         }
+    }
+}
+
+/// The paths File Station has reported as **successfully deleted** during this
+/// run of the program.
+///
+/// This is the memory that lets a *retry* tell "the files are gone because I
+/// removed them a moment ago" from "the files were never where I am looking".
+/// Both answer [`PathInfo::Missing`], and the executor is deliberately strict
+/// about the second one — an absent path is how a mis-resolved destination
+/// would otherwise get a completed download's task deleted with its payload
+/// still on the volume ([`decide_file_phase`]).
+///
+/// Without it, strictness would be a trap: an item whose files went but whose
+/// *post-delete confirmation* could not be read fails and keeps its task (see
+/// [`confirm_deleted`]), and the obvious retry would then hit that refusal for
+/// ever. Recording the fact at the one place that knows it — the delete
+/// returning success — fixes that at its cause instead of by ignoring the
+/// negative signal.
+///
+/// Cloned with the [`OpContext`], so every batch of a run shares one set.
+#[derive(Debug, Clone, Default)]
+pub struct DeletedPaths(Arc<std::sync::Mutex<std::collections::HashSet<String>>>);
+
+impl DeletedPaths {
+    /// Remember that `path` was deleted, successfully, by this process.
+    pub fn record(&self, path: &str) {
+        // A poisoned mutex would mean a panic while holding a `HashSet`, which
+        // cannot leave it inconsistent; the memory is an optimization for the
+        // retry case, never a safety guard, so recovering beats propagating.
+        let mut set = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        set.insert(path.to_string());
+    }
+
+    /// Whether this process already deleted `path`.
+    pub fn contains(&self, path: &str) -> bool {
+        let set = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        set.contains(path)
     }
 }
 
@@ -338,7 +383,7 @@ async fn run_delete(ops: OpContext, plan: DeletePlan, options: DeleteOptions) {
     );
 
     for (index, item) in plan.items.iter().enumerate() {
-        let outcome = delete_one(&ops.client, item, options).await;
+        let outcome = delete_one(&ops.client, item, options, &ops.deleted).await;
         tally.record(&outcome);
 
         let progress = AppEvent::OpProgress {
@@ -369,11 +414,16 @@ async fn run_delete(ops: OpContext, plan: DeletePlan, options: DeleteOptions) {
 }
 
 /// Carry out the phases for one item, stopping at the first failure.
-async fn delete_one(client: &SynoClient, item: &DeleteItem, options: DeleteOptions) -> ItemOutcome {
+async fn delete_one(
+    client: &SynoClient,
+    item: &DeleteItem,
+    options: DeleteOptions,
+    deleted: &DeletedPaths,
+) -> ItemOutcome {
     let ops = delete::plan_delete_ops(item, options);
     if ops.is_empty() {
-        // A refused item: the dialog showed it as SKIPPED and nothing —
-        // including the DSM task — is touched.
+        // A refused item *while files are being deleted*: the dialog showed it
+        // as SKIPPED and nothing — including the DSM task — is touched.
         return ItemOutcome::Skipped(
             item.refusal()
                 .unwrap_or("there is nothing to do for this task")
@@ -384,7 +434,7 @@ async fn delete_one(client: &SynoClient, item: &DeleteItem, options: DeleteOptio
     let mut files_were_already_gone = false;
 
     for (index, op) in ops.iter().enumerate() {
-        match run_op(client, item, op, options).await {
+        match run_op(client, item, op, options, deleted).await {
             OpOutcome::Done => {}
             OpOutcome::NothingThere => files_were_already_gone = true,
             OpOutcome::Failed(why) => {
@@ -432,23 +482,52 @@ enum OpOutcome {
 /// that mapped [`PathInfo::Error`] onto [`OpOutcome::NothingThere`] would
 /// silently do the last of those.
 ///
-/// `name_source` is the provenance of the path
-/// ([`crate::delete::DeleteItem::name_source`]). Absence is only allowed to
-/// mean "already cleaned up" when the path came from the task's **file list**;
-/// for a name guessed from the display title, an absent path is at least as
-/// likely to mean the guess missed, and the task must survive so the payload
-/// stays reachable.
-fn decide_file_phase(info: PathInfo, path: &str, name_source: Option<NameSource>) -> OpOutcome {
+/// **An absent path is only benign when something explains the absence.** Three
+/// things can:
+///
+/// * *this run already deleted that exact path* (`already_deleted`, from
+///   [`DeletedPaths`]) — the strongest explanation there is, and the one that
+///   keeps a retry after an unreadable post-delete check from being refused for
+///   ever;
+/// * the path came from the task's **file list** (`name_source`) *and* the task
+///   is in a state where Download Station cleans up after itself — an
+///   incomplete, paused or errored download. That is the case the plan's
+///   "Missing ⇒ still delete the task" rule was written for;
+/// * nothing else. A name guessed from the display **title** is at least as
+///   likely to have missed as to have been tidied up, and a **finished** task's
+///   payload demonstrably existed, so its absence points at a mis-resolved
+///   *destination* rather than at a cleanup — see
+///   [`crate::delete::payload_should_exist`]. Both keep the task, so the data
+///   stays reachable; both name `--no-delete-files` as the way out.
+fn decide_file_phase(
+    info: PathInfo,
+    path: &str,
+    name_source: Option<NameSource>,
+    status: &crate::model::TaskStatus,
+    already_deleted: bool,
+) -> OpOutcome {
     match info {
         PathInfo::Found { .. } => OpOutcome::Done,
 
-        PathInfo::Missing if name_source == Some(NameSource::FileList) => OpOutcome::NothingThere,
-        PathInfo::Missing => OpOutcome::Failed(format!(
-            "nothing at {path}, and that path was guessed from the task's title rather than \
+        PathInfo::Missing if already_deleted => {
+            tracing::info!(path, "already deleted by this run; treating as gone");
+            OpOutcome::NothingThere
+        }
+        PathInfo::Missing if name_source != Some(NameSource::FileList) => {
+            OpOutcome::Failed(format!(
+                "nothing at {path}, and that path was guessed from the task's title rather than \
              read from its file list — refusing to delete the task, which would leave no \
              pointer to the data if the guess was wrong (use --no-delete-files to remove \
              the task anyway)"
+            ))
+        }
+        PathInfo::Missing if delete::payload_should_exist(status) => OpOutcome::Failed(format!(
+            "nothing at {path}, but this task has finished, so its data should be there — \
+             the resolved location is more likely wrong than the files already gone; \
+             refusing to delete the task, which would leave no pointer to the payload \
+             (use --no-delete-files to remove the task anyway)"
         )),
+        PathInfo::Missing => OpOutcome::NothingThere,
 
         // Not absence — "I could not look" must never be read as "there is
         // nothing to delete", which would remove the task and strand the files.
@@ -470,6 +549,7 @@ async fn run_op(
     item: &DeleteItem,
     op: &Op,
     options: DeleteOptions,
+    deleted: &DeletedPaths,
 ) -> OpOutcome {
     match op {
         Op::Pause => {
@@ -502,7 +582,13 @@ async fn run_op(
                 Err(err) => return OpOutcome::Failed(format!("could not check {path}: {err}")),
             };
 
-            match decide_file_phase(info, path, item.name_source) {
+            match decide_file_phase(
+                info,
+                path,
+                item.name_source,
+                &item.status,
+                deleted.contains(path),
+            ) {
                 OpOutcome::Done => {}
                 OpOutcome::NothingThere => {
                     tracing::info!(id = %item.id, path, "nothing on disk at the resolved path");
@@ -515,6 +601,10 @@ async fn run_op(
             if let Err(err) = file_station::delete_paths(client, &paths).await {
                 return OpOutcome::Failed(format!("could not delete {path}: {err}"));
             }
+            // File Station reported the delete finished with no per-path
+            // errors. Recorded *before* the confirmation, because it is exactly
+            // the confirmation failing that makes this memory worth having.
+            deleted.record(path);
             confirm_deleted(client, path).await
         }
 
@@ -542,25 +632,34 @@ async fn run_op(
 /// One extra `getinfo` makes that safety property hold regardless of the field
 /// name.
 ///
-/// **Only a path that is still *there* fails the item.** A lookup that cannot
-/// be read is inconclusive, and the previous phase already got a positive
-/// [`PathInfo::Found`] out of the same call for the same path — see
-/// [`decide_confirm_phase`].
+/// **A lookup that did not answer at all is a failure**, not a confirmation.
+/// There is no evidence in either direction, and of the two ways to be wrong,
+/// keeping a task whose files are gone is the recoverable one — the user sees a
+/// row and can remove it; deleting a task whose files are *not* gone leaves data
+/// on the volume with nothing pointing at it.
+///
+/// This does not strand the task: the path is recorded in [`DeletedPaths`]
+/// before this runs, so a retry reads the resulting absence as "this run
+/// deleted it" and finishes the job. That is the cause of the old
+/// retry-deadlock, fixed where it lives rather than by reading a failed lookup
+/// as a success.
+///
+/// Which *readable* answers fail the item is [`decide_confirm_phase`]'s
+/// question, and it is deliberately not the same list as before the delete.
 async fn confirm_deleted(client: &SynoClient, path: &str) -> OpOutcome {
     match file_station::path_info(client, path).await {
         Ok(info) => decide_confirm_phase(info, path),
-        // The delete's own `status` said finished with no path errors, and this
-        // second opinion is unavailable rather than negative. Failing here
-        // would leave a DSM task pointing at files that are gone — and for a
-        // title-derived name, a retry then hits `decide_file_phase`'s
-        // Missing + Title refusal and the task can never be removed at all.
         Err(err) => {
             tracing::warn!(
                 path,
                 %err,
-                "could not re-check the path after deleting it; trusting the delete's own report"
+                "could not re-check the path after deleting it; keeping the task"
             );
-            OpOutcome::Done
+            OpOutcome::Failed(format!(
+                "File Station reported the delete of {path} as finished but the re-check \
+                 could not be made ({err}) — keeping the task rather than removing it on \
+                 an answer that never came; retrying is safe"
+            ))
         }
     }
 }
@@ -581,8 +680,16 @@ async fn confirm_deleted(client: &SynoClient, path: &str) -> OpOutcome {
 ///   positive `Missing` failed **every** item of **every** run — files gone,
 ///   task kept, footer reporting FAILED.
 ///
-/// So: still `Found` is the failure. Anything else is the delete having done
-/// what it said it did.
+/// The relaxation stops at [`PathInfo::Unknown`]. [`PathInfo::Error`] is a
+/// **readable** answer carrying a real DSM code — "I could not look at this
+/// path" — and it is the same answer [`decide_file_phase`] hard-fails on, for
+/// the same reason: it says nothing about whether anything is still there. A
+/// recursive delete of a directory holding one entry the DSM account may not
+/// remove is exactly the case that produces it, and reading it as absence would
+/// delete the Download Station task off a directory that survived.
+///
+/// So: still `Found`, or an error code, is the failure. `Missing` and an
+/// unattributable answer are the delete having done what it said it did.
 fn decide_confirm_phase(info: PathInfo, path: &str) -> OpOutcome {
     match info {
         PathInfo::Found { .. } => OpOutcome::Failed(format!(
@@ -591,12 +698,17 @@ fn decide_confirm_phase(info: PathInfo, path: &str) -> OpOutcome {
              without touching the files)"
         )),
         PathInfo::Missing => OpOutcome::Done,
-        other => {
+        PathInfo::Error(code) => OpOutcome::Failed(format!(
+            "File Station reported the delete of {path} as finished but the re-check \
+             answered with an error rather than an absence ({}) — keeping the task, since \
+             that answer does not say the path is gone",
+            crate::error::Error::dsm(code, file_station::FS_LIST_API)
+        )),
+        PathInfo::Unknown => {
             tracing::warn!(
                 path,
-                answer = ?other,
-                "the post-delete check could not be read; the delete reported itself finished \
-                 and the path is not there, so the task is removed"
+                "the post-delete check carried no entry for the path; the delete reported \
+                 itself finished, so the task is removed"
             );
             OpOutcome::Done
         }
@@ -870,6 +982,7 @@ mod tests {
     //! thoroughly in `app.rs`.
 
     use super::*;
+    use crate::model::TaskStatus;
 
     #[test]
     fn op_kinds_are_named_for_the_footer() {
@@ -1210,6 +1323,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_delete_files_removes_a_refused_items_task_instead_of_skipping_it() {
+        // The same fixture task as above, with the flag that makes its refusal
+        // meaningless: no path is used, so there is nothing to be unsure about,
+        // and this is the only route left for a torrent whose on-disk name
+        // cannot be resolved. A dry run keeps it off the network while still
+        // reporting the ops that *would* run.
+        let refused: Vec<Task> = fixture_tasks()
+            .into_iter()
+            .filter(|task| task.id == "dbid_013")
+            .collect();
+        let plan = DeletePlan::snapshot(refused.iter());
+        assert!(plan.items[0].is_refused());
+
+        let (tx, mut rx) = channel();
+        let ops = OpContext::new(uncalled_client(), tx, RefreshHandle::new());
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_delete(
+                ops,
+                plan,
+                DeleteOptions {
+                    delete_files: false,
+                    dry_run: true,
+                },
+            ),
+        )
+        .await
+        .expect("a dry run issues no request and cannot hang");
+
+        let event = rx.try_recv().expect("one progress event");
+        let AppEvent::OpProgress { detail, .. } = event else {
+            panic!("expected progress, got {event:?}");
+        };
+        assert!(
+            detail.contains("would delete the DSM task"),
+            "a refused item must still be removable with --no-delete-files: {detail}"
+        );
+        assert!(
+            !detail.contains("share no single top-level directory"),
+            "the refusal is about a path this run never uses: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_path_deleted_by_this_run_is_remembered() {
+        // What keeps the strict readings of an absent path from becoming a task
+        // nothing can remove: the retry knows why the path is empty.
+        let deleted = DeletedPaths::default();
+        assert!(!deleted.contains("/downloads/X"));
+        deleted.record("/downloads/X");
+        assert!(deleted.contains("/downloads/X"));
+        assert!(!deleted.contains("/downloads/Y"));
+
+        // Shared with every clone, so a retry in a *later* batch of the same
+        // run sees what the first batch did.
+        let clone = deleted.clone();
+        clone.record("/downloads/Y");
+        assert!(deleted.contains("/downloads/Y"));
+    }
+
+    #[tokio::test]
     async fn a_path_that_fails_re_validation_is_never_handed_to_file_station() {
         // The defence-in-depth check at the top of the file phase. `dry_run` is
         // used because validation runs **before** the dry-run early return, so
@@ -1262,30 +1436,95 @@ mod tests {
     // reclaimed, somebody had already reclaimed it, or the files are still
     // there and the task pointing at them is about to be destroyed.
 
+    /// The pre-delete decision for an incomplete task whose path came from its
+    /// file list — the ordinary case, with no memory of an earlier delete.
+    fn file_phase(info: PathInfo) -> OpOutcome {
+        decide_file_phase(
+            info,
+            "/downloads/X",
+            Some(NameSource::FileList),
+            &TaskStatus::Downloading,
+            false,
+        )
+    }
+
     #[test]
     fn a_path_that_is_there_is_deleted() {
         assert_eq!(
-            decide_file_phase(
-                PathInfo::Found { is_dir: true },
-                "/downloads/X",
-                Some(NameSource::FileList)
-            ),
+            file_phase(PathInfo::Found { is_dir: true }),
             OpOutcome::Done
         );
     }
 
     #[test]
-    fn an_absent_path_from_the_file_list_is_a_skip_that_still_removes_the_task() {
-        // The file list is what BitTorrent actually wrote, so nothing being
-        // there really does mean somebody already tidied up.
-        assert_eq!(
-            decide_file_phase(
+    fn an_absent_path_from_an_incomplete_task_is_a_skip_that_still_removes_the_task() {
+        // Download Station removes its own partial data, so an incomplete
+        // task's path being empty really does mean somebody already tidied up.
+        for status in [
+            TaskStatus::Downloading,
+            TaskStatus::Waiting,
+            TaskStatus::Paused,
+            TaskStatus::Error,
+            TaskStatus::Finishing,
+        ] {
+            assert_eq!(
+                decide_file_phase(
+                    PathInfo::Missing,
+                    "/downloads/X",
+                    Some(NameSource::FileList),
+                    &status,
+                    false
+                ),
+                OpOutcome::NothingThere,
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_path_on_a_finished_task_keeps_the_task() {
+        // The orphaning route that goes through the *destination* rather than
+        // the name: a task that finished had its payload on disk, so nothing
+        // being at the resolved path says the path is wrong, not that the data
+        // is gone — and deleting the row would leave that payload unreachable.
+        for status in [
+            TaskStatus::Finished,
+            TaskStatus::Seeding,
+            TaskStatus::Extracting,
+        ] {
+            let outcome = decide_file_phase(
                 PathInfo::Missing,
                 "/downloads/X",
-                Some(NameSource::FileList)
-            ),
-            OpOutcome::NothingThere
-        );
+                Some(NameSource::FileList),
+                &status,
+                false,
+            );
+            assert!(
+                matches!(&outcome, OpOutcome::Failed(why)
+                    if why.contains("finished") && why.contains("--no-delete-files")),
+                "{status}: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_this_run_already_deleted_reads_as_gone_whatever_the_task_says() {
+        // The retry after a post-delete check that could not be made: the files
+        // went, this process knows it, and the strictness above must not turn
+        // that into a task nothing can ever remove.
+        for source in [NameSource::FileList, NameSource::Title] {
+            assert_eq!(
+                decide_file_phase(
+                    PathInfo::Missing,
+                    "/downloads/X",
+                    Some(source),
+                    &TaskStatus::Finished,
+                    true
+                ),
+                OpOutcome::NothingThere,
+                "{source:?}"
+            );
+        }
     }
 
     #[test]
@@ -1294,14 +1533,26 @@ mod tests {
         // empty answer is at least as likely to mean the guess missed as to
         // mean the data is gone — and deleting the task would destroy the only
         // pointer to a payload still sitting on the volume.
-        let outcome = decide_file_phase(PathInfo::Missing, "/downloads/X", Some(NameSource::Title));
+        let outcome = decide_file_phase(
+            PathInfo::Missing,
+            "/downloads/X",
+            Some(NameSource::Title),
+            &TaskStatus::Downloading,
+            false,
+        );
         assert!(
             matches!(&outcome, OpOutcome::Failed(why) if why.contains("guessed")),
             "{outcome:?}"
         );
         // A refused item has no provenance at all and gets the same treatment.
         assert!(matches!(
-            decide_file_phase(PathInfo::Missing, "/downloads/X", None),
+            decide_file_phase(
+                PathInfo::Missing,
+                "/downloads/X",
+                None,
+                &TaskStatus::Downloading,
+                false
+            ),
             OpOutcome::Failed(_)
         ));
     }
@@ -1310,11 +1561,7 @@ mod tests {
     fn a_lookup_error_is_never_read_as_absence() {
         // "I am not allowed to look" becoming "there is nothing to delete" is
         // how the task goes and the files stay.
-        let outcome = decide_file_phase(
-            PathInfo::Error(403),
-            "/downloads/X",
-            Some(NameSource::FileList),
-        );
+        let outcome = file_phase(PathInfo::Error(403));
         assert!(
             matches!(&outcome, OpOutcome::Failed(why) if why.contains("403")),
             "{outcome:?}"
@@ -1326,11 +1573,7 @@ mod tests {
         // The whole-batch failure mode: a `getinfo` shape this client cannot
         // parse yields no entries, and calling that "already gone" would delete
         // every task in the batch while reclaiming nothing.
-        let outcome = decide_file_phase(
-            PathInfo::Unknown,
-            "/downloads/X",
-            Some(NameSource::FileList),
-        );
+        let outcome = file_phase(PathInfo::Unknown);
         assert!(matches!(outcome, OpOutcome::Failed(_)), "{outcome:?}");
     }
 
@@ -1364,7 +1607,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_recheck_does_not_strand_the_task() {
+    fn an_unattributable_recheck_does_not_strand_the_task() {
         // The whole-run failure this replaced: on a DSM build that answers an
         // absent path with `{"files": []}` every item deleted its files, got
         // `Unknown` back, failed, and kept the task — a half-completed delete
@@ -1374,28 +1617,49 @@ mod tests {
             OpOutcome::Done,
             "the delete reported itself finished and the path is not there"
         );
-        assert_eq!(
-            decide_confirm_phase(PathInfo::Error(403), "/downloads/X"),
-            OpOutcome::Done
+    }
+
+    #[test]
+    fn a_recheck_that_answers_with_an_error_keeps_the_task() {
+        // An error code is a *readable* answer, and what it says is "I could not
+        // look" — which is not "the path is gone". The case that produces it is
+        // a recursive delete of a directory holding one entry the account may
+        // not remove: File Station reports the task finished, the directory
+        // survives, and removing the DSM row would orphan it.
+        let outcome = decide_confirm_phase(PathInfo::Error(403), "/downloads/X");
+        assert!(
+            matches!(&outcome, OpOutcome::Failed(why) if why.contains("403")),
+            "{outcome:?}"
         );
     }
 
     #[test]
-    fn the_recheck_is_the_mirror_image_of_the_pre_check_only_for_found() {
+    fn the_recheck_is_the_mirror_image_of_the_pre_check_only_for_unknown() {
         // The two directions in one place, because collapsing them into one
         // helper is the tempting simplification that reintroduces both bugs.
-        for info in [PathInfo::Unknown, PathInfo::Error(403)] {
+        // The relaxation covers `Unknown` and nothing else: that is the one
+        // answer the previous phase's own `Found` proves this NAS can produce
+        // for a path that has stopped being there.
+        assert!(matches!(
+            file_phase(PathInfo::Unknown),
+            OpOutcome::Failed(_)
+        ));
+        assert_eq!(
+            decide_confirm_phase(PathInfo::Unknown, "/downloads/X"),
+            OpOutcome::Done
+        );
+
+        for info in [PathInfo::Error(403), PathInfo::Found { is_dir: true }] {
+            assert!(
+                matches!(file_phase(info), OpOutcome::Failed(_) | OpOutcome::Done),
+                "{info:?}"
+            );
             assert!(
                 matches!(
-                    decide_file_phase(info, "/downloads/X", Some(NameSource::FileList)),
+                    decide_confirm_phase(info, "/downloads/X"),
                     OpOutcome::Failed(_)
                 ),
-                "{info:?} before a delete must refuse to touch anything"
-            );
-            assert_eq!(
-                decide_confirm_phase(info, "/downloads/X"),
-                OpOutcome::Done,
-                "{info:?} after a finished delete must not strand the task"
+                "{info:?} after a finished delete says nothing about the path being gone"
             );
         }
     }

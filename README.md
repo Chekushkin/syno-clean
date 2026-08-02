@@ -322,8 +322,11 @@ tool could destroy the wrong data, so it is built to **refuse rather than guess*
    match an unrelated folder and be recursively deleted.
 3. The file list is absent or empty (HTTP/FTP/NZB downloads have none) → the title is
    used.
-4. The destination is normalized (a leading `/volumeN` stripped, surrounding slashes
-   trimmed) and joined as `/{destination}/{name}`.
+4. The destination is normalized (a leading volume mount stripped — `/volume1`,
+   `/volume`, `/volumeUSB1/usbshare1-2`, `/volumeSATA1/…` — and surrounding slashes
+   trimmed) and joined as `/{destination}/{name}`. A *relative* destination is never
+   touched, and an absolute first component that is not a mount point (`/downloads`)
+   is already share-rooted and left alone.
 5. The normalized destination is **empty** → **the task is refused**. With no
    destination there is no share to root the path at, and `/{name}` would name a share
    rather than a directory inside one.
@@ -342,11 +345,21 @@ the task's own directory.
 Before any recursive delete, `SYNO.FileStation.List` `getinfo` is called on the
 resolved path:
 
-- **not found** → the file phase is *skipped* (the files were probably already removed
-  by hand) and only the DSM task is deleted, which is the harmless half;
+- **not found**, for a task that never finished → the file phase is *skipped*
+  (Download Station cleans up its own partial data) and only the DSM task is deleted,
+  which is the harmless half;
+- **not found**, for a task that **finished, is seeding or is extracting** → its
+  payload demonstrably existed, so nothing being there says the resolved location is
+  wrong far more often than it says the files are gone. The item fails and the task
+  stays, because deleting it would leave that payload with nothing pointing at it.
+  (A path this same run already deleted is exempt — the absence is explained.)
 - **found** → proceed;
 - **an error** (a permission problem, say) → that is not absence: the item fails and
   the task is left alone rather than being deleted while its files stay behind.
+
+After the delete reports itself finished the path is looked up once more. Still there,
+an error code, or a lookup that fails outright all keep the task: only an answer that
+actually says "gone" completes the item.
 
 ### 4. Three phases, ordered for recoverability
 
@@ -395,7 +408,12 @@ one.
   untouched must mean it.
 - **`--no-delete-files`** (or `delete_files = false`) — removes the Download Station
   task only and leaves the files on the volume. The dialog says so, and the totals line
-  reads "left on disk" instead of "to free".
+  reads "left on disk" instead of "to free". This is also the way to remove a task
+  whose on-disk location cannot be worked out — no destination, or a file list with
+  several top-level directories. Those rows are `SKIPPED` in the normal flow, because
+  a recursive delete that cannot be aimed must not be followed by removing the only
+  pointer to the data; with the files out of scope there is nothing left to be unsure
+  about, so they are listed as ordinary deletable rows.
 
 ## Troubleshooting
 

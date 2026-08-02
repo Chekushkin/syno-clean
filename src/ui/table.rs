@@ -17,10 +17,14 @@
 //!   *dropping* is deliberately out of scope for v1 — on a terminal narrower
 //!   than [`ideal_width`] the rightmost columns are simply clipped by the
 //!   buffer, which is a cosmetic loss, not a broken frame.
-//! * **The scroll offset is derived, never stored.** [`scroll_offset`] is a
-//!   pure function of the cursor, the row count and the viewport height, so
-//!   there is no second piece of state that can disagree with the cursor after
-//!   a refresh reorders the list.
+//! * **The scroll offset is stored, and re-clamped on every use.** Scrolling is
+//!   *edge-triggered* — the window moves only when the cursor would leave it —
+//!   and that cannot be expressed by a function of the cursor alone, which can
+//!   only ever pin the cursor to one row of the viewport. So [`App`] holds the
+//!   offset and [`scroll_offset`] clamps it against the current cursor, row
+//!   count and height each time it is asked, which keeps the property the
+//!   derived version was for: a stale offset self-corrects instead of showing
+//!   the wrong rows.
 //! * **Rendering stays a pure function of `&App`.** Everything here reads;
 //!   nothing writes back.
 
@@ -206,21 +210,35 @@ pub fn column_widths(total: usize) -> [usize; COLUMNS.len()] {
     widths
 }
 
-/// The first visible row for a given cursor position.
+/// Where the window should sit, given where it sat last (`previous`) and where
+/// the cursor is now.
 ///
-/// Derived rather than stored: the window is the smallest one that contains the
-/// cursor, and it never scrolls past the end of the list, so it cannot get out
-/// of step with a cursor that a refresh moved. A cursor already inside the
-/// first page leaves the offset at zero.
-pub fn scroll_offset(cursor: usize, rows: usize, height: usize) -> usize {
+/// **Edge-triggered.** The window only moves when the cursor would otherwise
+/// leave it: any offset that keeps the cursor on screen is kept as it is, and
+/// only a cursor past an edge drags the window by the minimum needed. The
+/// alternative — deriving the offset from the cursor alone — has exactly one
+/// solution for `cursor >= height`, `cursor - height + 1`, which glues the
+/// cursor to the bottom row: the user can never see a single row below where
+/// they are, and every arrow press repaints the whole table.
+///
+/// **A stale `previous` cannot show the wrong rows.** The result is clamped
+/// against the *current* row count and cursor on every call, so an offset left
+/// over from a longer list, a narrower window or a cursor a refresh moved
+/// self-corrects on the next frame — the safety property the previously derived
+/// offset had, kept without its behaviour.
+pub fn scroll_offset(previous: usize, cursor: usize, rows: usize, height: usize) -> usize {
     if rows == 0 || height == 0 {
         return 0;
     }
-    // The offset that would put the cursor on the bottom row, capped so the
-    // final page is full rather than trailing off into blank rows.
-    cursor
-        .saturating_sub(height - 1)
-        .min(rows.saturating_sub(height))
+    let cursor = cursor.min(rows - 1);
+    // Never past a full last page: the frame is never padded with blank rows
+    // below a short tail.
+    let last_page = rows.saturating_sub(height);
+    // The window that puts the cursor on its bottom row is the furthest down it
+    // may sit; putting the cursor on the top row is the furthest up.
+    let lowest = cursor.saturating_sub(height - 1);
+    let highest = cursor.min(last_page);
+    previous.clamp(lowest, highest)
 }
 
 /// The compact status word shown in the Status column.
@@ -386,7 +404,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let visible = app.visible();
     let height = body_area.height as usize;
-    let offset = scroll_offset(app.cursor, visible.len(), height);
+    // Clamped against *this* frame's height, which the app may not have been
+    // told about yet — a resize is seen here one draw before `set_page_size`.
+    let offset = app.scroll_offset(height);
     let rows: Vec<Line> = visible
         .iter()
         .enumerate()
@@ -472,16 +492,19 @@ mod tests {
     #[test]
     fn a_list_that_fits_is_never_scrolled() {
         for cursor in 0..10 {
-            assert_eq!(scroll_offset(cursor, 10, 10), 0, "{cursor}");
-            assert_eq!(scroll_offset(cursor, 10, 40), 0, "{cursor}");
+            assert_eq!(scroll_offset(0, cursor, 10, 10), 0, "{cursor}");
+            assert_eq!(scroll_offset(0, cursor, 10, 40), 0, "{cursor}");
         }
     }
 
     #[test]
     fn scrolling_keeps_the_cursor_on_screen() {
         let (rows, height) = (100, 10);
+        // Walking down the list one row at a time, carrying the offset along,
+        // is what the arrow keys do.
+        let mut offset = 0;
         for cursor in 0..rows {
-            let offset = scroll_offset(cursor, rows, height);
+            offset = scroll_offset(offset, cursor, rows, height);
             assert!(offset <= cursor, "cursor {cursor} scrolled off the top");
             assert!(
                 cursor < offset + height,
@@ -491,23 +514,72 @@ mod tests {
     }
 
     #[test]
+    fn the_window_only_moves_when_the_cursor_would_leave_it() {
+        // The bug this replaced: an offset derived from the cursor alone is
+        // `cursor - height + 1` for every cursor past the first page, which
+        // glues the cursor to the bottom row and repaints on every key.
+        let (rows, height) = (100, 10);
+
+        // Moving down inside the window leaves it exactly where it was...
+        for cursor in 0..height {
+            assert_eq!(scroll_offset(0, cursor, rows, height), 0, "{cursor}");
+        }
+        // ...and stepping off the bottom edge moves it by one row, no more.
+        assert_eq!(scroll_offset(0, height, rows, height), 1);
+        assert_eq!(scroll_offset(1, height + 1, rows, height), 2);
+
+        // Coming back up: the window stays put until the cursor passes its top
+        // row, which is where the old behaviour dragged it down a row per press.
+        assert_eq!(scroll_offset(20, 29, rows, height), 20);
+        assert_eq!(scroll_offset(20, 20, rows, height), 20);
+        assert_eq!(scroll_offset(20, 19, rows, height), 19);
+
+        // There are always rows visible below the cursor after moving down into
+        // a window that has room — the property the user actually notices.
+        let offset = scroll_offset(20, 25, rows, height);
+        assert!(offset + height - 1 > 25, "no rows visible below the cursor");
+    }
+
+    #[test]
     fn the_scroll_offset_never_runs_past_the_end_of_the_list() {
-        // The window puts the cursor on the bottom row...
-        assert_eq!(scroll_offset(89, 100, 10), 80);
-        assert_eq!(scroll_offset(95, 100, 10), 86);
-        // ...but never scrolls past a full last page: 100 rows in a 10-row
-        // window tops out at 90, so the frame is never padded with blanks.
-        assert_eq!(scroll_offset(99, 100, 10), 90);
-        assert_eq!(scroll_offset(100, 100, 10), 90);
+        // A jump to the far end drags the window the minimum: the cursor lands
+        // on the bottom row...
+        assert_eq!(scroll_offset(0, 89, 100, 10), 80);
+        assert_eq!(scroll_offset(0, 95, 100, 10), 86);
+        // ...but never past a full last page: 100 rows in a 10-row window tops
+        // out at 90, so the frame is never padded with blanks.
+        assert_eq!(scroll_offset(0, 99, 100, 10), 90);
+        assert_eq!(scroll_offset(0, 100, 100, 10), 90);
+        // ...and a stored offset that is already past the end is pulled back,
+        // which is how a refresh that shortened the list corrects itself.
+        assert_eq!(scroll_offset(400, 50, 100, 10), 50);
+        assert_eq!(scroll_offset(400, 99, 100, 10), 90);
+    }
+
+    #[test]
+    fn a_stale_offset_is_re_clamped_rather_than_trusted() {
+        // The safety property of the old derived offset, kept: whatever is
+        // stored, the cursor is on screen and the window is inside the list.
+        for previous in [0, 3, 40, 999] {
+            for cursor in [0usize, 7, 13] {
+                let offset = scroll_offset(previous, cursor, 14, 5);
+                assert!(offset <= cursor.min(13), "{previous}/{cursor}: {offset}");
+                assert!(
+                    cursor.min(13) < offset + 5,
+                    "{previous}/{cursor}: {offset} hides the cursor"
+                );
+                assert!(offset <= 14 - 5, "{previous}/{cursor}: {offset} past end");
+            }
+        }
     }
 
     #[test]
     fn a_degenerate_viewport_or_list_scrolls_to_zero() {
-        assert_eq!(scroll_offset(0, 0, 10), 0);
-        assert_eq!(scroll_offset(5, 0, 10), 0);
-        assert_eq!(scroll_offset(5, 10, 0), 0);
+        assert_eq!(scroll_offset(0, 0, 0, 10), 0);
+        assert_eq!(scroll_offset(3, 5, 0, 10), 0);
+        assert_eq!(scroll_offset(3, 5, 10, 0), 0);
         // A cursor somehow past the end still yields a valid offset.
-        assert_eq!(scroll_offset(500, 10, 4), 6);
+        assert_eq!(scroll_offset(0, 500, 10, 4), 6);
     }
 
     // ---- cell contents ----------------------------------------------------
