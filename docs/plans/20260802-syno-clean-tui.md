@@ -264,12 +264,19 @@ Name absorbs slack and truncates with an ellipsis at correct **display width** (
 - Create: `src/error.rs`
 - Modify: `src/main.rs`
 
-- [ ] define `Error` enum with `thiserror`: `Http`, `Dsm { code, api }`, `Config`, `Io`, `Parse`, `Auth`, `UnsafePath`, `ApiUnavailable`
-- [ ] implement `dsm_message(code, api) -> &'static str` for common codes: 100 unknown error, 101 invalid parameter, 102 API does not exist, 103 method does not exist, 105 insufficient user privilege, 106 session timeout, 107 session interrupted by duplicate login, 119 invalid SID
-- [ ] implement the **auth** code table correctly — 400 no such account or incorrect password, **401 account disabled**, **402 permission denied**, 403 2-step verification code required, 404 failed to authenticate 2-step verification code, 406 enforce 2-step verification, 407 blocked IP source, 408 expired password (cannot change), 409 expired password, 410 password must be changed
-- [ ] add `Result<T>` alias; wire `error` module into `main.rs`
-- [ ] write tests for `dsm_message` — known codes map to specific text (assert 400/401/402 individually, since these are the ones most easily transposed), unknown codes fall back to a generic message including the numeric code
-- [ ] run `cargo test` — must pass before task 3
+- [x] define `Error` enum with `thiserror`: `Http`, `Dsm { code, api }`, `Config`, `Io`, `Parse`, `Auth`, `UnsafePath`, `ApiUnavailable`
+- [x] implement `dsm_message(code, api) -> &'static str` for common codes: 100 unknown error, 101 invalid parameter, 102 API does not exist, 103 method does not exist, 105 insufficient user privilege, 106 session timeout, 107 session interrupted by duplicate login, 119 invalid SID — signature landed as `-> String` (see note below); 104 added as well
+- [x] implement the **auth** code table correctly — 400 no such account or incorrect password, **401 account disabled**, **402 permission denied**, 403 2-step verification code required, 404 failed to authenticate 2-step verification code, 406 enforce 2-step verification, 407 blocked IP source, 408 expired password (cannot change), 409 expired password, 410 password must be changed
+- [x] add `Result<T>` alias; wire `error` module into `main.rs` — via a new `src/lib.rs` (see note below)
+- [x] write tests for `dsm_message` — known codes map to specific text (assert 400/401/402 individually, since these are the ones most easily transposed), unknown codes fall back to a generic message including the numeric code
+- [x] run `cargo test` — must pass before task 3 — 13 tests pass
+
+⚠️ **Decisions taken during Task 2** (plan text above kept verbatim; actuals recorded here):
+- `dsm_message` returns **`String`, not `&'static str`**. The two bullets conflict: a `&'static str` cannot embed the numeric code that the fallback test requires. `String` satisfies both; the known-code tables are still `&'static str` internally.
+- The auth 400-range table is applied **only when `api == "SYNO.API.Auth"`**. Download Station and File Station have their own, different 400-range meanings, so a DS 400 falls through to the generic "unrecognized DSM error code 400" rather than rendering as "incorrect password". Covered by a test.
+- ➕ **Added `src/lib.rs`.** In a bin-only crate, every `pub` item not yet reachable from `main` is a `dead_code` warning, and `-D warnings` makes that a hard failure on *every* task until the module is wired in. A library root removes the friction without disabling the lint and lets `tests/` reach the code; `main.rs` is now a thin shell over `syno_clean::`. The module list in the layout above is otherwise unchanged. Recorded in `CLAUDE.md`.
+- ➕ Added `is_session_error()` / `SESSION_ERROR_CODES` (106/107/119) and `OTP_REQUIRED_CODE` (403) here rather than in Task 4, so the retry and 2FA rules have one definition.
+- ➕ `ApiUnavailable` carries an `ApiUnavailableReason` (`NotInstalled` / `VersionMismatch`) so Task 4's `pick_version` has a place to report a non-overlapping range, and missing APIs render by DSM package name ("File Station is not installed on this NAS").
 
 ### Task 3: Config file, CLI flags, env overrides, and validation
 
