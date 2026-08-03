@@ -68,9 +68,7 @@ use tokio::task::JoinHandle;
 use crate::api::client::SynoClient;
 use crate::api::download_station;
 use crate::api::file_station::{self, PathInfo};
-use crate::delete::{
-    self, DeleteItem, DeleteOptions, DeletePlan, ExpectedKind, NameSource, Op, PayloadState,
-};
+use crate::delete::{self, DeleteItem, DeleteOptions, DeletePlan, ExpectedKind, Op, PayloadState};
 use crate::error::{Error, Result};
 use crate::model::Task;
 
@@ -544,12 +542,12 @@ enum OpOutcome {
 /// from, and what should be found there.
 ///
 /// The two are carried together because they are the two halves of the same
-/// question — [`NameSource`] says how to read an *absent* answer,
+/// question — `named` says whether anything resolved a path at all,
 /// [`ExpectedKind`] how to read a *present* one — and because a five-argument
 /// decision function invites a caller to line the wrong ones up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileTarget {
-    name_source: Option<NameSource>,
+    named: bool,
     expected_kind: ExpectedKind,
 }
 
@@ -557,7 +555,7 @@ impl FileTarget {
     /// What the snapshot resolved for this item.
     fn of_item(item: &DeleteItem) -> Self {
         FileTarget {
-            name_source: item.name_source,
+            named: item.named,
             expected_kind: item.expected_kind,
         }
     }
@@ -636,7 +634,7 @@ fn decide_file_phase(
     already_deleted: bool,
 ) -> OpOutcome {
     let FileTarget {
-        name_source,
+        named,
         expected_kind,
     } = target;
 
@@ -701,7 +699,7 @@ fn decide_file_phase(
         // and refused here rather than reasoned about, because "nothing named
         // this path" is the one input that authorizes nothing whatever the
         // counters say.
-        PathInfo::Missing if name_source.is_none() => OpOutcome::Failed(format!(
+        PathInfo::Missing if !named => OpOutcome::Failed(format!(
             "nothing at {path}, and nothing in the task names that path; refusing to delete \
              the task (use --no-delete-files to remove the task anyway)"
         )),
@@ -710,15 +708,6 @@ fn decide_file_phase(
         // guess at. A task that never wrote one has nothing on the volume to
         // orphan, so its absent path is benign whatever named it.
         PathInfo::Missing if !delete::payload_should_exist(payload) => OpOutcome::NothingThere,
-        PathInfo::Missing if name_source != Some(NameSource::FileList) => {
-            OpOutcome::Failed(format!(
-                "nothing at {path}, but this task has finished downloading, so its data should \
-             be there — and that path was only guessed from the task's title rather than read \
-             from its file list, so the guess is the likeliest thing to be wrong; refusing to \
-             delete the task, which would leave no pointer to the data (use --no-delete-files \
-             to remove the task anyway)"
-            ))
-        }
         PathInfo::Missing => OpOutcome::Failed(format!(
             "nothing at {path}, but this task has finished downloading, so its data should be \
              there — the resolved location is more likely wrong than the files already gone; \
@@ -1647,7 +1636,7 @@ mod tests {
         // is in doubt. This is a **real** run, not a dry one.
         let refused: Vec<Task> = fixture_tasks()
             .into_iter()
-            .filter(|task| task.id == "dbid_013")
+            .filter(|task| task.id == "dbid_010")
             .collect();
         assert_eq!(refused.len(), 1);
         let plan = DeletePlan::snapshot(refused.iter());
@@ -1685,7 +1674,7 @@ mod tests {
         // reporting the ops that *would* run.
         let refused: Vec<Task> = fixture_tasks()
             .into_iter()
-            .filter(|task| task.id == "dbid_013")
+            .filter(|task| task.id == "dbid_010")
             .collect();
         let plan = DeletePlan::snapshot(refused.iter());
         assert!(plan.items[0].is_refused());
@@ -1754,7 +1743,7 @@ mod tests {
             // A share root: `resolve_delete_target` can never produce one, so the
             // only way it arrives here is a bug between the snapshot and now.
             target: delete::Target::Path("/downloads".to_string()),
-            name_source: Some(NameSource::FileList),
+            named: true,
             expected_kind: ExpectedKind::Dir,
         };
         let plan = DeletePlan { items: vec![item] };
@@ -1797,7 +1786,7 @@ mod tests {
     /// multi-file torrent resolves to, and the ordinary shape.
     fn dir_from_file_list() -> FileTarget {
         FileTarget {
-            name_source: Some(NameSource::FileList),
+            named: true,
             expected_kind: ExpectedKind::Dir,
         }
     }
@@ -1862,7 +1851,7 @@ mod tests {
             PathInfo::Found { is_dir: true },
             "/downloads/X.iso",
             FileTarget {
-                name_source: Some(NameSource::FileList),
+                named: true,
                 expected_kind: ExpectedKind::File,
             },
             &partial(TaskStatus::Finished),
@@ -1892,7 +1881,7 @@ mod tests {
                 PathInfo::Found { is_dir: false },
                 "/downloads/X.iso",
                 FileTarget {
-                    name_source: Some(NameSource::FileList),
+                    named: true,
                     expected_kind: ExpectedKind::File,
                 },
                 &partial(TaskStatus::Seeding),
@@ -1916,7 +1905,7 @@ mod tests {
                     PathInfo::Found { is_dir },
                     "/downloads/X",
                     FileTarget {
-                        name_source: Some(NameSource::Title),
+                        named: true,
                         expected_kind: ExpectedKind::AnyFromTitle,
                     },
                     &partial(TaskStatus::Finished),
@@ -1941,7 +1930,7 @@ mod tests {
                 PathInfo::Found { is_dir },
                 "/downloads/X",
                 FileTarget {
-                    name_source: Some(NameSource::FileList),
+                    named: true,
                     expected_kind: ExpectedKind::Indeterminate,
                 },
                 &partial(TaskStatus::Downloading),
@@ -1984,8 +1973,11 @@ mod tests {
             ..fixture_task("dbid_001")
         };
         let item = &DeletePlan::snapshot([&task]).items[0];
-        assert_eq!(item.name_source, Some(NameSource::FileList));
-        assert_eq!(item.expected_kind, ExpectedKind::Indeterminate);
+        assert!(item.named);
+        // A multi-entry list means a container whatever the entries say, so a
+        // malformed list no longer makes the expectation indeterminate — it
+        // cannot mislead a path it does not name.
+        assert_eq!(item.expected_kind, ExpectedKind::Dir);
 
         let outcome = decide_file_phase(
             PathInfo::Found { is_dir: true },
@@ -1994,7 +1986,7 @@ mod tests {
             &item.payload_state(),
             false,
         );
-        assert!(matches!(outcome, OpOutcome::Failed(_)), "{outcome:?}");
+        assert_eq!(outcome, OpOutcome::Done, "a directory is what was expected");
     }
 
     #[test]
@@ -2078,20 +2070,20 @@ mod tests {
         // The retry after a post-delete check that could not be made: the files
         // went, this process knows it, and the strictness above must not turn
         // that into a task nothing can ever remove.
-        for source in [NameSource::FileList, NameSource::Title] {
+        {
             assert_eq!(
                 decide_file_phase(
                     PathInfo::Missing,
                     "/downloads/X",
                     FileTarget {
-                        name_source: Some(source),
+                        named: true,
                         expected_kind: ExpectedKind::Dir,
                     },
                     &partial(TaskStatus::Finished),
                     true
                 ),
                 OpOutcome::NothingThere,
-                "{source:?}"
+                "a path this run deleted reads as gone"
             );
         }
     }
@@ -2100,18 +2092,21 @@ mod tests {
     /// metadata to say what kind of object to expect.
     fn from_title() -> FileTarget {
         FileTarget {
-            name_source: Some(NameSource::Title),
+            named: true,
             expected_kind: ExpectedKind::AnyFromTitle,
         }
     }
 
     #[test]
-    fn an_absent_path_guessed_from_the_title_is_a_failure_when_the_payload_should_be_there() {
-        // The path came from the display title, which nothing corroborates. For
-        // a task whose payload demonstrably existed, an empty answer is at
-        // least as likely to mean the guess missed as to mean the data is gone
-        // — and deleting the task would destroy the only pointer to a payload
-        // still sitting on the volume.
+    fn an_absent_path_is_a_failure_when_the_payload_should_be_there() {
+        // For a task whose payload demonstrably existed, an empty answer is at
+        // least as likely to mean the resolved location is wrong as to mean the
+        // data is gone — and deleting the task would destroy the only pointer
+        // to a payload still sitting on the volume.
+        //
+        // This no longer turns on where the name came from: it is always the
+        // title, and the title is what Download Station writes. The counters
+        // are the whole question.
         let outcome = decide_file_phase(
             PathInfo::Missing,
             "/downloads/X",
@@ -2121,12 +2116,12 @@ mod tests {
         );
         assert!(
             matches!(&outcome, OpOutcome::Failed(why)
-                if why.contains("guessed") && why.contains("--no-delete-files")),
+                if why.contains("more likely wrong") && why.contains("--no-delete-files")),
             "{outcome:?}"
         );
 
         // Status is not the only evidence: a task paused at 100% has its whole
-        // payload on disk, so the title guess is worth refusing over there too.
+        // payload on disk, so an absent path is worth refusing over there too.
         let outcome = decide_file_phase(
             PathInfo::Missing,
             "/downloads/X",
@@ -2139,7 +2134,7 @@ mod tests {
             false,
         );
         assert!(
-            matches!(&outcome, OpOutcome::Failed(why) if why.contains("guessed")),
+            matches!(&outcome, OpOutcome::Failed(why) if why.contains("more likely wrong")),
             "{outcome:?}"
         );
     }
@@ -2200,7 +2195,7 @@ mod tests {
                 PathInfo::Missing,
                 "/downloads/X",
                 FileTarget {
-                    name_source: None,
+                    named: false,
                     expected_kind: ExpectedKind::Indeterminate,
                 },
                 &partial(TaskStatus::Downloading),
@@ -2229,7 +2224,7 @@ mod tests {
             ..fixture_task("dbid_007")
         };
         let item = &DeletePlan::snapshot([&task]).items[0];
-        assert_eq!(item.name_source, Some(NameSource::Title));
+        assert!(item.named);
 
         assert_eq!(
             decide_file_phase(
@@ -2381,7 +2376,7 @@ mod tests {
             ..fixture_task("dbid_001")
         };
         let item = &DeletePlan::snapshot([&seeding]).items[0];
-        assert_eq!(item.name_source, Some(NameSource::FileList));
+        assert!(item.named);
         assert!(
             item.downloaded < item.size,
             "the counters must not be able to answer this on their own"

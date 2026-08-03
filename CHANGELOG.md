@@ -11,6 +11,28 @@ Nothing yet.
 
 ## [0.1.0] - unreleased
 
+### Fixed
+
+- **The on-disk path is now taken from the task's title, not from the file list's
+  common top-level component.** Download Station names what it writes after the task
+  — a container directory for a multi-file torrent, the filename itself for a
+  single-file one — and the file list is relative to that container, so it can never
+  name it. The old rule refused 15 of 41 tasks on a real DSM 7 NAS because their
+  entries shared no top-level component, and for two Blu-ray torrents (file list
+  `BDMV/…`) it resolved to `/video/BDMV` when the payload was `/video/{title}/BDMV/…`
+  — a path that could have belonged to something else. The file list is now used for
+  what it can attest: the *shape* to expect, checked against the volume before any
+  delete.
+- **File Station is pinned to API v2.** `path` is sent as a JSON array — the only
+  encoding safe for a filename containing a comma — and v1 cannot parse one: it kills
+  the backend CGI and DSM answers `502 Bad Gateway`, which made every delete fail at
+  the existence check.
+- The startup banner no longer occupies the footer for the whole session, which hid
+  the key hints in every real run. The connection moved to the title bar.
+- The password is asked for only when it is actually needed: a valid cached session
+  now saves the typing, not just a round trip.
+
+
 First release. Everything below is the initial implementation; there is no previous
 version to have changed anything from.
 

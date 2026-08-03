@@ -334,20 +334,34 @@ the deliberate one-key confirm. `q` closes the dialog rather than the program.
 Deriving "which directory holds this torrent" from the DSM API is the one place this
 tool could destroy the wrong data, so it is built to **refuse rather than guess**.
 
-### 1. Path resolution refuses ambiguity
+### 1. The path comes from the task, and the file list checks it
 
-1. The task's file list has a single common top-level component → that is the on-disk
-   name, even when the display title differs from it.
-2. The file list has **no** single common top-level component → **the task is skipped**
-   and reported as such. It does *not* fall back to the title: a guessed path could
-   match an unrelated folder and be recursively deleted.
+1. **The on-disk name is the task's title.** Download Station names what it writes
+   after the task: a container directory for a multi-file torrent, and for a
+   single-file torrent the title *is* the filename. That is also what the BitTorrent
+   spec says — `info.name` is the directory for a multi-file torrent and the file name
+   for a single-file one.
+2. **The file list says what shape to expect there**, and is checked against what is
+   actually on the volume (see [4](#4-existence-check-before-deleting)):
+   one entry with no separator means a **file**; anything else non-empty means the
+   **directory** Download Station created.
 3. The file list is absent or empty **on a task type that has none** (HTTP, FTP, NZB,
-   eMule) → the title is used. It is the on-disk name for those types.
+   eMule) → nothing says which shape to expect, so either is accepted.
 4. The file list is absent or empty **on a BitTorrent task** → **the task is skipped**.
-   A torrent always has a file list, so one arriving without it is an anomaly, and the
-   title is exactly the value rule 2 already refuses to trust. (`--no-delete-files`
+   A torrent always has a file list, so one arriving without it means this program does
+   not understand the record — and nothing corroborates the shape. (`--no-delete-files`
    still removes such a row.)
-5. The destination is normalized (a leading volume mount stripped — `/volume1`,
+
+> Earlier versions took the on-disk name from the file list's common top-level
+> component instead, and refused any task whose entries shared none. Measured against a
+> real DSM 7 NAS: that refused 15 of 41 tasks outright, and for two Blu-ray torrents
+> (file list `BDMV/…`) it aimed at `/video/BDMV` when the payload was really
+> `/video/{title}/BDMV/…`. The current rule resolved all 40 tasks that had a
+> destination to a path that exists, with the expected kind.
+
+### 2. The destination is normalized, and an empty one is refused
+
+1. The destination is normalized (a leading volume mount stripped — `/volume1`,
    `/volume`, `/volumeUSB1/usbshare1-2`, `/volumeSATA1/…` — and surrounding slashes
    trimmed) and joined as `/{destination}/{name}`. A *relative* destination is never
    touched, and an absolute first component that is not a mount point (`/downloads`)
@@ -355,11 +369,11 @@ tool could destroy the wrong data, so it is built to **refuse rather than guess*
    `volume`, `volume<N>`, `volumeUSB<N>`, `volumeSATA<N>` — so a share that merely
    starts with the word (`/volumes/movies`, `/volume-media/tv`) keeps its first
    component instead of having the delete re-rooted into a different share.
-6. The normalized destination is **empty** → **the task is refused**. With no
+2. The normalized destination is **empty** → **the task is refused**. With no
    destination there is no share to root the path at, and `/{name}` would name a share
    rather than a directory inside one.
 
-### 2. Syntactic guards
+### 3. Syntactic guards
 
 A resolved path is refused — leaving the task completely untouched — if it is empty,
 `/`, has fewer than two components (never delete a share root), lacks a leading `/`,
@@ -368,7 +382,7 @@ contains a control character. The on-disk name is separately required to be a si
 component, so a title fallback cannot smuggle in a `/` and aim one level deeper than
 the task's own directory.
 
-### 3. Existence check before deleting
+### 4. Existence check before deleting
 
 Before any recursive delete, `SYNO.FileStation.List` `getinfo` is called on the
 resolved path:
@@ -405,7 +419,7 @@ After the delete reports itself finished the path is looked up once more. Still 
 an error code, or a lookup that fails outright all keep the task: only an answer that
 actually says "gone" completes the item.
 
-### 4. Three phases, ordered for recoverability
+### 5. Three phases, ordered for recoverability
 
 | Task status | Ordering |
 |---|---|
@@ -420,7 +434,7 @@ accepting a `pause` only means the request was queued.
 is not deleted either — it survives still pointing at its data, so nothing is ever
 orphaned.
 
-### 5. What you see is what goes
+### 6. What you see is what goes
 
 ```text
   Absolute.Dest… fi┌ Delete 2 tasks ────────────────────────────────────────────────────────────────┐ ∞ /volume1/downlo…
@@ -457,8 +471,8 @@ one.
   (`force_complete=false`, which is deliberate — the alternative marks the task
   complete and keeps a half-downloaded file). The dialog says that too, per row and in
   the totals, so those bytes are never counted as staying. This is also the way to remove a task
-  whose on-disk location cannot be worked out — no destination, a file list with
-  several top-level directories, or a torrent with no file list at all. Those rows are `SKIPPED` in the normal flow, because
+  whose on-disk location cannot be worked out — no destination, or a torrent that
+  reports no file list at all. Those rows are `SKIPPED` in the normal flow, because
   a recursive delete that cannot be aimed must not be followed by removing the only
   pointer to the data; with the files out of scope there is nothing left to be unsure
   about, so they are listed as ordinary deletable rows.

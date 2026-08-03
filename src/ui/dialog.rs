@@ -1210,9 +1210,9 @@ mod tests {
 
     #[test]
     fn a_refused_item_is_reported_as_skipped_with_its_reason() {
-        // dbid_013's files share no common root, so `delete.rs` refuses it. The
-        // user must be able to see that, not have it quietly dropped.
-        let summary = summary(&["dbid_001", "dbid_013"]);
+        // dbid_010 reports no destination, so `delete.rs` refuses it. The user
+        // must be able to see that, not have it quietly dropped.
+        let summary = summary(&["dbid_001", "dbid_010"]);
 
         assert_eq!(summary.delete_count, 1);
         assert_eq!(summary.skipped_count, 1);
@@ -1224,26 +1224,22 @@ mod tests {
             .find(|line| line.kind == LineKind::Skipped)
             .expect("a skipped line");
         assert!(skipped.text.contains(SKIP_MARKER), "{:?}", skipped.text);
-        assert!(skipped.text.contains("Mixed.Root.Release"));
+        assert!(skipped.text.contains("Hosted.Archive.Part1of3"));
 
         let reason = summary
             .lines
             .iter()
             .find(|line| line.kind == LineKind::Reason)
             .expect("a reason line");
-        assert!(
-            reason.text.contains("no single top-level"),
-            "{:?}",
-            reason.text
-        );
+        assert!(reason.text.contains("no destination"), "{:?}", reason.text);
     }
 
     #[test]
     fn a_refused_items_bytes_are_excluded_from_the_total() {
-        let refused = task("dbid_013");
+        let refused = task("dbid_010");
         assert!(refused.size > 0, "the refused task must have a size");
 
-        let summary = summary(&["dbid_001", "dbid_013"]);
+        let summary = summary(&["dbid_001", "dbid_010"]);
         assert_eq!(summary.total_size, task("dbid_001").size);
         assert!(
             !summary.totals.contains(&format::bytes(refused.size)),
@@ -1254,19 +1250,19 @@ mod tests {
 
     #[test]
     fn a_plan_of_nothing_but_refusals_promises_no_deletion() {
-        let summary = summary(&["dbid_010", "dbid_011", "dbid_013"]);
+        let summary = summary(&["dbid_010", "dbid_011"]);
         assert_eq!(summary.delete_count, 0);
-        assert_eq!(summary.skipped_count, 3);
+        assert_eq!(summary.skipped_count, 2);
         assert_eq!(summary.total_size, 0);
         assert!(summary.totals.contains("Nothing"), "{:?}", summary.totals);
-        assert!(summary.totals.contains("3 skipped"), "{:?}", summary.totals);
+        assert!(summary.totals.contains("2 skipped"), "{:?}", summary.totals);
         assert!(summary.title.contains("0 tasks"), "{:?}", summary.title);
     }
 
     #[test]
     fn items_are_listed_in_snapshot_order_not_grouped_by_outcome() {
         // The dialog's rows have to map onto the rows the user selected.
-        let summary = summary(&["dbid_013", "dbid_001"]);
+        let summary = summary(&["dbid_010", "dbid_001"]);
         assert_eq!(summary.lines[0].kind, LineKind::Skipped);
         assert_eq!(summary.lines[2].kind, LineKind::Delete);
     }
@@ -1409,17 +1405,31 @@ mod tests {
     #[test]
     fn a_refused_finished_row_still_says_no_file_is_touched() {
         // The other half of the same rule, so the qualification cannot creep
-        // onto rows whose payload really does survive. dbid_013 is seeding —
-        // complete — and its file list has no single root, so it is refused.
+        // onto rows whose payload really does survive. No fixture row is both
+        // refused *and* complete, so build one: a torrent reporting no file
+        // list is refused, and one that has finished downloading has a payload
+        // on the volume that outlives a task-only delete.
         let options = DeleteOptions {
             delete_files: false,
             dry_run: false,
         };
+        let finished_but_refused = Task {
+            title: "Refused.But.Complete".to_string(),
+            // A torrent with no file list is rule 4's refusal…
+            task_type: crate::model::TaskType::BitTorrent,
+            // …and `bare_task` is already Finished with downloaded == size.
+            ..crate::testutil::bare_task()
+        };
+        assert!(
+            delete::resolve_delete_target(&finished_but_refused).is_err(),
+            "the row has to be refused for this test to mean anything"
+        );
         assert!(delete::payload_survives_task_delete(
-            &delete::PayloadState::of_task(&task("dbid_013"))
+            &delete::PayloadState::of_task(&finished_but_refused)
         ));
 
-        let summary = build_confirmation(&plan(&["dbid_013"]), options);
+        let plan = DeletePlan::snapshot(std::iter::once(&finished_but_refused));
+        let summary = build_confirmation(&plan, options);
         assert!(
             body(&summary).contains("no file is touched"),
             "{}",
@@ -1459,7 +1469,7 @@ mod tests {
             delete_files: false,
             dry_run: false,
         };
-        let ids = ["dbid_001", "dbid_013"];
+        let ids = ["dbid_001", "dbid_010"];
         let summary = build_confirmation(&plan(&ids), options);
 
         assert_eq!(summary.delete_count, 2);
@@ -1487,7 +1497,7 @@ mod tests {
     fn deleting_files_still_reports_a_refused_item_as_skipped() {
         // The other half of the same rule: with files in scope the refusal is
         // load-bearing again.
-        let summary = summary(&["dbid_001", "dbid_013"]);
+        let summary = summary(&["dbid_001", "dbid_010"]);
         assert_eq!((summary.delete_count, summary.skipped_count), (1, 1));
         assert!(body(&summary).contains(SKIP_MARKER));
     }
@@ -1554,7 +1564,7 @@ mod tests {
         // Every refusal reason names `--no-delete-files` at the end of a long
         // sentence, inside a list that scrolls. This one line does not scroll
         // and is the same whatever was refused.
-        let skipping = summary(&["dbid_001", "dbid_013"]);
+        let skipping = summary(&["dbid_001", "dbid_010"]);
         assert_eq!(skipping.note.as_deref(), Some(SKIP_REMEDY));
         assert!(SKIP_REMEDY.contains("--no-delete-files"));
 
@@ -1570,7 +1580,7 @@ mod tests {
             delete_files: false,
             dry_run: false,
         };
-        let summary = build_confirmation(&plan(&["dbid_001", "dbid_013"]), options);
+        let summary = build_confirmation(&plan(&["dbid_001", "dbid_010"]), options);
         assert_eq!(summary.skipped_count, 0);
         assert_eq!(summary.note, None);
     }

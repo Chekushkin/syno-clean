@@ -2889,7 +2889,7 @@ mod tests {
         // Refusals are part of the snapshot, not an aborted batch: dbid_013's
         // files share no common root and must appear as a skip.
         let mut app = App::new(fixture_tasks());
-        for id in ["dbid_001", "dbid_013"] {
+        for id in ["dbid_001", "dbid_010"] {
             app.selected.insert(id.to_string());
         }
         app.handle_key(press(KeyCode::Char('d')));

@@ -40,6 +40,32 @@ pub fn fixture_task(id: &str) -> Task {
         .unwrap_or_else(|| panic!("fixture has no task {id}"))
 }
 
+/// A minimal task to build a test case on top of with struct-update syntax.
+///
+/// A completed HTTP download in `downloads` with no file list — the shape that
+/// resolves through rule 3 and touches the fewest guards, so a test overriding
+/// two fields is exercising those two fields and nothing else. `Task` has no
+/// `Default` on purpose: every field is real DSM data, and a silently zeroed one
+/// in production would be a parse bug rather than a sensible default.
+pub fn bare_task() -> Task {
+    Task {
+        id: "synthetic".to_string(),
+        title: "Some.Release".to_string(),
+        status: crate::model::TaskStatus::Finished,
+        task_type: crate::model::TaskType::Http,
+        size: 1024,
+        downloaded: 1024,
+        uploaded: 0,
+        download_speed: 0,
+        upload_speed: 0,
+        destination: "downloads".to_string(),
+        files: Vec::new(),
+        seeders: 0,
+        leechers: 0,
+        create_time: None,
+    }
+}
+
 /// A resolved configuration pointing at a host that does not exist.
 ///
 /// `nas.invalid` is in the reserved `.invalid` TLD, so it can never resolve,
