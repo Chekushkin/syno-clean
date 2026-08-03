@@ -46,24 +46,43 @@ use crate::error::{Error, Result};
 pub const FS_LIST_API: &str = "SYNO.FileStation.List";
 /// Version range this client implements for `SYNO.FileStation.List`.
 ///
-/// **Pinned to v1**, for the same reason
-/// [`crate::api::download_station::DS_TASK_SUPPORTED`] is: only the v1 response
-/// shape has been seen from a real NAS. Only `path`, `isdir` and the per-path
-/// `code` are read and those are *believed* stable across v1 and v2, but this
-/// is the API that authorizes an irreversible recursive delete, and a v2
-/// `getinfo` whose shape does not deserialize into [`GetInfo`] would yield an
-/// empty entry list. Widen it once a v2 response has actually been captured.
-pub const FS_LIST_SUPPORTED: VersionRange = (1, 1);
+/// **Pinned to v2, and v2 is required** — not a ceiling but a floor as well.
+///
+/// [`build_fs_path_params`] encodes `path` as a JSON array, which is the only
+/// encoding safe for a delete: a filename may contain a comma, so the
+/// comma-separated form v1 expects is ambiguous exactly where being wrong is
+/// irreversible. **v1 does not accept a JSON array — it kills the backend CGI
+/// and DSM's nginx answers `502 Bad Gateway`.** Verified against DSM 7
+/// (`FamilyNas`, `SYNO.FileStation.List` min 1 / max 2): the identical request
+/// 502s at `version=1` and returns `{"isdir":…,"path":…}` at `version=2`.
+///
+/// So the two are a matched pair — the JSON-array encoding and v2 — and
+/// negotiating *down* to v1 is what breaks. Requiring v2 turns a NAS that
+/// somehow lacks it into a clear `ApiUnavailable` at startup instead of a 502
+/// mid-delete. DSM 7 always ships v2, which is the only DSM this tool targets.
+///
+/// Note this is the opposite situation to
+/// [`crate::api::download_station::DS_TASK_SUPPORTED`], which is genuinely
+/// pinned *down* to v1 because v2/v3 change the response shape `model.rs`
+/// parses. Do not "make them consistent".
+pub const FS_LIST_SUPPORTED: VersionRange = (2, 2);
 
 /// File deletion.
 pub const FS_DELETE_API: &str = "SYNO.FileStation.Delete";
 /// Version range this client implements for `SYNO.FileStation.Delete`.
 ///
-/// Pinned to v1 alongside [`FS_LIST_SUPPORTED`]: [`classify_delete_status`]
-/// reads `finished` and `path_err_num`, and a v2 `status` payload that spells
-/// either of those differently would read as "finished, no errors" for a
-/// delete that removed nothing.
-pub const FS_DELETE_SUPPORTED: VersionRange = (1, 1);
+/// Pinned to v2 alongside [`FS_LIST_SUPPORTED`], and for the same reason:
+/// `start` takes the same JSON-array `path` from [`build_fs_path_params`], so
+/// it inherits v1's inability to parse it.
+///
+/// [`classify_delete_status`] reads `finished` and `path_err_num` from the
+/// `status` payload. `status` itself answers identically on v1 and v2 (both
+/// return `{"error":{"code":599}}` for an unknown taskid), but the field names
+/// in a *real* in-progress payload are still unverified — the probe that
+/// established the version pin was necessarily non-destructive. This is why
+/// `confirm_deleted` re-checks the path with `getinfo` afterwards rather than
+/// trusting `path_err_num` alone.
+pub const FS_DELETE_SUPPORTED: VersionRange = (2, 2);
 
 /// File Station's "no such file or directory".
 pub const FS_NO_SUCH_FILE: i32 = 408;
@@ -657,14 +676,48 @@ mod tests {
     // ---- constants ---------------------------------------------------------
 
     #[test]
-    fn the_two_file_station_apis_are_pinned_to_the_shape_that_has_been_seen() {
-        // Both drive the one irreversible operation in this program, and the
-        // v2 response shapes have never been captured from a real NAS. Widening
-        // either without a captured response is how `classify_getinfo` starts
-        // answering `Unknown` for everything — or, worse, how
-        // `classify_delete_status` starts reading a renamed error count as zero.
-        assert_eq!(FS_LIST_SUPPORTED, (1, 1));
-        assert_eq!(FS_DELETE_SUPPORTED, (1, 1));
+    fn the_two_file_station_apis_require_v2_because_v1_cannot_parse_our_paths() {
+        // Not a ceiling — a floor. `build_fs_path_params` sends `path` as a
+        // JSON array (the only encoding safe for a filename containing a
+        // comma), and v1 does not accept one: it kills the backend CGI and DSM
+        // answers 502 Bad Gateway. Verified against a real DSM 7 NAS, where the
+        // identical `getinfo` 502s at version=1 and succeeds at version=2.
+        //
+        // Lowering either bound to 1 re-breaks every delete on every NAS. If
+        // the JSON-array encoding is ever replaced, revisit this together with
+        // it — the encoding and the version are a matched pair.
+        assert_eq!(FS_LIST_SUPPORTED, (2, 2));
+        assert_eq!(FS_DELETE_SUPPORTED, (2, 2));
+    }
+
+    #[test]
+    fn a_real_nas_getinfo_response_deserializes() {
+        // Captured verbatim from DSM 7 (`SYNO.FileStation.List` v2 `getinfo`).
+        // Three shapes in one: a file, a directory, and a path that is not
+        // there. The absent entry carries `code` and no `isdir`, which is what
+        // `classify_getinfo` keys `PathInfo::Missing` off.
+        let file = r#"{"data":{"files":[{"isdir":false,"name":"a.mp4","path":"/video/a.mp4"}]},"success":true}"#;
+        let dir =
+            r#"{"data":{"files":[{"isdir":true,"name":"video","path":"/video"}]},"success":true}"#;
+        let gone = r#"{"data":{"files":[{"code":408,"path":"/video/nope"}]},"success":true}"#;
+
+        let parse = |body: &str| {
+            crate::api::client::parse_envelope::<GetInfo>(body, FS_LIST_API)
+                .expect("a real NAS response must deserialize")
+        };
+
+        assert_eq!(
+            classify_getinfo(&parse(file), "/video/a.mp4"),
+            PathInfo::Found { is_dir: false }
+        );
+        assert_eq!(
+            classify_getinfo(&parse(dir), "/video"),
+            PathInfo::Found { is_dir: true }
+        );
+        assert_eq!(
+            classify_getinfo(&parse(gone), "/video/nope"),
+            PathInfo::Missing
+        );
     }
 
     #[test]
