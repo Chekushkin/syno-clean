@@ -12,30 +12,31 @@ keyboard, and removes both halves in one confirmed step.
 Nothing is installed on the NAS: it is a plain HTTP client for the documented DSM API.
 
 ```text
- syno-clean 0.1.0                                                                                         14 / 14 tasks
-  Name▲          Status            Size  Progress      ↓ Speed      ↑ Speed  Ratio Seeds/Peers      ETA Destination
-  Absolute.Dest… finished     256.0 MiB    100.0%            —            —   1.00           —        ∞ /volume1/downlo…
-✓ archlinux-202… finished       1.1 GiB    100.0%            —            —   0.50           —        ∞ downloads
-  Big.Buck.Bunn… seeding        1.8 GiB    100.0%            —    1.2 MiB/s   2.14         5/9        ∞ video/movies
-✓ Broken.Releas… error        700.0 MiB      0.0%            —            —   0.00           —        ∞ downloads
-  empty-placeho… waiting            0 B      0.0%            —            —   0.00           —        ∞ downloads
-  Hosted.Archiv… hosting      500.0 MiB      0.0%            —            —   0.00           —        ∞ —
-  LibreOffice.2… paused         3.0 GiB     30.0%            —            —   0.00           —        ∞ software
-  Mixed.Root.Re… seeding        3.0 MiB    100.0%            —     64 KiB/s   0.33         2/1        ∞ video/tv
-  Mystery.Task.… captcha_ne…    1.0 GiB      0.0%            —            —   0.00           —        ∞ —
-  Sintel.2010.2… finishing     12.0 GiB    100.0%    1.0 MiB/s    256 KiB/s   0.17         6/2       1s downloads/incom…
-  Some.Show.S01… checking      20.0 GiB     50.0%            —            —   0.00           —        ∞ video/tv
-  syno-clean-0.… waiting        4.0 MiB      0.0%            —            —   0.00           —        ∞ downloads
-  Ubuntu.24.04.… downloading    5.8 GiB     39.0%    8.5 MiB/s    512 KiB/s   0.05        12/4    7m 7s downloads
-  千と千尋の神…  extracting     8.0 GiB    100.0%            —            —   0.05         3/0        ∞ video/movies
- 2 selected · 1.8 GiB · sort Name▲ · d delete · p/u pause/resume · r refresh · q quit · ? help
+ syno-clean 0.1.0 · eduard@nas.local:5001                                                               14 / 14 tasks
+  Name▲        Status            Size  Progress      ↓ Speed      ↑ Speed  Ratio Seeds/Peers      ETA Destination
+✓ Absolute.De… finished     256.0 MiB    100.0%            —            —   1.00           —        ∞ /volume1/downlo…
+✓ archlinux-2… finished       1.1 GiB    100.0%            —            —   0.50           —        ∞ downloads
+  Big.Buck.Bu… seeding        1.8 GiB    100.0%            —    1.2 MiB/s   2.14         5/9        ∞ video/movies
+  Broken.Rele… error        700.0 MiB      0.0%            —            —   0.00           —        ∞ downloads
+  empty-place… waiting            0 B      0.0%            —            —   0.00           —        ∞ downloads
+  Hosted.Arch… hosting      500.0 MiB      0.0%            —            —   0.00           —        ∞ —
+  LibreOffice… paused         3.0 GiB     30.0%            —            —   0.00           —        ∞ software
+  Mixed.Root.… seeding        3.0 MiB    100.0%            —     64 KiB/s   0.33         2/1        ∞ video/tv
+  Mystery.Tas… captcha_ne…    1.0 GiB      0.0%            —            —   0.00           —        ∞ —
+  Sintel.2010… finishing     12.0 GiB    100.0%    1.0 MiB/s    256 KiB/s   0.17         6/2       1s downloads/incom…
+  Some.Show.S… checking      20.0 GiB     50.0%            —            —   0.00           —        ∞ video/tv
+  syno-clean-… waiting        4.0 MiB      0.0%            —            —   0.00           —        ∞ downloads
+  Ubuntu.24.0… downloading    5.8 GiB     39.0%    8.5 MiB/s    512 KiB/s   0.05        12/4    7m 7s downloads
+  千と千尋の…  extracting     8.0 GiB    100.0%            —            —   0.05         3/0        ∞ video/movies
+ 2 selected · 1.3 GiB · sort Name▲ · d delete · p/u pause/resume · r refresh · q quit · ? help
 ```
 
 > This is **not a photograph of a live session**. It is the program's own renderer
-> drawing one 120x17 frame from the checked-in test fixture
-> (`tests/fixtures/task_list.json`) into an in-memory buffer, with two rows selected —
-> the same `ratatui` `TestBackend` path the layout tests use. Colour and the cursor
-> highlight are lost in plain text; everything else is exactly what the terminal gets.
+> drawing one 118x19 frame from the checked-in test fixture
+> (`tests/fixtures/task_list.json`) into an in-memory buffer, with the top two rows
+> selected — the same `ratatui` `TestBackend` path the layout tests use. Colour and the
+> cursor highlight are lost in plain text; everything else is exactly what the terminal
+> gets, footer hints and all.
 >
 > ⚠️ **A real terminal screenshot (or an asciinema recording) against a live NAS is
 > still outstanding and must be added before v0.1.0 is published.** The fixture behind

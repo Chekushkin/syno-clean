@@ -161,8 +161,21 @@ pub struct App {
     /// and `dry_run` settings. The confirmation modal states both.
     pub delete_options: DeleteOptions,
     /// One line of feedback shown in the footer: the result of the last
-    /// operation or the startup banner.
+    /// operation.
+    ///
+    /// **Transient by nature — do not seed it at startup.** The footer shows
+    /// this *instead of* the key hints, and a message nothing ever clears hides
+    /// the keymap for the whole session, which is how the one affordance that
+    /// teaches the program disappears. Standing context belongs in
+    /// [`Self::connection`], which the title bar renders alongside the hints
+    /// rather than on top of them.
     pub status_message: Option<String>,
+    /// Where this session is connected, as `user@host:port`.
+    ///
+    /// Rendered in the title bar: true for the whole run, so it earns permanent
+    /// space, and it is the first thing to check when the numbers look wrong.
+    /// `None` in `--fixture` mode, which is connected to nothing.
+    pub connection: Option<String>,
     /// Whether a task list has **ever** arrived.
     ///
     /// `tasks.is_empty()` alone cannot tell "the NAS has nothing queued" from
@@ -252,6 +265,7 @@ impl Default for App {
             mode: Mode::Normal,
             delete_options: DeleteOptions::default(),
             status_message: None,
+            connection: None,
             loaded: false,
             error: None,
             page_size: DEFAULT_PAGE_SIZE,
@@ -307,6 +321,12 @@ impl App {
     /// Set what a confirmed delete may do (from the merged configuration).
     pub fn with_delete_options(mut self, options: DeleteOptions) -> Self {
         self.delete_options = options;
+        self
+    }
+
+    /// Record where this session is connected, for the title bar.
+    pub fn with_connection(mut self, connection: impl Into<String>) -> Self {
+        self.connection = Some(connection.into());
         self
     }
 
