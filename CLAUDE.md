@@ -444,26 +444,35 @@ recursive delete, and **existence alone does not authorize it**:
   the *title*. Those *fail* instead, so the row survives to point at the data;
 - **error** is not absence — see `PathInfo` above.
 
-The state those questions are asked of is what the pause phase read
-(`pause_and_confirm` hands back a `PauseRead`), not `DeleteItem`, which is frozen
-when the dialog opens and can be minutes stale mid-batch. The snapshot fills in
-whatever the pause phase did not observe.
+The state those questions are asked of is what the pause phase folded
+(`pause_and_confirm` hands back a `PauseRead`), never `DeleteItem` on its own:
+that snapshot is frozen when the dialog opens and can be minutes stale mid-batch.
 
 **A `PauseRead`'s two halves both ratchet toward "the payload must exist", by
-different evidence.** Every read of the task — the one before the pause and each
-one confirming it — is folded into both halves under the same monotonic rule: a
-later read may move the answer toward *must exist*, never away from it. The
-*status* advances when a read reports one `delete::status_implies_payload`
-accepts, so a task that reaches `Finished`/`Seeding`/`Extracting` while the pause
-settles is judged as finished rather than from its stale pre-pause status; and
-because `Paused` is not such a status, this program's own pause can never walk a
-`Seeding` back into a state whose absent payload the check waves through — the
-guard is not defeated by its own side effect. The *counters* (`downloaded`/`size`)
+different evidence.** Every read of the task — **the dialog's snapshot, which
+seeds the fold**, the one before the pause, and each one confirming it — is
+folded into both halves under the same monotonic rule: a later read may move the
+answer toward *must exist*, never away from it. The *status* advances when a read
+reports one `delete::status_implies_payload` accepts, so a task that reaches
+`Finished`/`Seeding`/`Extracting` while the pause settles is judged as finished
+rather than from its stale pre-pause status; and because `Paused` is not such a
+status, no read can walk a `Seeding` back into a state whose absent payload the
+check waves through — not this program's own pause, and not a task DSM stopped
+between the dialog and its turn in the queue. The *counters* (`downloaded`/`size`)
 advance to the freshest values seen, except that a read which said "complete" is
 never walked back: pausing does not un-download anything, and a task that reaches
 100% while the pause takes effect is exactly the case where stale-low counters
-let a missing path be judged benign. Do not "simplify" either half into "whatever
-the last read said" — that re-admits both walk-backs.
+let a missing path be judged benign.
+
+**Seeding the fold with the snapshot is the whole design, not an optimization.**
+The snapshot is simply the earliest read, so it belongs *inside* the ratchet
+rather than as a fallback chosen against it — a seeding torrent with unselected
+files (`downloaded < size`, so only the status proves anything) that DSM stopped
+before its turn came round is the case that composing the halves "live if
+present, else snapshot" got wrong. `payload_for_file_phase` therefore chooses
+nothing; it unwraps the folded value, and falls back to the raw snapshot only
+when no pause phase ran at all. Do not reintroduce per-half preference, and do
+not "simplify" either half into "whatever the last read said".
 
 ### Snapshot semantics
 
