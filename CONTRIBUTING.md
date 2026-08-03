@@ -16,7 +16,7 @@ The toolchain is pinned in `rust-toolchain.toml` to an **explicit version** (cur
 `clippy` components are fetched automatically on the first cargo command:
 
 ```sh
-git clone https://github.com/emacarov/syno-clean
+git clone https://github.com/Chekushkin/syno-clean
 cd syno-clean
 cargo build
 ```

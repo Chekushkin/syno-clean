@@ -98,7 +98,7 @@ Requires the Rust toolchain pinned in `rust-toolchain.toml` (rustup installs it
 automatically):
 
 ```sh
-git clone https://github.com/emacarov/syno-clean
+git clone https://github.com/Chekushkin/syno-clean
 cd syno-clean
 cargo build --release
 # the binary is at target/release/syno-clean
@@ -114,7 +114,7 @@ Prebuilt archives are attached to each tagged release for
 ```sh
 VERSION=0.1.0
 TARGET=aarch64-apple-darwin
-curl -fsSLO "https://github.com/emacarov/syno-clean/releases/download/v${VERSION}/syno-clean-${VERSION}-${TARGET}.tar.gz"
+curl -fsSLO "https://github.com/Chekushkin/syno-clean/releases/download/v${VERSION}/syno-clean-${VERSION}-${TARGET}.tar.gz"
 tar xzf "syno-clean-${VERSION}-${TARGET}.tar.gz"
 install -m 0755 "syno-clean-${VERSION}-${TARGET}/syno-clean" ~/.local/bin/
 ```

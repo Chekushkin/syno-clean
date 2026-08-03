@@ -1005,10 +1005,10 @@ Real, deliberate, and none of them a regression:
   manual checks that remain are listed under Post-Completion in the plan.
 - ⚠️ **The README's terminal frame is a `TestBackend` rendering of the fixture,
   not a screenshot.** A real capture is still owed before publishing.
-- ⚠️ **`https://github.com/emacarov/syno-clean` is a placeholder.** It appears in
-  `Cargo.toml`, `README.md`, `CONTRIBUTING.md` and `CHANGELOG.md`; confirm the
-  real org before publishing and update all four together. `publish = false`
-  guards against an accidental crates.io release.
+- **The repository is `https://github.com/Chekushkin/syno-clean`** — settled, no
+  longer a placeholder. It appears in `Cargo.toml`, `README.md`,
+  `CONTRIBUTING.md` and `CHANGELOG.md`; keep those four in step.
+  `publish = false` still guards against an accidental crates.io release.
 - **Eight sort keys against eleven columns.** Seeds/Peers, ETA and Destination
   are not sortable, and `SortKey::Added` sorts by a value with no column. Post-v1
   if it is missed.

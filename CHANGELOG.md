@@ -148,5 +148,5 @@ version to have changed anything from.
   and free no space.** That is a DSM setting this program does not control.
 - **`--logout` is not suppressed by `--dry-run`** — ending a session destroys no data.
 
-[Unreleased]: https://github.com/emacarov/syno-clean/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/emacarov/syno-clean/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Chekushkin/syno-clean/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Chekushkin/syno-clean/releases/tag/v0.1.0
