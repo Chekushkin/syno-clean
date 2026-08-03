@@ -57,6 +57,9 @@ async fn main() -> Result<()> {
     if missing.any() {
         return Err(first_run(&config_path, missing));
     }
+    // Lifted out before the merge consumes the layer: the password deliberately
+    // does not travel through `ResolvedConfig`, which is logged at startup.
+    let file_password = file_config.password.clone();
     let resolved = config::merge(file_config, env_config, &cli)?;
 
     tracing::info!(
@@ -75,7 +78,7 @@ async fn main() -> Result<()> {
     }
 
     if cli.is_dump() {
-        return dump(&cli, &resolved, &paths).await;
+        return dump(&cli, &resolved, &paths, file_password.as_deref()).await;
     }
 
     let mut app = App::new(Vec::new()).with_delete_options(DeleteOptions::from_config(&resolved));
@@ -100,7 +103,7 @@ async fn main() -> Result<()> {
         .await
         .map_err(|err| startup_failure(&err, &resolved))?;
     let client = Arc::new(
-        authenticate(client, &resolved, &paths)
+        authenticate(client, &resolved, &paths, file_password.as_deref())
             .await
             .map_err(|err| startup_failure(&err, &resolved))?,
     );
@@ -639,7 +642,12 @@ enum Next {
 /// particular `tests/fixtures/task_list.json`, which the parser tests and the
 /// offline `--fixture` mode are built on. The bodies are printed verbatim,
 /// with no reformatting, so the capture is exactly what DSM sent.
-async fn dump(cli: &Cli, resolved: &ResolvedConfig, paths: &Paths) -> Result<()> {
+async fn dump(
+    cli: &Cli,
+    resolved: &ResolvedConfig,
+    paths: &Paths,
+    file_password: Option<&str>,
+) -> Result<()> {
     let mut client = SynoClient::new(resolved)?;
     client
         .discover()
@@ -653,7 +661,7 @@ async fn dump(cli: &Cli, resolved: &ResolvedConfig, paths: &Paths) -> Result<()>
     }
 
     if cli.dump_tasks_json {
-        let client = authenticate(client, resolved, paths)
+        let client = authenticate(client, resolved, paths, file_password)
             .await
             .map_err(|err| startup_failure(&err, resolved))?;
         println!("{}", download_station::list_tasks_json(&client).await?);
@@ -700,48 +708,80 @@ async fn logout(resolved: &ResolvedConfig, paths: &Paths) -> Result<()> {
 /// Attach a session to a discovered client, reusing a cached `sid` when there
 /// is one and logging in when there is not.
 ///
-/// Credentials are resolved either way and handed to the client, so a cached
-/// `sid` that DSM has since expired is repaired by the transparent
-/// re-login-once retry in `api::client` rather than failing the run. The cost
-/// is a password prompt when `SYNO_CLEAN_PASSWORD` is unset; the cache still
-/// saves the login round-trip.
+/// A password is asked for **only when one is actually needed**: no usable
+/// cached session, and none available from `SYNO_CLEAN_PASSWORD` or the config
+/// file's `password`. So the cache saves the typing, not just the round trip.
+///
+/// The trade-off that buys: with a cached session and no stored password the
+/// client carries no credentials, so `api::client`'s transparent
+/// re-login-once retry cannot fire and a session DSM expires mid-run ends the
+/// operation with "the session expired and no credentials are available to
+/// renew it". Re-running logs in fresh. That is better than the alternative —
+/// prompting for a password from underneath the alternate screen — and storing
+/// a password anywhere restores the renewal.
+///
+/// `file_password` comes from the config file layer rather than
+/// [`ResolvedConfig`], which is logged at startup.
 async fn authenticate(
     client: SynoClient,
     resolved: &ResolvedConfig,
     paths: &Paths,
+    file_password: Option<&str>,
 ) -> error::Result<SynoClient> {
     let session_file = paths.session_file();
     let key = resolved.session_key();
     let mut cache = SessionCache::load(&session_file);
 
-    let password =
-        config::resolve_password(&config::system_env, &resolved.username, &resolved.host)?;
-    let mut credentials = Credentials::new(&resolved.username, password);
-    if let Some(otp) = config::otp_from_env(&config::system_env) {
-        credentials = credentials.with_otp(otp);
-    }
-
-    let sid = match cache.sid(&key) {
-        Some(sid) => {
-            tracing::info!(%key, "reusing the cached session");
-            sid.to_string()
-        }
-        None => {
-            let sid = match auth::login(&client, &credentials).await {
-                Ok(sid) => sid,
-                // DSM only asks for a one-time code after a login attempt, so
-                // the prompt belongs here rather than up front.
-                Err(err) if auth::is_otp_required(&err) => {
-                    credentials = credentials.with_otp(prompt_otp()?);
-                    auth::login(&client, &credentials).await?
-                }
-                Err(err) => return Err(err),
-            };
-            cache.set_sid(&key, &sid);
-            cache.save(&session_file)?;
-            sid
+    // Only sources that cost the user nothing. Resolving the password *before*
+    // consulting the cache is what made every launch prompt for one it did not
+    // need — the cached session saved a round trip and never the typing.
+    let stored = config::stored_password(&config::system_env, file_password);
+    let otp = config::otp_from_env(&config::system_env);
+    let make_credentials = |password: String| {
+        let credentials = Credentials::new(&resolved.username, password);
+        match &otp {
+            Some(otp) => credentials.with_otp(otp.clone()),
+            None => credentials,
         }
     };
+
+    if let Some(sid) = cache.sid(&key).map(str::to_string) {
+        tracing::info!(
+            %key,
+            renewable = stored.is_some(),
+            "reusing the cached session"
+        );
+        // Credentials are attached only when they were free. Without them the
+        // client cannot renew a session that expires mid-run — `can_relogin()`
+        // is false and the request fails with a message saying so, which beats
+        // stopping to ask for a password from underneath the alternate screen.
+        let client = client.with_sid(sid);
+        return Ok(match stored {
+            Some(password) => client.with_credentials(make_credentials(password)),
+            None => client,
+        });
+    }
+
+    // No usable session, so a password is genuinely required: use a stored one
+    // if there is one, otherwise ask.
+    let password = match stored {
+        Some(password) => password,
+        None => config::prompt_password(&resolved.username, &resolved.host)?,
+    };
+    let mut credentials = make_credentials(password);
+
+    let sid = match auth::login(&client, &credentials).await {
+        Ok(sid) => sid,
+        // DSM only asks for a one-time code after a login attempt, so the
+        // prompt belongs here rather than up front.
+        Err(err) if auth::is_otp_required(&err) => {
+            credentials = credentials.with_otp(prompt_otp()?);
+            auth::login(&client, &credentials).await?
+        }
+        Err(err) => return Err(err),
+    };
+    cache.set_sid(&key, &sid);
+    cache.save(&session_file)?;
 
     Ok(client.with_credentials(credentials).with_sid(sid))
 }
