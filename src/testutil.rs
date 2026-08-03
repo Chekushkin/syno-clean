@@ -16,8 +16,8 @@ use crate::model::{Task, TaskList};
 
 /// The checked-in `SYNO.DownloadStation.Task` `list` response.
 ///
-/// Still hand-written and marked PROVISIONAL inside the file itself; see the
-/// note on `model`'s fixture tests.
+/// Shape captured from a real DSM 7 NAS, content synthetic; see the note on
+/// `model`'s fixture tests.
 pub const FIXTURE_JSON: &str = include_str!("../tests/fixtures/task_list.json");
 
 /// Every task in the fixture, in the order DSM listed them.

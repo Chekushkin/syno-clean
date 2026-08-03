@@ -13,6 +13,17 @@ Nothing yet.
 
 ### Fixed
 
+- **`TaskFile` parsed a field DSM has never sent.** The model called it `selected`;
+  the real key is `wanted`. It had been silently defaulting to `true` on every NAS
+  this program has ever talked to. Nothing depended on the value, but the fixture
+  had invented two more keys the same way (`priority` on the detail block,
+  `status_extra` on the task), and a test now guards against that recurring.
+- **The pause-confirmation bound is 60s, not 15s.** Pausing settles in ~0.1s
+  normally, but one delete in a run of seven had its pause accepted and the task
+  still seeding 15s later — most likely the tracker "stopped" announce that
+  stopping a seeding torrent triggers. The wait now also logs once when it stops
+  looking instant, because the failing run logged nothing at all for its 15s.
+
 - **The on-disk path is now taken from the task's title, not from the file list's
   common top-level component.** Download Station names what it writes after the task
   — a container directory for a multi-file torrent, the filename itself for a

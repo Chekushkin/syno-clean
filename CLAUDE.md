@@ -338,12 +338,25 @@ and a `/volume1/...` destination. Numbers appear in both the JSON-number and
 string forms on purpose. It drives the `model.rs` parser tests, the layout tests
 and the offline `--fixture` mode.
 
-⚠️ It is **hand-written and marked `PROVISIONAL`** in a top-level `_comment` key —
-no NAS was reachable when it was written, and none has been since. Re-capture
-with `syno-clean --dump-tasks-json > tests/fixtures/task_list.json`, then drop
-the marker *and* `model.rs`'s `the_fixture_is_still_marked_provisional…` test
-together. Until then, every assertion about the DSM wire shape is only as good as
-that file.
+**Its shape came from a real DSM 7 capture; its content is synthetic.** Every key
+name, nesting level and value type is the real one — the titles and filenames are
+invented so the file can be public, and the real library it was captured from
+stays private. `_comment` at the top says so, and lists the three deliberate
+departures (string-encoded numbers, omitted `additional` sub-blocks, and the
+status/type variety the captured library happened not to contain).
+
+⚠️ **Do not re-capture straight over it.** `syno-clean --dump-tasks-json` emits
+real torrent titles, and this repository is public. Take the *shape* from a
+capture and keep the content synthetic;
+`model.rs::the_fixture_still_carries_only_keys_a_real_nas_sends` is the guard
+against invented keys creeping back.
+
+That guard exists because the fixture had three of them before the first real
+capture: `selected` on a file entry (the real key is **`wanted`** — `TaskFile`
+deserialized a name DSM has never sent, silently defaulting it on every NAS),
+`priority` on the detail block, and `status_extra` on the task. A real entry also
+carries `index` and `size_downloaded`, which are deliberately not modelled
+because nothing reads them.
 
 ## The dangerous part: delete ordering and path safety
 
@@ -1021,13 +1034,14 @@ Rules that keep the suite honest:
 
 Real, deliberate, and none of them a regression:
 
-- ⚠️ **The task-list fixture is `PROVISIONAL`** (see above). Re-capture from a
-  real DSM 7 NAS before release and confirm the discovered version ranges for
-  `SYNO.API.Auth`, `SYNO.DownloadStation.Task`, `SYNO.FileStation.List` and
-  `SYNO.FileStation.Delete` against the `SUPPORTED` consts.
-- ⚠️ **No live NAS and no TTY has ever exercised this.** Everything is verified by
-  unit tests, `TestBackend` frames and non-interactive runs of the binary. The
-  manual checks that remain are listed under Post-Completion in the plan.
+- **The fixture's wire shape is now real** (see above), which retired the largest
+  piece of debt this project had. Still unconfirmed against a NAS: the
+  `SYNO.FileStation.Delete` `status` payload in flight — `finished` and
+  `path_err_num` were only ever probed with a bogus taskid — which is why
+  `confirm_deleted` re-checks the path rather than trusting those fields.
+- **A live NAS has now exercised the read paths, discovery, login, list, pause,
+  resume and delete**, and the interactive TUI has been driven in a pty. What
+  remains unexercised is listed under Post-Completion in the plan.
 - ⚠️ **The README's terminal frame is a `TestBackend` rendering of the fixture,
   not a screenshot.** A real capture is still owed before publishing.
 - **The repository is `https://github.com/Chekushkin/syno-clean`** — settled, no

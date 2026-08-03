@@ -1,510 +1,544 @@
 {
-  "_comment": "⚠️ PROVISIONAL — not captured from a real NAS. Hand-written from the documented SYNO.DownloadStation.Task v1 `list` response shape (additional=detail,transfer,file). Re-capture with `syno-clean --dump-tasks-json > tests/fixtures/task_list.json` against a real DSM 7 NAS and re-run the parser tests (plan Task 21). JSON has no comment syntax, so this marker is a top-level `_comment` key; the response envelope ignores unknown fields, so it is inert.",
-  "success": true,
-  "data": {
-    "total": 14,
-    "offset": 0,
-    "tasks": [
+ "_comment": "SHAPE captured from a real DSM 7 NAS (SYNO.DownloadStation.Task v1 list, 41 tasks); CONTENT is synthetic. Titles, filenames and URIs are invented so this file can live in a public repository — the real library it was captured from is nobody's business. Every key name, nesting level and value type below is the real one. Deliberate departures from that capture, each earning its place: some numbers are string-encoded (DSM does this per field and per build, and de_u64/de_u32 must tolerate both); some tasks omit an `additional` sub-block entirely (the capture always sent all three, but one odd task must never blank the whole table); and the status and type variety is invented, because the captured library happened to hold only bt tasks that were finished or seeding.",
+ "success": true,
+ "data": {
+  "total": 14,
+  "offset": 0,
+  "tasks": [
+   {
+    "id": "dbid_001",
+    "type": "bt",
+    "username": "eduard",
+    "title": "Ubuntu.24.04.3.LTS.Desktop.amd64",
+    "size": 6231819257,
+    "status": "downloading",
+    "additional": {
+     "detail": {
+      "completed_time": "0",
+      "connected_leechers": 4,
+      "connected_peers": 27,
+      "connected_seeders": 12,
+      "create_time": "1753960800",
+      "destination": "downloads",
+      "started_time": "1753960812",
+      "total_peers": 41,
+      "total_pieces": 5943,
+      "unzip_password": "",
+      "uri": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+      "waiting_seconds": 0,
+      "seedelapsed": 0
+     },
+     "transfer": {
+      "downloaded_pieces": 2317,
+      "size_downloaded": 2429550592,
+      "size_uploaded": 118325248,
+      "speed_download": 8912896,
+      "speed_upload": 524288
+     },
+     "file": [
       {
-        "id": "dbid_001",
-        "type": "bt",
-        "username": "eduard",
-        "title": "Ubuntu.24.04.3.LTS.Desktop.amd64",
-        "size": 6231819257,
-        "status": "downloading",
-        "additional": {
-          "detail": {
-            "completed_time": "0",
-            "connected_leechers": 4,
-            "connected_peers": 27,
-            "connected_seeders": 12,
-            "create_time": "1753960800",
-            "destination": "downloads",
-            "priority": "auto",
-            "started_time": "1753960812",
-            "total_peers": 41,
-            "total_pieces": 5943,
-            "unzip_password": "",
-            "uri": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
-            "waiting_seconds": 0
-          },
-          "transfer": {
-            "downloaded_pieces": 2317,
-            "size_downloaded": 2429550592,
-            "size_uploaded": 118325248,
-            "speed_download": 8912896,
-            "speed_upload": 524288
-          },
-          "file": [
-            {
-              "filename": "Ubuntu.24.04.3.LTS.Desktop.amd64/ubuntu-24.04.3-desktop-amd64.iso",
-              "size": "6231818240",
-              "priority": "normal",
-              "selected": true
-            },
-            {
-              "filename": "Ubuntu.24.04.3.LTS.Desktop.amd64/SHA256SUMS",
-              "size": "184",
-              "priority": "normal",
-              "selected": true
-            },
-            {
-              "filename": "Ubuntu.24.04.3.LTS.Desktop.amd64/SHA256SUMS.gpg",
-              "size": "833",
-              "priority": "low",
-              "selected": false
-            }
-          ]
-        }
+       "filename": "Ubuntu.24.04.3.LTS.Desktop.amd64/ubuntu-24.04.3-desktop-amd64.iso",
+       "index": 0,
+       "priority": "normal",
+       "size": "6231818240",
+       "size_downloaded": 6231818240,
+       "wanted": true
       },
       {
-        "id": "dbid_002",
-        "type": "bt",
-        "username": "eduard",
-        "title": "Big.Buck.Bunny.2008.1080p.🐰.BluRay.x264",
-        "size": 1932735283,
-        "status": "seeding",
-        "additional": {
-          "detail": {
-            "completed_time": "1750003600",
-            "connected_leechers": 9,
-            "connected_peers": 14,
-            "connected_seeders": 5,
-            "create_time": "1750000000",
-            "destination": "video/movies",
-            "priority": "auto",
-            "started_time": "1750000060",
-            "total_peers": 63,
-            "total_pieces": 1843,
-            "uri": "magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef"
-          },
-          "transfer": {
-            "downloaded_pieces": 1843,
-            "size_downloaded": 1932735283,
-            "size_uploaded": 4137684173,
-            "speed_download": 0,
-            "speed_upload": 1258291
-          },
-          "file": [
-            {
-              "filename": "Big.Buck.Bunny.2008.1080p.BluRay.x264/big_buck_bunny.mkv",
-              "size": 1932700000,
-              "priority": "normal",
-              "selected": true
-            },
-            {
-              "filename": "Big.Buck.Bunny.2008.1080p.BluRay.x264/poster.jpg",
-              "size": 35283,
-              "priority": "normal",
-              "selected": true
-            }
-          ]
-        }
+       "filename": "Ubuntu.24.04.3.LTS.Desktop.amd64/SHA256SUMS",
+       "index": 1,
+       "priority": "normal",
+       "size": "184",
+       "size_downloaded": 184,
+       "wanted": true
       },
       {
-        "id": "dbid_003",
-        "type": "bt",
-        "username": "eduard",
-        "title": "archlinux-2026.07.01-x86_64.iso",
-        "size": 1181116006,
-        "status": "finished",
-        "additional": {
-          "detail": {
-            "completed_time": "1751331600",
-            "connected_leechers": 0,
-            "connected_peers": 0,
-            "connected_seeders": 0,
-            "create_time": "1751328000",
-            "destination": "downloads",
-            "priority": "auto",
-            "started_time": "1751328060",
-            "total_peers": 0,
-            "total_pieces": 1127,
-            "uri": "magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98"
-          },
-          "transfer": {
-            "downloaded_pieces": 1127,
-            "size_downloaded": 1181116006,
-            "size_uploaded": 590558003,
-            "speed_download": 0,
-            "speed_upload": 0
-          },
-          "file": [
-            {
-              "filename": "archlinux-2026.07.01-x86_64.iso",
-              "size": "1181116006",
-              "priority": "normal",
-              "selected": true
-            }
-          ]
-        }
-      },
-      {
-        "id": "dbid_004",
-        "type": "bt",
-        "username": "eduard",
-        "title": "LibreOffice.25.8.Collection",
-        "size": 3221225472,
-        "status": "paused",
-        "additional": {
-          "detail": {
-            "completed_time": "0",
-            "connected_leechers": 0,
-            "connected_peers": 0,
-            "connected_seeders": 0,
-            "create_time": "1752000000",
-            "destination": "software",
-            "priority": "auto",
-            "started_time": "1752000030",
-            "total_peers": 0,
-            "total_pieces": 3072
-          },
-          "transfer": {
-            "downloaded_pieces": 921,
-            "size_downloaded": 966367641,
-            "size_uploaded": 0,
-            "speed_download": 0,
-            "speed_upload": 0
-          },
-          "file": [
-            {
-              "filename": "LibreOffice.25.8.Collection/LibreOffice_25.8_MacOS_aarch64.dmg",
-              "size": "1610612736",
-              "priority": "normal",
-              "selected": true
-            },
-            {
-              "filename": "LibreOffice.25.8.Collection/LibreOffice_25.8_Linux_x86-64_deb.tar.gz",
-              "size": "1610612736",
-              "priority": "normal",
-              "selected": true
-            }
-          ]
-        }
-      },
-      {
-        "id": "dbid_005",
-        "type": "bt",
-        "username": "eduard",
-        "title": "Broken.Release.2019.720p",
-        "size": 734003200,
-        "status": "error",
-        "status_extra": {
-          "error_detail": "destination_denied"
-        },
-        "additional": {
-          "detail": {
-            "completed_time": "0",
-            "connected_leechers": 0,
-            "connected_peers": 0,
-            "connected_seeders": 0,
-            "create_time": "1749000000",
-            "destination": "downloads",
-            "priority": "auto",
-            "total_peers": 0,
-            "total_pieces": 700
-          },
-          "transfer": {
-            "downloaded_pieces": 0,
-            "size_downloaded": 0,
-            "size_uploaded": 0,
-            "speed_download": 0,
-            "speed_upload": 0
-          },
-          "file": [
-            {
-              "filename": "Broken.Release.2019.720p/movie.mkv",
-              "size": "734003200",
-              "priority": "normal",
-              "selected": true
-            }
-          ]
-        }
-      },
-      {
-        "id": "dbid_006",
-        "type": "bt",
-        "username": "eduard",
-        "title": "千と千尋の神隠し.2001.1080p.日本語音声",
-        "size": 8589934592,
-        "status": "extracting",
-        "additional": {
-          "detail": {
-            "completed_time": "1754003600",
-            "connected_leechers": 0,
-            "connected_peers": 3,
-            "connected_seeders": 3,
-            "create_time": "1754000000",
-            "destination": "video/movies",
-            "priority": "auto",
-            "total_peers": 3,
-            "total_pieces": 8192,
-            "unzip_password": ""
-          },
-          "transfer": {
-            "downloaded_pieces": 8192,
-            "size_downloaded": 8589934592,
-            "size_uploaded": 429496729,
-            "speed_download": 0,
-            "speed_upload": 0
-          },
-          "file": [
-            {
-              "filename": "千と千尋の神隠し.2001.1080p/映画.part1.rar",
-              "size": "4294967296",
-              "priority": "normal",
-              "selected": true
-            },
-            {
-              "filename": "千と千尋の神隠し.2001.1080p/映画.part2.rar",
-              "size": "4294967296",
-              "priority": "normal",
-              "selected": true
-            }
-          ]
-        }
-      },
-      {
-        "id": "dbid_007",
-        "type": "http",
-        "username": "eduard",
-        "title": "syno-clean-0.1.0-x86_64-unknown-linux-gnu.tar.gz",
-        "size": 4194304,
-        "status": "waiting",
-        "additional": {
-          "detail": {
-            "completed_time": "0",
-            "connected_leechers": 0,
-            "connected_peers": 0,
-            "connected_seeders": 0,
-            "create_time": "1754100000",
-            "destination": "downloads",
-            "priority": "auto",
-            "total_peers": 0,
-            "total_pieces": 0,
-            "uri": "https://example.invalid/syno-clean-0.1.0-x86_64-unknown-linux-gnu.tar.gz",
-            "waiting_seconds": 42
-          },
-          "transfer": {
-            "downloaded_pieces": 0,
-            "size_downloaded": 0,
-            "size_uploaded": 0,
-            "speed_download": 0,
-            "speed_upload": 0
-          }
-        }
-      },
-      {
-        "id": "dbid_008",
-        "type": "bt",
-        "username": "eduard",
-        "title": "Sintel.2010.2160p.HDR",
-        "size": 12884901888,
-        "status": "finishing",
-        "additional": {
-          "detail": {
-            "completed_time": "0",
-            "connected_leechers": 2,
-            "connected_peers": 8,
-            "connected_seeders": 6,
-            "create_time": "1754200000",
-            "destination": "downloads/incoming",
-            "priority": "auto",
-            "total_peers": 18,
-            "total_pieces": 12288
-          },
-          "transfer": {
-            "downloaded_pieces": 12287,
-            "size_downloaded": 12883853312,
-            "size_uploaded": 2147483648,
-            "speed_download": 1048576,
-            "speed_upload": 262144
-          },
-          "file": []
-        }
-      },
-      {
-        "id": "dbid_009",
-        "type": "bt",
-        "username": "eduard",
-        "title": "Some.Show.S01.1080p.WEB-DL",
-        "size": 21474836480,
-        "status": "hash_checking",
-        "additional": {
-          "detail": {
-            "completed_time": "0",
-            "connected_leechers": 0,
-            "connected_peers": 0,
-            "connected_seeders": 0,
-            "create_time": "1753000000",
-            "destination": "video/tv",
-            "priority": "auto",
-            "total_peers": 0,
-            "total_pieces": 20480
-          },
-          "transfer": {
-            "downloaded_pieces": 10240,
-            "size_downloaded": 10737418240,
-            "size_uploaded": 0,
-            "speed_download": 0,
-            "speed_upload": 0
-          },
-          "file": [
-            {
-              "filename": "Some.Show.S01.1080p.WEB-DL/Some.Show.S01E01.mkv",
-              "size": "10737418240",
-              "priority": "normal",
-              "selected": true
-            },
-            {
-              "filename": "Some.Show.S01.1080p.WEB-DL/Some.Show.S01E02.mkv",
-              "size": "10737418240",
-              "priority": "normal",
-              "selected": true
-            }
-          ]
-        }
-      },
-      {
-        "id": "dbid_010",
-        "type": "nzb",
-        "username": "eduard",
-        "title": "Hosted.Archive.Part1of3",
-        "size": 524288000,
-        "status": "filehosting_waiting"
-      },
-      {
-        "id": "dbid_011",
-        "type": "bt",
-        "username": "eduard",
-        "title": "Mystery.Task.With.Unrecognized.Status",
-        "size": 1073741824,
-        "status": "captcha_needed",
-        "additional": {
-          "file": [
-            {
-              "filename": "Mystery.Task.With.Unrecognized.Status/data.bin",
-              "size": "1073741824",
-              "priority": "normal"
-            }
-          ]
-        }
-      },
-      {
-        "id": "dbid_012",
-        "type": "http",
-        "username": "eduard",
-        "title": "empty-placeholder.bin",
-        "size": 0,
-        "status": "waiting",
-        "additional": {
-          "detail": {
-            "completed_time": "0",
-            "connected_leechers": 0,
-            "connected_peers": 0,
-            "connected_seeders": 0,
-            "create_time": "1754300000",
-            "destination": "downloads",
-            "priority": "auto",
-            "total_peers": 0,
-            "total_pieces": 0,
-            "uri": "https://example.invalid/empty-placeholder.bin"
-          },
-          "transfer": {
-            "downloaded_pieces": 0,
-            "size_downloaded": 0,
-            "size_uploaded": 0,
-            "speed_download": 0,
-            "speed_upload": 0
-          },
-          "file": []
-        }
-      },
-      {
-        "id": "dbid_013",
-        "type": "bt",
-        "username": "eduard",
-        "title": "Mixed.Root.Release",
-        "size": 3145728,
-        "status": "seeding",
-        "additional": {
-          "detail": {
-            "completed_time": "1752500600",
-            "connected_leechers": 1,
-            "connected_peers": 2,
-            "connected_seeders": 2,
-            "create_time": "1752500000",
-            "destination": "video/tv",
-            "priority": "auto",
-            "total_peers": 4,
-            "total_pieces": 3
-          },
-          "transfer": {
-            "downloaded_pieces": 3,
-            "size_downloaded": 3145728,
-            "size_uploaded": 1048576,
-            "speed_download": 0,
-            "speed_upload": 65536
-          },
-          "file": [
-            {
-              "filename": "Disc1/track01.flac",
-              "size": "1048576",
-              "priority": "normal",
-              "selected": true
-            },
-            {
-              "filename": "Disc2/track01.flac",
-              "size": "1048576",
-              "priority": "normal",
-              "selected": true
-            },
-            {
-              "filename": "readme.nfo",
-              "size": "1048576",
-              "priority": "normal",
-              "selected": true
-            }
-          ]
-        }
-      },
-      {
-        "id": "dbid_014",
-        "type": "bt",
-        "username": "eduard",
-        "title": "Absolute.Destination.Sample",
-        "size": 268435456,
-        "status": "finished",
-        "additional": {
-          "detail": {
-            "completed_time": "1751003600",
-            "connected_leechers": 0,
-            "connected_peers": 0,
-            "connected_seeders": 0,
-            "create_time": "1751000000",
-            "destination": "/volume1/downloads",
-            "priority": "auto",
-            "started_time": "1751000060",
-            "total_peers": 0,
-            "total_pieces": 256
-          },
-          "transfer": {
-            "downloaded_pieces": 256,
-            "size_downloaded": 268435456,
-            "size_uploaded": 268435456,
-            "speed_download": 0,
-            "speed_upload": 0
-          },
-          "file": [
-            {
-              "filename": "Absolute.Destination.Sample/payload.bin",
-              "size": "268435456",
-              "priority": "normal",
-              "selected": true
-            }
-          ]
-        }
+       "filename": "Ubuntu.24.04.3.LTS.Desktop.amd64/SHA256SUMS.gpg",
+       "index": 2,
+       "priority": "low",
+       "size": "833",
+       "size_downloaded": 0,
+       "wanted": false
       }
-    ]
-  }
+     ]
+    }
+   },
+   {
+    "id": "dbid_002",
+    "type": "bt",
+    "username": "eduard",
+    "title": "Big.Buck.Bunny.2008.1080p.🐰.BluRay.x264",
+    "size": 1932735283,
+    "status": "seeding",
+    "additional": {
+     "detail": {
+      "completed_time": "1750003600",
+      "connected_leechers": 9,
+      "connected_peers": 14,
+      "connected_seeders": 5,
+      "create_time": "1750000000",
+      "destination": "video/movies",
+      "started_time": "1750000060",
+      "total_peers": 63,
+      "total_pieces": 1843,
+      "uri": "magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef",
+      "seedelapsed": 45054750
+     },
+     "transfer": {
+      "downloaded_pieces": 1843,
+      "size_downloaded": 1932735283,
+      "size_uploaded": 4137684173,
+      "speed_download": 0,
+      "speed_upload": 1258291
+     },
+     "file": [
+      {
+       "filename": "Big.Buck.Bunny.2008.1080p.BluRay.x264/big_buck_bunny.mkv",
+       "index": 0,
+       "priority": "normal",
+       "size": 1932700000,
+       "size_downloaded": 1932700000,
+       "wanted": true
+      },
+      {
+       "filename": "Big.Buck.Bunny.2008.1080p.BluRay.x264/poster.jpg",
+       "index": 1,
+       "priority": "normal",
+       "size": 35283,
+       "size_downloaded": 35283,
+       "wanted": true
+      }
+     ]
+    }
+   },
+   {
+    "id": "dbid_003",
+    "type": "bt",
+    "username": "eduard",
+    "title": "archlinux-2026.07.01-x86_64.iso",
+    "size": 1181116006,
+    "status": "finished",
+    "additional": {
+     "detail": {
+      "completed_time": "1751331600",
+      "connected_leechers": 0,
+      "connected_peers": 0,
+      "connected_seeders": 0,
+      "create_time": "1751328000",
+      "destination": "downloads",
+      "started_time": "1751328060",
+      "total_peers": 0,
+      "total_pieces": 1127,
+      "uri": "magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98",
+      "seedelapsed": 0
+     },
+     "transfer": {
+      "downloaded_pieces": 1127,
+      "size_downloaded": 1181116006,
+      "size_uploaded": 590558003,
+      "speed_download": 0,
+      "speed_upload": 0
+     },
+     "file": [
+      {
+       "filename": "archlinux-2026.07.01-x86_64.iso",
+       "index": 0,
+       "priority": "normal",
+       "size": "1181116006",
+       "size_downloaded": 1181116006,
+       "wanted": true
+      }
+     ]
+    }
+   },
+   {
+    "id": "dbid_004",
+    "type": "bt",
+    "username": "eduard",
+    "title": "LibreOffice.25.8.Collection",
+    "size": 3221225472,
+    "status": "paused",
+    "additional": {
+     "detail": {
+      "completed_time": "0",
+      "connected_leechers": 0,
+      "connected_peers": 0,
+      "connected_seeders": 0,
+      "create_time": "1752000000",
+      "destination": "software",
+      "started_time": "1752000030",
+      "total_peers": 0,
+      "total_pieces": 3072,
+      "seedelapsed": 0
+     },
+     "transfer": {
+      "downloaded_pieces": 921,
+      "size_downloaded": 966367641,
+      "size_uploaded": 0,
+      "speed_download": 0,
+      "speed_upload": 0
+     },
+     "file": [
+      {
+       "filename": "LibreOffice.25.8.Collection/LibreOffice_25.8_MacOS_aarch64.dmg",
+       "index": 0,
+       "priority": "normal",
+       "size": "1610612736",
+       "size_downloaded": 1610612736,
+       "wanted": true
+      },
+      {
+       "filename": "LibreOffice.25.8.Collection/LibreOffice_25.8_Linux_x86-64_deb.tar.gz",
+       "index": 1,
+       "priority": "normal",
+       "size": "1610612736",
+       "size_downloaded": 1610612736,
+       "wanted": true
+      }
+     ]
+    }
+   },
+   {
+    "id": "dbid_005",
+    "type": "bt",
+    "username": "eduard",
+    "title": "Broken.Release.2019.720p",
+    "size": 734003200,
+    "status": "error",
+    "additional": {
+     "detail": {
+      "completed_time": "0",
+      "connected_leechers": 0,
+      "connected_peers": 0,
+      "connected_seeders": 0,
+      "create_time": "1749000000",
+      "destination": "downloads",
+      "total_peers": 0,
+      "total_pieces": 700,
+      "seedelapsed": 0
+     },
+     "transfer": {
+      "downloaded_pieces": 0,
+      "size_downloaded": 0,
+      "size_uploaded": 0,
+      "speed_download": 0,
+      "speed_upload": 0
+     },
+     "file": [
+      {
+       "filename": "Broken.Release.2019.720p/movie.mkv",
+       "index": 0,
+       "priority": "normal",
+       "size": "734003200",
+       "size_downloaded": 734003200,
+       "wanted": true
+      }
+     ]
+    }
+   },
+   {
+    "id": "dbid_006",
+    "type": "bt",
+    "username": "eduard",
+    "title": "千と千尋の神隠し.2001.1080p.日本語音声",
+    "size": 8589934592,
+    "status": "extracting",
+    "additional": {
+     "detail": {
+      "completed_time": "1754003600",
+      "connected_leechers": 0,
+      "connected_peers": 3,
+      "connected_seeders": 3,
+      "create_time": "1754000000",
+      "destination": "video/movies",
+      "total_peers": 3,
+      "total_pieces": 8192,
+      "unzip_password": "",
+      "seedelapsed": 0
+     },
+     "transfer": {
+      "downloaded_pieces": 8192,
+      "size_downloaded": 8589934592,
+      "size_uploaded": 429496729,
+      "speed_download": 0,
+      "speed_upload": 0
+     },
+     "file": [
+      {
+       "filename": "千と千尋の神隠し.2001.1080p/映画.part1.rar",
+       "index": 0,
+       "priority": "normal",
+       "size": "4294967296",
+       "size_downloaded": 4294967296,
+       "wanted": true
+      },
+      {
+       "filename": "千と千尋の神隠し.2001.1080p/映画.part2.rar",
+       "index": 1,
+       "priority": "normal",
+       "size": "4294967296",
+       "size_downloaded": 4294967296,
+       "wanted": true
+      }
+     ]
+    }
+   },
+   {
+    "id": "dbid_007",
+    "type": "http",
+    "username": "eduard",
+    "title": "syno-clean-0.1.0-x86_64-unknown-linux-gnu.tar.gz",
+    "size": 4194304,
+    "status": "waiting",
+    "additional": {
+     "detail": {
+      "completed_time": "0",
+      "connected_leechers": 0,
+      "connected_peers": 0,
+      "connected_seeders": 0,
+      "create_time": "1754100000",
+      "destination": "downloads",
+      "total_peers": 0,
+      "total_pieces": 0,
+      "uri": "https://example.invalid/syno-clean-0.1.0-x86_64-unknown-linux-gnu.tar.gz",
+      "waiting_seconds": 42,
+      "seedelapsed": 0
+     },
+     "transfer": {
+      "downloaded_pieces": 0,
+      "size_downloaded": 0,
+      "size_uploaded": 0,
+      "speed_download": 0,
+      "speed_upload": 0
+     }
+    }
+   },
+   {
+    "id": "dbid_008",
+    "type": "bt",
+    "username": "eduard",
+    "title": "Sintel.2010.2160p.HDR",
+    "size": 12884901888,
+    "status": "finishing",
+    "additional": {
+     "detail": {
+      "completed_time": "0",
+      "connected_leechers": 2,
+      "connected_peers": 8,
+      "connected_seeders": 6,
+      "create_time": "1754200000",
+      "destination": "downloads/incoming",
+      "total_peers": 18,
+      "total_pieces": 12288,
+      "seedelapsed": 0
+     },
+     "transfer": {
+      "downloaded_pieces": 12287,
+      "size_downloaded": 12883853312,
+      "size_uploaded": 2147483648,
+      "speed_download": 1048576,
+      "speed_upload": 262144
+     },
+     "file": []
+    }
+   },
+   {
+    "id": "dbid_009",
+    "type": "bt",
+    "username": "eduard",
+    "title": "Some.Show.S01.1080p.WEB-DL",
+    "size": 21474836480,
+    "status": "hash_checking",
+    "additional": {
+     "detail": {
+      "completed_time": "0",
+      "connected_leechers": 0,
+      "connected_peers": 0,
+      "connected_seeders": 0,
+      "create_time": "1753000000",
+      "destination": "video/tv",
+      "total_peers": 0,
+      "total_pieces": 20480,
+      "seedelapsed": 0
+     },
+     "transfer": {
+      "downloaded_pieces": 10240,
+      "size_downloaded": 10737418240,
+      "size_uploaded": 0,
+      "speed_download": 0,
+      "speed_upload": 0
+     },
+     "file": [
+      {
+       "filename": "Some.Show.S01.1080p.WEB-DL/Some.Show.S01E01.mkv",
+       "index": 0,
+       "priority": "normal",
+       "size": "10737418240",
+       "size_downloaded": 10737418240,
+       "wanted": true
+      },
+      {
+       "filename": "Some.Show.S01.1080p.WEB-DL/Some.Show.S01E02.mkv",
+       "index": 1,
+       "priority": "normal",
+       "size": "10737418240",
+       "size_downloaded": 10737418240,
+       "wanted": true
+      }
+     ]
+    }
+   },
+   {
+    "id": "dbid_010",
+    "type": "nzb",
+    "username": "eduard",
+    "title": "Hosted.Archive.Part1of3",
+    "size": 524288000,
+    "status": "filehosting_waiting"
+   },
+   {
+    "id": "dbid_011",
+    "type": "bt",
+    "username": "eduard",
+    "title": "Mystery.Task.With.Unrecognized.Status",
+    "size": 1073741824,
+    "status": "captcha_needed",
+    "additional": {
+     "file": [
+      {
+       "filename": "Mystery.Task.With.Unrecognized.Status/data.bin",
+       "index": 0,
+       "priority": "normal",
+       "size": "1073741824",
+       "size_downloaded": 1073741824,
+       "wanted": true
+      }
+     ]
+    }
+   },
+   {
+    "id": "dbid_012",
+    "type": "http",
+    "username": "eduard",
+    "title": "empty-placeholder.bin",
+    "size": 0,
+    "status": "waiting",
+    "additional": {
+     "detail": {
+      "completed_time": "0",
+      "connected_leechers": 0,
+      "connected_peers": 0,
+      "connected_seeders": 0,
+      "create_time": "1754300000",
+      "destination": "downloads",
+      "total_peers": 0,
+      "total_pieces": 0,
+      "uri": "https://example.invalid/empty-placeholder.bin",
+      "seedelapsed": 0
+     },
+     "transfer": {
+      "downloaded_pieces": 0,
+      "size_downloaded": 0,
+      "size_uploaded": 0,
+      "speed_download": 0,
+      "speed_upload": 0
+     },
+     "file": []
+    }
+   },
+   {
+    "id": "dbid_013",
+    "type": "bt",
+    "username": "eduard",
+    "title": "Mixed.Root.Release",
+    "size": 3145728,
+    "status": "seeding",
+    "additional": {
+     "detail": {
+      "completed_time": "1752500600",
+      "connected_leechers": 1,
+      "connected_peers": 2,
+      "connected_seeders": 2,
+      "create_time": "1752500000",
+      "destination": "video/tv",
+      "total_peers": 4,
+      "total_pieces": 3,
+      "seedelapsed": 45054750
+     },
+     "transfer": {
+      "downloaded_pieces": 3,
+      "size_downloaded": 3145728,
+      "size_uploaded": 1048576,
+      "speed_download": 0,
+      "speed_upload": 65536
+     },
+     "file": [
+      {
+       "filename": "Disc1/track01.flac",
+       "index": 0,
+       "priority": "normal",
+       "size": "1048576",
+       "size_downloaded": 1048576,
+       "wanted": true
+      },
+      {
+       "filename": "Disc2/track01.flac",
+       "index": 1,
+       "priority": "normal",
+       "size": "1048576",
+       "size_downloaded": 1048576,
+       "wanted": true
+      },
+      {
+       "filename": "readme.nfo",
+       "index": 2,
+       "priority": "normal",
+       "size": "1048576",
+       "size_downloaded": 1048576,
+       "wanted": true
+      }
+     ]
+    }
+   },
+   {
+    "id": "dbid_014",
+    "type": "bt",
+    "username": "eduard",
+    "title": "Absolute.Destination.Sample",
+    "size": 268435456,
+    "status": "finished",
+    "additional": {
+     "detail": {
+      "completed_time": "1751003600",
+      "connected_leechers": 0,
+      "connected_peers": 0,
+      "connected_seeders": 0,
+      "create_time": "1751000000",
+      "destination": "/volume1/downloads",
+      "started_time": "1751000060",
+      "total_peers": 0,
+      "total_pieces": 256,
+      "seedelapsed": 0
+     },
+     "transfer": {
+      "downloaded_pieces": 256,
+      "size_downloaded": 268435456,
+      "size_uploaded": 268435456,
+      "speed_download": 0,
+      "speed_upload": 0
+     },
+     "file": [
+      {
+       "filename": "Absolute.Destination.Sample/payload.bin",
+       "index": 0,
+       "priority": "normal",
+       "size": "268435456",
+       "size_downloaded": 268435456,
+       "wanted": true
+      }
+     ]
+    }
+   }
+  ]
+ }
 }
