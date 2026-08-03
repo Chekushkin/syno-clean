@@ -50,6 +50,13 @@ const NORMAL_HINTS: &str = "d delete · p/u pause/resume · r refresh · q quit 
 /// Footer hints while the search box has focus.
 const SEARCH_HINTS: &str = "Enter commit · Esc cancel";
 
+/// Narrowest the title bar's connection segment may be before it is dropped.
+///
+/// A `user@host:port` sheared to a few cells is worse than nothing: it costs
+/// the space anyway and cannot be read. Below this the title bar keeps just the
+/// name and version, and the connection stays reachable in the log.
+const MIN_CONNECTION_WIDTH: usize = 12;
+
 /// Prefix on the non-fatal error banner, so a failure is recognizable as one
 /// even where colour is unavailable.
 pub const ERROR_MARKER: &str = "⚠";
@@ -254,7 +261,18 @@ fn render_title_bar(
     let [left, right] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(20)]).areas(area);
 
-    let title = format!(" {} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    // The connection rides here rather than in the footer. It is true for the
+    // whole session, so it earns permanent space — and the footer's default
+    // content is the key hints, which a standing message would hide for the
+    // entire run.
+    let mut title = format!(" {} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    if let Some(connection) = &app.connection {
+        let room = usize::from(left.width).saturating_sub(format::display_width(&title) + 3);
+        if room >= MIN_CONNECTION_WIDTH {
+            title.push_str(" · ");
+            title.push_str(&format::truncate_ellipsis(connection, room));
+        }
+    }
     frame.render_widget(Paragraph::new(Line::from(title)).style(style), left);
 
     let counts = format!("{visible_count} / {} tasks ", app.tasks.len());
@@ -933,6 +951,55 @@ mod tests {
             lines[7]
         );
         assert!(!lines[7].contains(NORMAL_HINTS));
+    }
+
+    #[test]
+    fn a_connected_session_still_shows_the_key_hints() {
+        // The regression this pins: the connection used to be seeded into
+        // `status_message` at startup, and nothing ever clears that — so the
+        // footer showed "https://… as user · logs: …" for the whole session and
+        // the keymap, the only thing on screen that teaches the program, was
+        // never visible once. It belongs in the title bar, where it does not
+        // compete.
+        let app = App::new(fixture_tasks()).with_connection("Chekushkin@192.168.1.170:5001");
+        let lines = frame_lines(&app, 120, 10);
+
+        assert!(
+            lines[9].contains(NORMAL_HINTS),
+            "the hints must survive a real startup: {:?}",
+            lines[9]
+        );
+        assert!(
+            lines[0].contains("Chekushkin@192.168.1.170:5001"),
+            "the connection belongs in the title bar: {:?}",
+            lines[0]
+        );
+        assert!(
+            !lines[9].contains("Chekushkin"),
+            "and not in the footer: {:?}",
+            lines[9]
+        );
+    }
+
+    #[test]
+    fn the_title_bar_drops_the_connection_rather_than_shearing_it() {
+        // A `user@host` cut to a few cells costs the space and cannot be read,
+        // and it must never push the task counts off the right-hand end.
+        let app = App::new(fixture_tasks())
+            .with_connection("a-very-long-account-name@nas.example.internal:5001");
+
+        for width in [40, 50, 60, 80, 120, 200] {
+            let lines = frame_lines(&app, width, 10);
+            let title = &lines[0];
+            assert!(
+                title.contains("syno-clean"),
+                "name survives at {width}: {title:?}"
+            );
+            assert!(
+                title.contains("tasks"),
+                "the counts are never displaced at {width}: {title:?}"
+            );
+        }
     }
 
     #[test]

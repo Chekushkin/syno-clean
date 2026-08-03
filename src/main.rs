@@ -81,13 +81,21 @@ async fn main() -> Result<()> {
         return dump(&cli, &resolved, &paths, file_password.as_deref()).await;
     }
 
-    let mut app = App::new(Vec::new()).with_delete_options(DeleteOptions::from_config(&resolved));
-    app.set_status(format!(
-        "{} as {} · logs: {}",
-        resolved.base_url(),
-        resolved.username,
-        log_file.display()
-    ));
+    // The connection goes in the title bar, not the footer. `status_message`
+    // displaces the key hints, and nothing clears a message set at startup — so
+    // seeding it here hid the keymap for the entire session, which is the one
+    // thing on screen that teaches the program. The log path is in `--help` and
+    // the README; it does not need a permanent row.
+    let mut app = App::new(Vec::new())
+        .with_delete_options(DeleteOptions::from_config(&resolved))
+        .with_connection(format!(
+            "{}@{}",
+            resolved.username,
+            resolved
+                .base_url()
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+        ));
 
     // Discovery and login happen *before* the alternate screen: both can prompt
     // (password, 2FA code) and both can fail with a message worth reading, and
