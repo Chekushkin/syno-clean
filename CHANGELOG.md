@@ -13,6 +13,16 @@ Nothing yet.
 
 ### Fixed
 
+- **A stale session is recovered instead of failing every request.** Download
+  Station answers a dead `_sid` with DSM **105** ("insufficient user privilege"),
+  not the documented 119, so the transparent re-login never fired and a cached
+  session that had expired made every refresh fail until the cache was cleared by
+  hand. 105 now earns one re-login — and if a fresh session is still refused, it
+  really is a permission problem and the client stops retrying it, so a
+  misconfigured account cannot turn the three-second poller into a login every
+  three seconds.
+- `--dump-tasks-json` writes a renewed session back to the cache, as the TUI
+  already did.
 - **`TaskFile` parsed a field DSM has never sent.** The model called it `selected`;
   the real key is `wanted`. It had been silently defaulting to `true` on every NAS
   this program has ever talked to. Nothing depended on the value, but the fixture

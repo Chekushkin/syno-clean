@@ -26,6 +26,19 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// of these; see `api::client`.
 pub const SESSION_ERROR_CODES: [i32; 3] = [106, 107, 119];
 
+/// DSM 105, "insufficient user privilege" — and **ambiguous**.
+///
+/// The common table calls it a permission problem, and it genuinely is one when
+/// the account may not use the API. But a real DSM 7 also answers 105 from
+/// `SYNO.DownloadStation.Task` for a `_sid` that has simply expired, where 119
+/// ("invalid session") is what the documentation would lead you to expect.
+/// Observed directly: a cached sid returned 105 for every request while a fresh
+/// login with the same credentials returned the task list immediately.
+///
+/// Because the client cannot tell the two apart from the code alone, it
+/// **disambiguates by trying**: see [`may_be_stale_session`].
+pub const PERMISSION_DENIED_CODE: i32 = 105;
+
 /// DSM auth error code asking for a 2-step verification code.
 pub const OTP_REQUIRED_CODE: i32 = 403;
 
@@ -35,6 +48,26 @@ pub const AUTH_API: &str = "SYNO.API.Auth";
 /// True when `code` means the session must be re-established.
 pub fn is_session_error(code: i32) -> bool {
     SESSION_ERROR_CODES.contains(&code)
+}
+
+/// True when `code` *might* mean the session is stale, so re-authenticating is
+/// worth one attempt.
+///
+/// Wider than [`is_session_error`] by exactly [`PERMISSION_DENIED_CODE`], which
+/// is why the two are separate functions rather than one list: 105 still
+/// *renders* as a permission error, because that is what it means when it is
+/// not a stale session, and the message a user finally sees should say so.
+///
+/// The ambiguity is resolved by attempting the re-login rather than by guessing:
+/// if a request fails 105, a fresh session fixes it, and it was a stale sid; if
+/// it fails 105 again, the account really may not do this. `api::client` stops
+/// treating 105 as a session error for the rest of the process the first time
+/// the second answer comes back — otherwise an account that genuinely lacks
+/// Download Station permission would re-authenticate on every poll, which at the
+/// default three-second interval is a login attempt every three seconds for as
+/// long as the program is open.
+pub fn may_be_stale_session(code: i32) -> bool {
+    is_session_error(code) || code == PERMISSION_DENIED_CODE
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -520,6 +553,32 @@ mod tests {
         assert!(is_session_error(119));
         assert!(!is_session_error(105));
         assert!(!is_session_error(400));
+    }
+
+    #[test]
+    fn a_stale_session_may_also_arrive_as_105() {
+        // Observed on a real DSM 7: a cached sid returned 105 from
+        // SYNO.DownloadStation.Task for every request, while a fresh login with
+        // the same credentials listed the tasks immediately. The documented
+        // "invalid session" code, 119, was never sent.
+        assert!(may_be_stale_session(105));
+        for code in SESSION_ERROR_CODES {
+            assert!(may_be_stale_session(code));
+        }
+        // Everything else stays outside: a re-login cannot fix a bad password
+        // or a missing API, and retrying would only double the traffic.
+        for code in [100, 101, 102, 103, 104, 400, 402, 403, 408] {
+            assert!(!may_be_stale_session(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn code_105_still_reads_as_a_permission_problem() {
+        // The retry widening must not change what the user is finally told:
+        // when a fresh session does *not* clear it, 105 means exactly what the
+        // common table says.
+        let rendered = dsm_message(PERMISSION_DENIED_CODE, OTHER_API);
+        assert!(rendered.contains("permission"), "{rendered}");
     }
 
     #[test]

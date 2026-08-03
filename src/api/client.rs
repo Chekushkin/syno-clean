@@ -22,6 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -33,7 +34,7 @@ use serde::de::Error as _;
 
 use crate::api::auth::{self, Credentials};
 use crate::config::ResolvedConfig;
-use crate::error::{Error, Result, is_session_error};
+use crate::error::{Error, PERMISSION_DENIED_CODE, Result, may_be_stale_session};
 
 /// The discovery API. Queried once at startup.
 pub const API_INFO: &str = "SYNO.API.Info";
@@ -257,6 +258,14 @@ pub struct SynoClient {
     apis: ApiInfoMap,
     sid: RwLock<Option<String>>,
     credentials: Option<Credentials>,
+    /// Set once a re-login has failed to clear a [`PERMISSION_DENIED_CODE`],
+    /// after which 105 stops being treated as a stale session.
+    ///
+    /// Without this, an account that genuinely may not use the API would
+    /// re-authenticate on every request — and the poller makes one every
+    /// `refresh_secs`, so a permanently misconfigured account would produce a
+    /// login every three seconds for as long as the program is open.
+    permission_is_real: AtomicBool,
 }
 
 impl SynoClient {
@@ -277,6 +286,7 @@ impl SynoClient {
             apis: ApiInfoMap::default(),
             sid: RwLock::new(None),
             credentials: None,
+            permission_is_real: AtomicBool::new(false),
         })
     }
 
@@ -371,7 +381,7 @@ impl SynoClient {
 
         match check_envelope(&body, api) {
             Ok(()) => Ok(body),
-            Err(Error::Dsm { code, .. }) if is_session_error(code) && self.can_relogin() => {
+            Err(Error::Dsm { code, .. }) if self.should_retry_session(code) => {
                 tracing::info!(
                     api,
                     method,
@@ -380,10 +390,45 @@ impl SynoClient {
                 );
                 self.clear_sid();
                 let sid = self.relogin().await?;
-                self.send(&endpoint, method, params, Some(sid)).await
+                let retried = self.send(&endpoint, method, params, Some(sid)).await?;
+
+                // 105 is ambiguous (see `error::may_be_stale_session`), and this
+                // is where the ambiguity is settled: a fresh session did not
+                // clear it, so it is a real permission problem and re-logging in
+                // for the next one would achieve nothing but a login per poll.
+                if code == PERMISSION_DENIED_CODE
+                    && matches!(
+                        check_envelope(&retried, api),
+                        Err(Error::Dsm {
+                            code: PERMISSION_DENIED_CODE,
+                            ..
+                        })
+                    )
+                {
+                    self.permission_is_real.store(true, Ordering::Relaxed);
+                    tracing::warn!(
+                        api,
+                        method,
+                        "a fresh session is still refused; treating this as a real \
+                         permission problem and not re-authenticating again"
+                    );
+                }
+                Ok(retried)
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Whether a failing `code` justifies one re-login and replay.
+    ///
+    /// Needs credentials to be worth attempting at all, and — for
+    /// [`PERMISSION_DENIED_CODE`] only — must not already have been shown that a
+    /// fresh session makes no difference.
+    fn should_retry_session(&self, code: i32) -> bool {
+        if !self.can_relogin() || !may_be_stale_session(code) {
+            return false;
+        }
+        code != PERMISSION_DENIED_CODE || !self.permission_is_real.load(Ordering::Relaxed)
     }
 
     /// One **POST** against an already-resolved endpoint, carrying `params` in

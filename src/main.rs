@@ -672,7 +672,12 @@ async fn dump(
         let client = authenticate(client, resolved, paths, file_password)
             .await
             .map_err(|err| startup_failure(&err, resolved))?;
-        println!("{}", download_station::list_tasks_json(&client).await?);
+        let json = download_station::list_tasks_json(&client).await?;
+        // Same reason the TUI path does it: the transparent re-login may have
+        // replaced the sid, and leaving the dead one on disk means the *next*
+        // run repeats the round trip that discovered it was dead.
+        persist_session(&client, resolved, paths);
+        println!("{json}");
     }
     Ok(())
 }
