@@ -240,7 +240,16 @@ needs must be `info!` or higher. `--log-file` changes only *where* the file goes
   `additional` shape `model.rs` is built around, so following the NAS upward
   would silently break parsing. A test pins the pin.
 - On DSM error **106 / 107 / 119** the client re-logs-in once and retries
-  exactly once.
+  exactly once — and on **105** as well, which is the ambiguous one.
+  `error::may_be_stale_session` is that wider set; `error::is_session_error` is
+  still the unambiguous three, because 105 must keep *rendering* as a permission
+  error. A real DSM 7 answers a dead sid from `SYNO.DownloadStation.Task` with
+  105, never 119, so without this an expired cached session failed every request
+  until `session.json` was deleted by hand. The ambiguity is settled by trying:
+  if a fresh session is still refused, `SynoClient::permission_is_real` latches
+  and 105 stops triggering a retry — otherwise an account that genuinely lacks
+  Download Station permission would log in once per poll, every `refresh_secs`,
+  for as long as the program is open.
 - List-valued parameters are encoded differently per API: Download Station v1
   takes **comma-separated** strings, File Station takes **JSON arrays**. All
   encoding lives in pure `build_*_params() -> Vec<(&str, String)>` functions so
