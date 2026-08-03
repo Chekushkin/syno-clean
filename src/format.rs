@@ -189,6 +189,96 @@ pub fn truncate_ellipsis(text: &str, max_width: usize) -> String {
     out
 }
 
+/// Break `text` into lines no wider than `max_width` **terminal cells**,
+/// preferring word boundaries.
+///
+/// Written because the alternative for a long line is truncation, and the one
+/// string in this program that must never be truncated is a refusal reason: the
+/// remedy it names (`--no-delete-files`) sits at the end of the sentence, so
+/// clipping it removes exactly the part the user needs. ratatui's own `Wrap`
+/// cannot be used where the wrapping has to be *counted* as well as drawn — the
+/// modals scroll, and a scroll offset over rows nobody counted is a scroll that
+/// stops in the wrong place.
+///
+/// A word longer than the whole width — a path with no spaces in it — is broken
+/// mid-word rather than allowed to overflow. Continuation lines repeat the first
+/// line's leading spaces, so a wrapped reason stays visually attached to the
+/// item it belongs to.
+///
+/// Always returns at least one line, so a caller can count rows without a
+/// special case for the empty string.
+pub fn wrap(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![String::new()];
+    }
+    if display_width(text) <= max_width {
+        return vec![text.to_string()];
+    }
+
+    // The indent every row gets, dropped when it would leave less than half the
+    // line for words. `split_whitespace` below discards the original leading
+    // spaces, so the first row is re-indented exactly like the rest.
+    let indent: String = text.chars().take_while(|c| *c == ' ').collect();
+    let indent = if display_width(&indent) * 2 < max_width {
+        indent
+    } else {
+        String::new()
+    };
+    // Positive: an empty indent leaves the whole width, and a kept one is by
+    // construction narrower than half of it.
+    let budget = max_width - display_width(&indent);
+
+    let mut rows: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut used = 0;
+    for word in text.split_whitespace() {
+        for chunk in hard_break(word, budget) {
+            let chunk_width = display_width(&chunk);
+            if !current.is_empty() && used + 1 + chunk_width > budget {
+                rows.push(std::mem::take(&mut current));
+                used = 0;
+            }
+            if !current.is_empty() {
+                current.push(' ');
+                used += 1;
+            }
+            current.push_str(&chunk);
+            used += chunk_width;
+        }
+    }
+    rows.push(current);
+
+    rows.into_iter()
+        .map(|row| format!("{indent}{row}"))
+        .collect()
+}
+
+/// Split a single word that is wider than the line into pieces that fit.
+///
+/// Returns the word untouched when it already does, which is the common case.
+fn hard_break(word: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 || display_width(word) <= max_width {
+        return vec![word.to_string()];
+    }
+
+    let mut pieces = Vec::new();
+    let mut piece = String::new();
+    let mut used = 0;
+    for ch in word.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + width > max_width && !piece.is_empty() {
+            pieces.push(std::mem::take(&mut piece));
+            used = 0;
+        }
+        piece.push(ch);
+        used += width;
+    }
+    if !piece.is_empty() {
+        pieces.push(piece);
+    }
+    pieces
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,5 +542,72 @@ mod tests {
             truncate_ellipsis(&title, upto_emoji + 3),
             format!("{head}🐰…")
         );
+    }
+
+    // ---- wrap ---------------------------------------------------------------
+
+    #[test]
+    fn text_that_fits_is_returned_as_one_line_unchanged() {
+        assert_eq!(wrap("short enough", 40), vec!["short enough".to_string()]);
+        assert_eq!(wrap("", 40), vec![String::new()]);
+        // A zero-width area still yields a countable row.
+        assert_eq!(wrap("anything", 0), vec![String::new()]);
+    }
+
+    #[test]
+    fn wrapping_breaks_on_words_and_never_exceeds_the_width() {
+        let text = "nothing at /downloads/X, and that path was guessed from the task's title";
+        for width in [10, 20, 31, 79] {
+            let lines = wrap(text, width);
+            for line in &lines {
+                assert!(
+                    display_width(line) <= width,
+                    "{width}: {line:?} is {} cells",
+                    display_width(line)
+                );
+            }
+            // Nothing is lost and nothing is invented. Compared without any
+            // whitespace, because a width narrow enough to break a word mid-way
+            // legitimately turns one word into two.
+            let squeeze =
+                |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+            assert_eq!(squeeze(&lines.join("")), squeeze(text), "{width}");
+        }
+    }
+
+    #[test]
+    fn a_word_wider_than_the_line_is_broken_rather_than_overflowing() {
+        // A path with no spaces in it is the realistic case, and it must not be
+        // allowed to spill past the modal's border.
+        let path = "/volume1/downloads/".to_string() + &"x".repeat(60);
+        let lines = wrap(&path, 20);
+        assert!(lines.len() > 1);
+        for line in &lines {
+            assert!(display_width(line) <= 20, "{line:?}");
+        }
+        assert_eq!(lines.concat(), path);
+    }
+
+    #[test]
+    fn continuation_lines_keep_the_first_lines_indent() {
+        let lines = wrap("    a reason that is much too long for this width", 20);
+        assert!(lines.len() > 1);
+        for line in &lines {
+            assert!(line.starts_with("    "), "{line:?}");
+            assert!(display_width(line) <= 20, "{line:?}");
+        }
+
+        // An indent that would swallow the line is dropped instead.
+        let lines = wrap("          indented past the point of usefulness", 12);
+        assert!(!lines[0].starts_with(' '), "{:?}", lines[0]);
+    }
+
+    #[test]
+    fn wrapping_counts_cells_not_characters() {
+        let lines = wrap("千と千尋の神隠し 2001", 8);
+        for line in &lines {
+            assert!(display_width(line) <= 8, "{line:?}");
+        }
+        assert!(lines.len() >= 3, "{lines:?}");
     }
 }

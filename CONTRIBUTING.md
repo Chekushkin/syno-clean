@@ -138,6 +138,8 @@ written at `INFO` and above and that level is fixed — there is no `--verbose` 
 `RUST_LOG` is ignored — so `tracing::debug!` lines never reach it.
 
 Redact the host name if you would rather not share it. The **password** cannot reach the
-log: `Credentials` has a hand-written redacting `Debug`. The session `sid` is *not*
-covered by that guarantee — `SynoClient` derives `Debug` and holds it — so scan for a
-`_sid=` or a `sid:` before pasting, and treat one as a live credential if you find it.
+log: `Credentials` has a hand-written redacting `Debug`. Neither can the session `sid`:
+it travels in the request query string, and `error::Error` strips the query out of every
+transport error before it is rendered. Neither guarantee survives a `{:?}` of a
+`SynoClient`, which derives `Debug` and holds both — so scan for a `_sid=` or a `sid:`
+before pasting anyway, and treat one as a live credential if you find it.

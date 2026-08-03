@@ -26,7 +26,7 @@ use crate::api::client::parse_envelope;
 use crate::api::download_station::DS_TASK_API;
 use crate::delete::{DeleteOptions, DeletePlan};
 use crate::error::Result;
-use crate::event::{AppEvent, OpKind, TaskOp, TaskRef};
+use crate::event::{AppEvent, ItemReport, OpKind, TaskOp, TaskRef};
 use crate::model::{Task, TaskList};
 use crate::ui::{dialog, table};
 use crate::view::{self, View};
@@ -51,6 +51,14 @@ pub enum Mode {
     Confirm,
     /// The `?` help overlay is open. It binds nothing: **any** key closes it.
     Help,
+    /// The results of the last finished batch are on screen.
+    ///
+    /// Unlike [`Mode::Help`] this one *is* scrollable, so it does not close on
+    /// any key — a `j` has to be able to mean "next line". It changes nothing
+    /// and blocks nothing: refreshes keep arriving underneath it, because the
+    /// report is a record of what already happened rather than a snapshot the
+    /// list could invalidate.
+    Results,
 }
 
 /// Which button of the confirmation modal `Enter` will press.
@@ -90,6 +98,40 @@ pub struct TaskOpRequest {
     /// [`TaskOp`] has no variant for one.
     pub op: TaskOp,
     pub tasks: Vec<TaskRef>,
+}
+
+/// What one finished batch did, kept so the user can still read it afterwards.
+///
+/// **The counts alone are not a report.** `⚠ delete finished: 3 succeeded, 2
+/// failed` names neither of the two, and the per-item lines that did name them
+/// went to the footer, where each overwrote the last and the summary overwrote
+/// them all. The reasons are also the longest strings the program produces — the
+/// refusals that name `--no-delete-files` run past 200 characters — so a
+/// one-line footer could not have shown one whole even if it had survived.
+///
+/// Successes are **not** kept: a batch of twenty that worked has nothing to
+/// report, and listing them would bury the two that did not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpReport {
+    pub op: OpKind,
+    pub succeeded: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    /// Every item that failed or was skipped, in batch order — which is the
+    /// order the confirmation dialog listed them in.
+    pub problems: Vec<ItemReport>,
+}
+
+impl OpReport {
+    /// Whether there is anything worth opening the modal for.
+    pub fn has_problems(&self) -> bool {
+        !self.problems.is_empty()
+    }
+
+    /// Body lines the modal renders: a heading and a reason per problem.
+    pub fn line_count(&self) -> usize {
+        self.problems.len() * 2
+    }
 }
 
 /// The whole of the application state.
@@ -172,6 +214,18 @@ pub struct App {
     /// means the whole confirmation flow stays testable without a runtime, a
     /// client or a NAS.
     confirmed_delete: Option<DeletePlan>,
+    /// Problems reported by the batch **currently running**, accumulated from
+    /// [`AppEvent::OpProgress`] and folded into an [`OpReport`] when the
+    /// matching `OpDone` arrives. Cleared by the first item of the next batch.
+    op_problems: Vec<ItemReport>,
+    /// The last finished batch's report. Kept after the modal is dismissed so
+    /// `v` can bring it back — the footer line naming the counts is gone by the
+    /// next refresh, and the reasons were never in it.
+    op_report: Option<OpReport>,
+    /// First body line the results modal shows. Same split as the confirmation
+    /// modal: clamped against the line count here, against the height at render
+    /// time.
+    results_scroll: usize,
     /// Whether an operation batch the event loop started is still running.
     ///
     /// Pushed in by [`App::set_op_in_flight`] before every draw — `App` owns no
@@ -208,6 +262,9 @@ impl Default for App {
             confirm_scroll: 0,
             requested_op: None,
             confirmed_delete: None,
+            op_problems: Vec::new(),
+            op_report: None,
+            results_scroll: 0,
             op_in_flight: false,
             quit: false,
         }
@@ -324,15 +381,94 @@ impl App {
                 op,
                 done,
                 total,
-                detail,
-            } => self.set_status(format!("{} {done}/{total} · {detail}", op.label())),
+                item,
+            } => {
+                // `done` counts from one, so the first item of a batch is where
+                // the previous batch's problems stop being current.
+                if done <= 1 {
+                    self.op_problems.clear();
+                }
+                self.set_status(format!("{} {done}/{total} · {}", op.label(), item.detail()));
+                if item.outcome.problem().is_some() {
+                    self.op_problems.push(item);
+                }
+            }
             AppEvent::OpDone {
                 op,
                 succeeded,
                 skipped,
                 failed,
-            } => self.set_status(op_summary(op, succeeded, skipped, failed)),
+            } => {
+                let report = OpReport {
+                    op,
+                    succeeded,
+                    skipped,
+                    failed,
+                    problems: std::mem::take(&mut self.op_problems),
+                };
+                self.set_status(summary_with_hint(op, succeeded, skipped, failed, &report));
+                let worth_showing = report.has_problems();
+                self.op_report = Some(report);
+                // Opened for the user rather than waited for: the counts land in
+                // a footer that the refresh this batch just asked for is about
+                // to talk over, and a reason nobody can reach is a reason
+                // nobody has. Only from `Normal` — a modal must not be replaced
+                // under a user who is reading it, least of all a delete
+                // confirmation.
+                if worth_showing && self.mode == Mode::Normal {
+                    self.show_results();
+                }
+            }
         }
+    }
+
+    // ---- the results modal ---------------------------------------------------
+
+    /// The last finished batch's report, if there has been one.
+    pub fn last_op_report(&self) -> Option<&OpReport> {
+        self.op_report.as_ref()
+    }
+
+    /// First body line the results modal should show.
+    pub fn results_scroll(&self) -> usize {
+        self.results_scroll
+    }
+
+    /// Open the results modal (`v`, and automatically after a batch with
+    /// anything to report).
+    ///
+    /// Says so in the footer rather than opening an empty box when there is
+    /// nothing to show: a modal that reports nothing teaches the user that the
+    /// key does nothing.
+    pub fn show_results(&mut self) {
+        match &self.op_report {
+            Some(report) if report.has_problems() => {
+                self.results_scroll = 0;
+                self.mode = Mode::Results;
+            }
+            Some(_) => self.set_status("the last operation finished with nothing to report"),
+            None => self.set_status("no operation has finished yet"),
+        }
+    }
+
+    /// Dismiss the results modal. The report itself is kept — `v` reopens it.
+    pub fn close_results(&mut self) {
+        self.results_scroll = 0;
+        self.mode = Mode::Normal;
+    }
+
+    /// Scroll the results modal, clamped to the lines there are.
+    fn scroll_results(&mut self, delta: isize) {
+        let last = self.results_line_count().saturating_sub(1);
+        self.results_scroll = shift(self.results_scroll, delta, last);
+    }
+
+    fn scroll_results_to(&mut self, line: usize) {
+        self.results_scroll = line.min(self.results_line_count().saturating_sub(1));
+    }
+
+    fn results_line_count(&self) -> usize {
+        self.op_report.as_ref().map_or(0, OpReport::line_count)
     }
 
     /// Reconcile a freshly fetched task list into the app.
@@ -972,6 +1108,7 @@ impl App {
             // *and* opened a delete confirmation would be a surprise on the
             // screen that exists to remove surprises.
             Mode::Help => self.close_help(),
+            Mode::Results => self.handle_results_key(key),
         }
     }
 
@@ -1010,6 +1147,9 @@ impl App {
             KeyCode::Char('p') => self.pause_target(),
             KeyCode::Char('u') => self.resume_target(),
             KeyCode::Char('/') => self.begin_search(),
+            // The reasons the footer could not hold. Never destructive, so it
+            // needs no confirmation and is safe to reach for at any time.
+            KeyCode::Char('v') => self.show_results(),
             KeyCode::Char('?') => self.show_help(),
             // `Esc` is mode-specific: here it is the panic button for a
             // selection, in `Mode::Search` it cancels the edit.
@@ -1052,6 +1192,30 @@ impl App {
             KeyCode::PageDown => self.scroll_confirm(page_delta(self.page_size)),
             KeyCode::Home => self.scroll_confirm_to(0),
             KeyCode::End => self.scroll_confirm_to(usize::MAX),
+            _ => {}
+        }
+    }
+
+    /// Keys while the results modal is open.
+    ///
+    /// **Not "any key closes it"**, the way the help overlay works: this one
+    /// scrolls, so `j` and `k` have to stay available, and an unrecognized key
+    /// does nothing rather than dismissing the only place the reasons are
+    /// legible. The modal changes nothing, so there is no destructive key here
+    /// to guard against either.
+    fn handle_results_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc
+            | KeyCode::Enter
+            | KeyCode::Char('q')
+            | KeyCode::Char('v')
+            | KeyCode::Char(' ') => self.close_results(),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_results(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_results(1),
+            KeyCode::PageUp => self.scroll_results(-page_delta(self.page_size)),
+            KeyCode::PageDown => self.scroll_results(page_delta(self.page_size)),
+            KeyCode::Home => self.scroll_results_to(0),
+            KeyCode::End => self.scroll_results_to(usize::MAX),
             _ => {}
         }
     }
@@ -1110,6 +1274,28 @@ pub fn op_summary(op: OpKind, succeeded: usize, skipped: usize, failed: usize) -
 
     let marker = if failed > 0 { "⚠ " } else { "" };
     format!("{marker}{} finished: {}", op.label(), parts.join(", "))
+}
+
+/// [`op_summary`] plus, when there is something to read, the key that reaches
+/// it.
+///
+/// The counts on their own are a dead end — "2 failed" names neither task nor
+/// reason, and the log file whose path scrolled past at startup is not an answer
+/// a user inside a TUI can act on. The modal opens by itself, but it is also
+/// dismissable, so the way back has to be on screen.
+fn summary_with_hint(
+    op: OpKind,
+    succeeded: usize,
+    skipped: usize,
+    failed: usize,
+    report: &OpReport,
+) -> String {
+    let summary = op_summary(op, succeeded, skipped, failed);
+    if report.has_problems() {
+        format!("{summary} · v for the reasons")
+    } else {
+        summary
+    }
 }
 
 /// A page jump as a signed row count, saturating rather than wrapping on the
@@ -1346,6 +1532,30 @@ mod tests {
             .map(|n| task(&format!("id_{n:03}"), &format!("task {n:03}"), 0))
             .collect();
         App::new(tasks)
+    }
+
+    /// A per-item progress report for a task that succeeded.
+    fn done_item(title: &str) -> ItemReport {
+        ItemReport {
+            title: title.to_string(),
+            outcome: crate::event::ItemOutcome::Done("deleted".to_string()),
+        }
+    }
+
+    /// A per-item progress report for a task that failed, with its reason.
+    fn failed_item(title: &str, why: &str) -> ItemReport {
+        ItemReport {
+            title: title.to_string(),
+            outcome: crate::event::ItemOutcome::Failed(why.to_string()),
+        }
+    }
+
+    /// A per-item progress report for a task that was deliberately skipped.
+    fn skipped_item(title: &str, why: &str) -> ItemReport {
+        ItemReport {
+            title: title.to_string(),
+            outcome: crate::event::ItemOutcome::Skipped(why.to_string()),
+        }
     }
 
     /// The ID of the task the cursor is on, for the reconciliation assertions.
@@ -2237,7 +2447,7 @@ mod tests {
             op: OpKind::Delete,
             done: 1,
             total: 3,
-            detail: "task 000: deleted".into(),
+            item: done_item("task 000"),
         });
         let status = app.status_message.clone().expect("a progress line");
         assert!(status.contains("delete 1/3"), "{status}");
@@ -2257,7 +2467,7 @@ mod tests {
             op: OpKind::Delete,
             done: 1,
             total: 4,
-            detail: "task 000: deleted".into(),
+            item: done_item("task 000"),
         });
 
         assert_eq!(app.tasks, tasks);
@@ -2278,6 +2488,203 @@ mod tests {
             app.status_message.as_deref(),
             Some("delete finished: 3 succeeded")
         );
+    }
+
+    // ---- the results modal ---------------------------------------------------
+    //
+    // The counts in the footer name neither the task nor the reason, and every
+    // per-item line was overwritten by the next one. These are the tests that
+    // the reasons survive the batch that produced them.
+
+    /// Run a two-item batch through `apply_event`, the second item failing.
+    fn batch_with_one_failure(app: &mut App) {
+        app.apply_event(AppEvent::OpProgress {
+            op: OpKind::Delete,
+            done: 1,
+            total: 2,
+            item: done_item("Good.Release"),
+        });
+        app.apply_event(AppEvent::OpProgress {
+            op: OpKind::Delete,
+            done: 2,
+            total: 2,
+            item: failed_item("Bad.Release", "nothing at /downloads/Bad.Release"),
+        });
+        app.apply_event(AppEvent::OpDone {
+            op: OpKind::Delete,
+            succeeded: 1,
+            skipped: 0,
+            failed: 1,
+        });
+    }
+
+    #[test]
+    fn a_batch_with_a_failure_opens_the_results_modal_with_the_reason_in_it() {
+        let mut app = app_with(2);
+        batch_with_one_failure(&mut app);
+
+        assert_eq!(app.mode, Mode::Results);
+        let report = app.last_op_report().expect("a report");
+        assert_eq!((report.succeeded, report.failed), (1, 1));
+        assert_eq!(report.problems.len(), 1, "successes are not listed");
+        assert_eq!(report.problems[0].title, "Bad.Release");
+        assert_eq!(
+            report.problems[0].outcome.problem(),
+            Some("nothing at /downloads/Bad.Release")
+        );
+
+        // And the footer says how to get back to it once dismissed.
+        let status = app.status_message.clone().expect("a summary");
+        assert!(status.contains("1 failed"), "{status}");
+        assert!(status.contains("v for the reasons"), "{status}");
+    }
+
+    #[test]
+    fn a_skipped_item_is_reported_as_well_as_a_failed_one() {
+        // A skip is not a success: the task is still on the NAS, and the reason
+        // is the one that names `--no-delete-files`.
+        let mut app = app_with(1);
+        app.apply_event(AppEvent::OpProgress {
+            op: OpKind::Delete,
+            done: 1,
+            total: 1,
+            item: skipped_item("Mixed.Root", "the task's files share no single top-level"),
+        });
+        app.apply_event(AppEvent::OpDone {
+            op: OpKind::Delete,
+            succeeded: 0,
+            skipped: 1,
+            failed: 0,
+        });
+
+        assert_eq!(app.mode, Mode::Results);
+        let report = app.last_op_report().expect("a report");
+        assert_eq!(report.problems.len(), 1);
+        assert!(!report.problems[0].outcome.is_failure());
+    }
+
+    #[test]
+    fn a_clean_batch_opens_nothing_and_offers_nothing_to_open() {
+        let mut app = app_with(1);
+        app.apply_event(AppEvent::OpProgress {
+            op: OpKind::Delete,
+            done: 1,
+            total: 1,
+            item: done_item("Good.Release"),
+        });
+        app.apply_event(AppEvent::OpDone {
+            op: OpKind::Delete,
+            succeeded: 1,
+            skipped: 0,
+            failed: 0,
+        });
+
+        assert_eq!(app.mode, Mode::Normal);
+        let status = app.status_message.clone().expect("a summary");
+        assert!(!status.contains("v for"), "{status}");
+
+        // `v` says so rather than opening an empty box.
+        app.handle_key(press(KeyCode::Char('v')));
+        assert_eq!(app.mode, Mode::Normal);
+        let status = app.status_message.clone().expect("a message");
+        assert!(status.contains("nothing to report"), "{status}");
+    }
+
+    #[test]
+    fn v_reopens_the_last_report_after_it_was_dismissed() {
+        let mut app = app_with(2);
+        batch_with_one_failure(&mut app);
+
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.last_op_report().is_some(), "the report is kept");
+
+        app.handle_key(press(KeyCode::Char('v')));
+        assert_eq!(app.mode, Mode::Results);
+    }
+
+    #[test]
+    fn v_with_no_batch_behind_it_says_so() {
+        let mut app = app_with(1);
+        app.handle_key(press(KeyCode::Char('v')));
+        assert_eq!(app.mode, Mode::Normal);
+        let status = app.status_message.clone().expect("a message");
+        assert!(status.contains("no operation has finished"), "{status}");
+    }
+
+    #[test]
+    fn the_results_modal_scrolls_and_does_not_close_on_an_unknown_key() {
+        let mut app = app_with(2);
+        batch_with_one_failure(&mut app);
+        // One problem, two body lines.
+        assert_eq!(app.results_line_count(), 2);
+
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(app.results_scroll(), 1);
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(app.results_scroll(), 1, "clamped to the last line");
+        app.handle_key(press(KeyCode::Home));
+        assert_eq!(app.results_scroll(), 0);
+        app.handle_key(press(KeyCode::End));
+        assert_eq!(app.results_scroll(), 1);
+
+        // Unlike the help overlay, a stray key must not take the reasons away.
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.mode, Mode::Results);
+        assert!(app.pending_delete().is_none(), "and it does nothing else");
+    }
+
+    #[test]
+    fn the_next_batch_starts_from_no_problems_at_all() {
+        // `done == 1` is where a batch begins; without the reset the second
+        // batch would report the first one's failures as its own.
+        let mut app = app_with(2);
+        batch_with_one_failure(&mut app);
+        app.close_results();
+
+        app.apply_event(AppEvent::OpProgress {
+            op: OpKind::Pause,
+            done: 1,
+            total: 1,
+            item: done_item("Good.Release"),
+        });
+        app.apply_event(AppEvent::OpDone {
+            op: OpKind::Pause,
+            succeeded: 1,
+            skipped: 0,
+            failed: 0,
+        });
+
+        let report = app.last_op_report().expect("a report");
+        assert_eq!(report.op, OpKind::Pause);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn a_finished_batch_never_replaces_a_modal_the_user_is_reading() {
+        // A confirmation dialog swapped out from under a `y` is the one thing
+        // this program must never do.
+        let mut app = app_with(2);
+        app.begin_delete();
+        assert_eq!(app.mode, Mode::Confirm);
+
+        app.apply_event(AppEvent::OpProgress {
+            op: OpKind::Pause,
+            done: 1,
+            total: 1,
+            item: failed_item("Other.Release", "could not pause it"),
+        });
+        app.apply_event(AppEvent::OpDone {
+            op: OpKind::Pause,
+            succeeded: 0,
+            skipped: 0,
+            failed: 1,
+        });
+
+        assert_eq!(app.mode, Mode::Confirm);
+        // Kept all the same — `v` reaches it once the dialog is gone.
+        assert!(app.last_op_report().expect("a report").has_problems());
     }
 
     #[test]

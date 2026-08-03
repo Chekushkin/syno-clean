@@ -608,8 +608,12 @@ fn progress_line(event: &AppEvent) -> Option<String> {
             op,
             done,
             total,
-            detail,
-        } => Some(format!("[{done}/{total}] {} · {detail}", op.label())),
+            item,
+        } => Some(format!(
+            "[{done}/{total}] {} · {}",
+            op.label(),
+            item.detail()
+        )),
         AppEvent::OpDone {
             op,
             succeeded,
@@ -772,6 +776,14 @@ mod tests {
     /// suite rather than as a failure.
     const TEST_LIMIT: Duration = Duration::from_secs(10);
 
+    /// One finished item, as a batch would report it.
+    fn progress_item(title: &str) -> syno_clean::event::ItemReport {
+        syno_clean::event::ItemReport {
+            title: title.to_string(),
+            outcome: syno_clean::event::ItemOutcome::Done("deleted".to_string()),
+        }
+    }
+
     /// A batch task that reports progress per item, like `event::run_delete`.
     ///
     /// It sends **more events than the channel has slots**, so it can only run
@@ -783,7 +795,7 @@ mod tests {
                     op: OpKind::Delete,
                     done,
                     total: items,
-                    detail: String::new(),
+                    item: progress_item("a task"),
                 };
                 if tx.send(progress).await.is_err() {
                     return;
@@ -860,7 +872,7 @@ mod tests {
                     op: OpKind::Delete,
                     done,
                     total: items,
-                    detail: format!("item {done}"),
+                    item: progress_item(&format!("item {done}")),
                 };
                 if tx.send(progress).await.is_err() {
                     return;
@@ -890,7 +902,7 @@ mod tests {
                 op: OpKind::Delete,
                 done: 1,
                 total: 9,
-                detail: "Some.Release: deleted".to_string(),
+                item: progress_item("Some.Release"),
             };
             let _ = tx.send(progress).await;
             std::future::pending::<()>().await;
@@ -910,7 +922,7 @@ mod tests {
             op: OpKind::Delete,
             done: 7,
             total: 20,
-            detail: "Some.Release: deleted".to_string(),
+            item: progress_item("Some.Release"),
         })
         .expect("progress reads as a line");
         assert!(line.contains("7/20"), "{line}");

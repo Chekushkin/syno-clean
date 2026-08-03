@@ -155,8 +155,11 @@ Paths use **XDG semantics on every platform, macOS included**:
 | What | Path |
 |---|---|
 | Config | `$XDG_CONFIG_HOME/syno-clean/config.toml` (default `~/.config/syno-clean/config.toml`) |
-| Log file | `$XDG_CACHE_HOME/syno-clean/syno-clean.log` (default `~/.cache/syno-clean/syno-clean.log`) |
+| Log file | `$XDG_CACHE_HOME/syno-clean/syno-clean.log` (default `~/.cache/syno-clean/syno-clean.log`), mode `0600` |
 | Session cache | `$XDG_CACHE_HOME/syno-clean/session.json` (default `~/.cache/syno-clean/session.json`), mode `0600` |
+
+The cache directory itself is `0700`: both files in it can carry the session `sid`, which
+is a bearer credential.
 
 Logs never go to stdout — the TUI owns the terminal — so the log file is the place to
 look when something misbehaves, and the right thing to attach to a bug report.
@@ -249,9 +252,14 @@ authoritative one.
 | `p` | pause the selection, or the row under the cursor |
 | `u` | resume the selection, or the row under the cursor |
 | `r` | refresh now |
+| `v` | the last batch's results, with the reason for every skip and failure |
 
 `d`, `p` and `u` act on the selection when there is one, and on the row under the
 cursor when there is not.
+
+The results modal opens by itself whenever a batch finishes with something to report,
+and `v` brings it back after it has been dismissed. The footer is one line and the
+reasons are long sentences, so it — not the footer — is where a failed delete is read.
 
 ### Sort, filter, search
 
@@ -284,6 +292,18 @@ recognize is shown only under `All` — it cannot be classified without guessing
 
 Matching is **live**, on every keystroke, so `Enter` commits the query rather than
 applying it. Every other printable key is text — `q` types a `q`.
+
+### Results modal
+
+| Key | Action |
+|---|---|
+| `Esc` `q` `Enter` `Space` `v` | close |
+| `↑` `↓` `k` `j` | scroll a line |
+| `PgUp` `PgDn` | scroll a page |
+| `Home` `End` | jump to the first / last line |
+
+Unlike the help overlay it does **not** close on any key — it scrolls, so `j` has to
+mean "next line". It changes nothing, and the task list keeps refreshing underneath it.
 
 ### Confirmation dialog
 

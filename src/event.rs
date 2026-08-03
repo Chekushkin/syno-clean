@@ -126,8 +126,10 @@ pub enum AppEvent {
         done: usize,
         /// How many items the batch has.
         total: usize,
-        /// What just happened, ready to show in the footer.
-        detail: String,
+        /// Which item finished and what happened to it. Structured rather than
+        /// preformatted so the reason survives the footer line that shows it —
+        /// see [`ItemReport`].
+        item: ItemReport,
     },
     /// A whole operation finished — see [`spawn_delete`] and [`spawn_task_op`].
     OpDone {
@@ -318,8 +320,15 @@ pub fn spawn_delete(ops: OpContext, plan: DeletePlan, options: DeleteOptions) ->
 }
 
 /// What happened to one item of a batch — a delete, a pause or a resume.
+///
+/// Public, and carried on [`AppEvent::OpProgress`] as data rather than as the
+/// one-line string it renders to, because the footer is not where a failure can
+/// be read: every item overwrites the last one's line, and the summary that
+/// replaces them all carries counts and no reasons. `App` keeps the outcomes it
+/// is handed so the results modal can list them — see
+/// [`crate::app::App::last_op_report`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ItemOutcome {
+pub enum ItemOutcome {
     /// Everything the operation asked for was done. Carries the past tense of
     /// the operation ([`OpKind::past_tense`]) so one enum serves all three,
     /// optionally with a qualifier — a delete whose files turned out to be gone
@@ -340,12 +349,54 @@ impl ItemOutcome {
     }
 
     /// How the outcome reads in the footer.
-    fn detail(&self) -> String {
+    pub fn detail(&self) -> String {
         match self {
             ItemOutcome::Done(what) => what.clone(),
             ItemOutcome::Skipped(why) => format!("skipped — {why}"),
             ItemOutcome::Failed(why) => format!("FAILED — {why}"),
         }
+    }
+
+    /// Why this item did not plainly succeed, or `None` when it did.
+    ///
+    /// What the results modal lists: a batch of twenty successes has nothing to
+    /// report, and a screen that said so anyway would bury the two that did not.
+    pub fn problem(&self) -> Option<&str> {
+        match self {
+            ItemOutcome::Done(_) => None,
+            ItemOutcome::Skipped(why) | ItemOutcome::Failed(why) => Some(why),
+        }
+    }
+
+    /// Whether this is a failure rather than a deliberate skip. Drives the
+    /// wording and the colour of the results modal's line for it.
+    pub fn is_failure(&self) -> bool {
+        matches!(self, ItemOutcome::Failed(_))
+    }
+}
+
+/// One finished item of a batch: which task, and what became of it.
+///
+/// Travels on [`AppEvent::OpProgress`] instead of a preformatted line so `App`
+/// can both write the footer *and* keep the outcome for the results modal
+/// without parsing its own status text back out again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemReport {
+    pub title: String,
+    pub outcome: ItemOutcome,
+}
+
+impl ItemReport {
+    fn new(title: impl Into<String>, outcome: ItemOutcome) -> Self {
+        ItemReport {
+            title: title.into(),
+            outcome,
+        }
+    }
+
+    /// The one-line footer form: what it was, then what happened to it.
+    pub fn detail(&self) -> String {
+        format!("{}: {}", self.title, self.outcome.detail())
     }
 }
 
@@ -398,7 +449,7 @@ async fn run_delete(ops: OpContext, plan: DeletePlan, options: DeleteOptions) {
             op: OpKind::Delete,
             done: index + 1,
             total,
-            detail: format!("{}: {}", item.title, outcome.detail()),
+            item: ItemReport::new(&item.title, outcome.clone()),
         };
         if ops.tx.send(progress).await.is_err() {
             // The UI has gone. Finishing the batch would be work nobody can see
@@ -521,26 +572,39 @@ impl FileTarget {
 /// that mapped [`PathInfo::Error`] onto [`OpOutcome::NothingThere`] would
 /// silently do the last of those.
 ///
-/// **An absent path is only benign when something explains the absence.** Three
+/// **An absent path is only benign when something explains the absence.** Two
 /// things can:
 ///
 /// * *this run already deleted that exact path* (`already_deleted`, from
 ///   [`DeletedPaths`]) — the strongest explanation there is, and the one that
 ///   keeps a retry after an unreadable post-delete check from being refused for
 ///   ever;
-/// * the path came from the task's **file list** (`name_source`) *and* the task
-///   is in a state where Download Station cleans up after itself — an
-///   incomplete, paused or errored download. That is the case the plan's
-///   "Missing ⇒ still delete the task" rule was written for. A file list that
-///   does not determine the *kind* (see below) does not disqualify it: the name
-///   is still the component every entry shares, and an absence leads to no
-///   recursive delete for the malformed metadata to have misaimed;
-/// * nothing else. A name guessed from the display **title** is at least as
-///   likely to have missed as to have been tidied up, and a **finished** task's
-///   payload demonstrably existed, so its absence points at a mis-resolved
-///   *destination* rather than at a cleanup — see
-///   [`crate::delete::payload_should_exist`]. Both keep the task, so the data
-///   stays reachable; both name `--no-delete-files` as the way out.
+/// * **the task's own counters say there is no payload to have missed** — see
+///   [`crate::delete::payload_should_exist`], the question this asks *before* it
+///   asks where the name came from. An incomplete, paused or errored download is
+///   data Download Station cleans up after itself, and that is the case the
+///   plan's "Missing ⇒ still delete the task" rule was written for.
+///
+/// **The order of those two questions is the whole of it.** Provenance was once
+/// asked first, and a name guessed from the display **title** was refused
+/// outright when the path was absent — but that reasoning presupposes there was
+/// a payload to guess at. A `waiting` HTTP download that has written nothing has
+/// none: the guess is moot, there is nothing on the volume to orphan, and
+/// refusing only leaves a row that can never be removed in the normal flow (the
+/// name of every non-BitTorrent task comes from its title, so the refusal
+/// covered all of them). So the counters answer first, and provenance is asked
+/// only of a task whose payload **should** be there:
+///
+/// * a **finished** task's payload demonstrably existed, so its absence points
+///   at a mis-resolved *destination* rather than at a cleanup — refused, and
+///   more sharply still when the name was a title guess rather than read from
+///   the file list. A file list that does not determine the *kind* (see below)
+///   does not disqualify it: the name is still the component every entry shares,
+///   and an absence leads to no recursive delete for the malformed metadata to
+///   have misaimed.
+///
+/// Every refusal here keeps the task, so the data stays reachable, and names
+/// `--no-delete-files` as the way out.
 ///
 /// **A path that exists is not automatically the right path.** The lookup
 /// reports what *kind* of object is there, and resolution knows what kind it
@@ -632,21 +696,35 @@ fn decide_file_phase(
             tracing::info!(path, "already deleted by this run; treating as gone");
             OpOutcome::NothingThere
         }
+        // No provenance at all belongs to a *refused* item, which resolves no
+        // path and therefore issues no file phase — unreachable in production,
+        // and refused here rather than reasoned about, because "nothing named
+        // this path" is the one input that authorizes nothing whatever the
+        // counters say.
+        PathInfo::Missing if name_source.is_none() => OpOutcome::Failed(format!(
+            "nothing at {path}, and nothing in the task names that path; refusing to delete \
+             the task (use --no-delete-files to remove the task anyway)"
+        )),
+        // Asked **before** the provenance check below: a path that was guessed
+        // from the title is only worth refusing over if there was a payload to
+        // guess at. A task that never wrote one has nothing on the volume to
+        // orphan, so its absent path is benign whatever named it.
+        PathInfo::Missing if !delete::payload_should_exist(payload) => OpOutcome::NothingThere,
         PathInfo::Missing if name_source != Some(NameSource::FileList) => {
             OpOutcome::Failed(format!(
-                "nothing at {path}, and that path was guessed from the task's title rather than \
-             read from its file list — refusing to delete the task, which would leave no \
-             pointer to the data if the guess was wrong (use --no-delete-files to remove \
-             the task anyway)"
+                "nothing at {path}, but this task has finished downloading, so its data should \
+             be there — and that path was only guessed from the task's title rather than read \
+             from its file list, so the guess is the likeliest thing to be wrong; refusing to \
+             delete the task, which would leave no pointer to the data (use --no-delete-files \
+             to remove the task anyway)"
             ))
         }
-        PathInfo::Missing if delete::payload_should_exist(payload) => OpOutcome::Failed(format!(
+        PathInfo::Missing => OpOutcome::Failed(format!(
             "nothing at {path}, but this task has finished downloading, so its data should be \
              there — the resolved location is more likely wrong than the files already gone; \
              refusing to delete the task, which would leave no pointer to the payload \
              (use --no-delete-files to remove the task anyway)"
         )),
-        PathInfo::Missing => OpOutcome::NothingThere,
 
         // Not absence — "I could not look" must never be read as "there is
         // nothing to delete", which would remove the task and strand the files.
@@ -1223,7 +1301,7 @@ async fn run_task_op(ops: OpContext, op: TaskOp, tasks: Vec<TaskRef>, dry_run: b
             op: kind,
             done: index + 1,
             total,
-            detail: format!("{}: {}", task.title, outcome.detail()),
+            item: ItemReport::new(&task.title, outcome.clone()),
         };
         if ops.tx.send(progress).await.is_err() {
             tracing::debug!("the event channel closed mid-batch; stopping");
@@ -1494,11 +1572,10 @@ mod tests {
         // successes — a dry run must never read as "2 succeeded".
         for expected in 1..=2 {
             match rx.recv().await {
-                Some(AppEvent::OpProgress {
-                    op, done, detail, ..
-                }) => {
+                Some(AppEvent::OpProgress { op, done, item, .. }) => {
                     assert_eq!(op, OpKind::Pause);
                     assert_eq!(done, expected);
+                    let detail = item.detail();
                     assert!(detail.contains("dry run"), "{detail}");
                 }
                 other => panic!("expected progress, got {other:?}"),
@@ -1538,8 +1615,9 @@ mod tests {
             match event {
                 // Every item, including the ones that would really have been
                 // deleted, reports what it *would* do — never that it did it.
-                AppEvent::OpProgress { op, detail, .. } => {
+                AppEvent::OpProgress { op, ref item, .. } => {
                     assert_eq!(op, OpKind::Delete);
+                    let detail = item.detail();
                     assert!(
                         detail.contains("dry run") || detail.contains("skipped"),
                         "{detail}"
@@ -1585,7 +1663,7 @@ mod tests {
         }
         assert!(matches!(
             events.first(),
-            Some(AppEvent::OpProgress { detail, .. }) if detail.contains("skipped")
+            Some(AppEvent::OpProgress { item, .. }) if item.detail().contains("skipped")
         ));
         assert_eq!(
             events.last(),
@@ -1629,9 +1707,10 @@ mod tests {
         .expect("a dry run issues no request and cannot hang");
 
         let event = rx.try_recv().expect("one progress event");
-        let AppEvent::OpProgress { detail, .. } = event else {
+        let AppEvent::OpProgress { item, .. } = event else {
             panic!("expected progress, got {event:?}");
         };
+        let detail = item.detail();
         assert!(
             detail.contains("would delete the DSM task"),
             "a refused item must still be removable with --no-delete-files: {detail}"
@@ -1691,8 +1770,8 @@ mod tests {
         assert!(
             matches!(
                 events.first(),
-                Some(AppEvent::OpProgress { detail, .. })
-                    if detail.contains("FAILED") && detail.contains("share root")
+                Some(AppEvent::OpProgress { item, .. })
+                    if item.detail().contains("FAILED") && item.detail().contains("share root")
             ),
             "{events:?}"
         );
@@ -1829,7 +1908,8 @@ mod tests {
         // a guess about DSM's unpack behaviour would strand every HTTP/NZB task
         // this fallback exists for. Deliberate, documented, and logged — not an
         // oversight. The strictness for these paths lives on the *absent*
-        // branch instead.
+        // branch instead — and there only for a task whose payload should be on
+        // the volume; see the two tests below.
         for is_dir in [true, false] {
             assert_eq!(
                 decide_file_phase(
@@ -2016,27 +2096,105 @@ mod tests {
         }
     }
 
+    /// The shape rule 3 produces: a name taken from the display title, with no
+    /// metadata to say what kind of object to expect.
+    fn from_title() -> FileTarget {
+        FileTarget {
+            name_source: Some(NameSource::Title),
+            expected_kind: ExpectedKind::AnyFromTitle,
+        }
+    }
+
     #[test]
-    fn an_absent_path_guessed_from_the_title_is_a_failure_not_a_skip() {
-        // The path came from the display title, which nothing corroborates. An
-        // empty answer is at least as likely to mean the guess missed as to
-        // mean the data is gone — and deleting the task would destroy the only
-        // pointer to a payload still sitting on the volume.
+    fn an_absent_path_guessed_from_the_title_is_a_failure_when_the_payload_should_be_there() {
+        // The path came from the display title, which nothing corroborates. For
+        // a task whose payload demonstrably existed, an empty answer is at
+        // least as likely to mean the guess missed as to mean the data is gone
+        // — and deleting the task would destroy the only pointer to a payload
+        // still sitting on the volume.
         let outcome = decide_file_phase(
             PathInfo::Missing,
             "/downloads/X",
-            FileTarget {
-                name_source: Some(NameSource::Title),
-                expected_kind: ExpectedKind::AnyFromTitle,
+            from_title(),
+            &partial(TaskStatus::Finished),
+            false,
+        );
+        assert!(
+            matches!(&outcome, OpOutcome::Failed(why)
+                if why.contains("guessed") && why.contains("--no-delete-files")),
+            "{outcome:?}"
+        );
+
+        // Status is not the only evidence: a task paused at 100% has its whole
+        // payload on disk, so the title guess is worth refusing over there too.
+        let outcome = decide_file_phase(
+            PathInfo::Missing,
+            "/downloads/X",
+            from_title(),
+            &PayloadState {
+                status: TaskStatus::Paused,
+                downloaded: 1024,
+                size: 1024,
             },
-            &partial(TaskStatus::Downloading),
             false,
         );
         assert!(
             matches!(&outcome, OpOutcome::Failed(why) if why.contains("guessed")),
             "{outcome:?}"
         );
-        // A refused item has no provenance at all and gets the same treatment.
+    }
+
+    #[test]
+    fn an_absent_path_guessed_from_the_title_is_benign_when_no_payload_was_ever_written() {
+        // The over-refusal this ordering exists to undo. Every non-BitTorrent
+        // task resolves its name from the title, so hard-failing a missing path
+        // on provenance alone made an HTTP/FTP/NZB task that downloaded nothing
+        // — `waiting`, or errored on a bad URL — impossible to delete in the
+        // normal flow: no payload to orphan, and yet the row survived every
+        // retry.
+        for status in [
+            TaskStatus::Waiting,
+            TaskStatus::Error,
+            TaskStatus::Downloading,
+            TaskStatus::Paused,
+        ] {
+            assert_eq!(
+                decide_file_phase(
+                    PathInfo::Missing,
+                    "/downloads/empty-placeholder.bin",
+                    from_title(),
+                    &PayloadState {
+                        status: status.clone(),
+                        downloaded: 0,
+                        size: 4 * 1024 * 1024,
+                    },
+                    false,
+                ),
+                OpOutcome::NothingThere,
+                "{status}"
+            );
+        }
+
+        // A partially written payload is the same answer: Download Station
+        // cleans its own partial data up, which is what the file-list branch
+        // has always relied on.
+        assert_eq!(
+            decide_file_phase(
+                PathInfo::Missing,
+                "/downloads/X",
+                from_title(),
+                &partial(TaskStatus::Downloading),
+                false,
+            ),
+            OpOutcome::NothingThere
+        );
+    }
+
+    #[test]
+    fn an_absent_path_with_no_provenance_at_all_is_refused_whatever_the_counters_say() {
+        // A refused item resolves no path and never reaches the file phase, so
+        // this is defence in depth: nothing named the path, so nothing
+        // authorizes deleting the task off its absence.
         assert!(matches!(
             decide_file_phase(
                 PathInfo::Missing,
@@ -2050,6 +2208,39 @@ mod tests {
             ),
             OpOutcome::Failed(_)
         ));
+    }
+
+    #[test]
+    fn an_errored_http_download_that_wrote_nothing_can_be_deleted_end_to_end() {
+        // The common real case, taken from the snapshot the dialog would build
+        // rather than from a hand-made `FileTarget`: a bad URL, zero bytes
+        // written, the name resolved from the title because an HTTP task has no
+        // file list. Nothing was ever on the volume, so the missing path must
+        // not strand the row.
+        let task = Task {
+            id: "dbid_098".to_string(),
+            title: "broken-download.bin".to_string(),
+            task_type: crate::model::TaskType::Http,
+            destination: "downloads".to_string(),
+            status: TaskStatus::Error,
+            size: 4 * 1024 * 1024,
+            downloaded: 0,
+            files: Vec::new(),
+            ..fixture_task("dbid_007")
+        };
+        let item = &DeletePlan::snapshot([&task]).items[0];
+        assert_eq!(item.name_source, Some(NameSource::Title));
+
+        assert_eq!(
+            decide_file_phase(
+                PathInfo::Missing,
+                item.path().expect("resolved"),
+                FileTarget::of_item(item),
+                &item.payload_state(),
+                false,
+            ),
+            OpOutcome::NothingThere
+        );
     }
 
     // ---- which read of the task the file phase judges from ------------------
@@ -2565,7 +2756,7 @@ mod tests {
         assert_eq!(events.len(), 3, "{events:?}");
         for event in &events[..2] {
             assert!(
-                matches!(event, AppEvent::OpProgress { detail, .. } if detail.contains("FAILED")),
+                matches!(event, AppEvent::OpProgress { item, .. } if item.detail().contains("FAILED")),
                 "{event:?}"
             );
         }
@@ -2588,8 +2779,9 @@ mod tests {
         run_task_op(ops, TaskOp::Pause, task_refs(&["dbid_007"]), true).await;
 
         match rx.try_recv() {
-            Ok(AppEvent::OpProgress { detail, .. }) => {
-                assert!(detail.starts_with("Title of dbid_007:"), "{detail}")
+            Ok(AppEvent::OpProgress { item, .. }) => {
+                assert_eq!(item.title, "Title of dbid_007");
+                assert!(item.detail().starts_with("Title of dbid_007:"), "{item:?}");
             }
             other => panic!("expected progress, got {other:?}"),
         }

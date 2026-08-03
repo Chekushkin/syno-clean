@@ -572,7 +572,7 @@ impl SessionCache {
     /// needed.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            create_private_dir(parent)?;
         }
         let text = serde_json::to_string_pretty(self)?;
         write_private(path, text.as_bytes())
@@ -603,6 +603,53 @@ impl SessionCache {
     }
 }
 
+/// `mode` on `OpenOptions` only applies at **creation** time, so a file that
+/// already exists keeps whatever mode it had. Every private file is therefore
+/// re-chmod'd after opening rather than trusted to have been created by us.
+#[cfg(unix)]
+fn tighten(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn tighten(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+/// Create **this program's own** directory, and make sure only the owner can
+/// enter it.
+///
+/// The cache directory holds the two files that can carry a sid — the session
+/// cache and, by default, the log — so leaving it at `0755` beside two `0600`
+/// files still lets another local user stat them and watch the log grow.
+/// Tightened even when it already exists, because a directory created by an
+/// earlier version is exactly the one that is still open. Parents are created
+/// with the default mode; only the leaf is ours to narrow.
+///
+/// ⚠️ Only ever call this on a path the program chose ([`Paths`]). A directory
+/// the *user* named — `--log-file` can point anywhere — may be shared, and
+/// chmodding `/tmp` to `0700` would be considerably worse than the leak it was
+/// meant to close; use [`create_dir_for`] there.
+fn create_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    tighten(path, 0o700)
+}
+
+/// Create the directory a user-named file lives in, tightening it **only if it
+/// did not already exist**.
+///
+/// A directory this program brings into being is its own and starts at `0700`;
+/// one that was already there belongs to whoever made it, and narrowing it is
+/// not this program's call.
+fn create_dir_for(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    create_private_dir(path)
+}
+
 /// Write a file only the owner can read.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
@@ -618,17 +665,17 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.flush()?;
 
-    // `mode` on OpenOptions only applies at creation time; an existing file
-    // keeps whatever mode it had, so tighten it explicitly.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    tighten(path, 0o600)
 }
 
 /// Send `tracing` output to a file — never to stdout, which the TUI owns.
+///
+/// **Mode `0600`, for the same reason `session.json` is** (see [`SessionCache`]):
+/// a DSM error carries the URL that produced it, and every non-login request
+/// puts the sid in that URL's query string. [`crate::error::Error`] strips the
+/// query before it renders, so a sid should never reach a log line — but the log
+/// is one formatting mistake away from holding a bearer credential, and a file
+/// the whole machine can read is not where that mistake should land.
 ///
 /// The returned [`WorkerGuard`] must be held for the lifetime of the process:
 /// dropping it early silently discards everything still buffered in the
@@ -636,12 +683,17 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 #[must_use = "dropping the WorkerGuard discards buffered log lines"]
 pub fn init_logging(log_file: &Path) -> Result<WorkerGuard> {
     if let Some(parent) = log_file.parent() {
-        fs::create_dir_all(parent)?;
+        create_dir_for(parent)?;
     }
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_file)?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(log_file)?;
+    tighten(log_file, 0o600)?;
     let (writer, guard) = tracing_appender::non_blocking(file);
 
     tracing_subscriber::fmt()
@@ -1337,5 +1389,72 @@ delete_files = true
         assert!(!path.parent().expect("parent").exists());
         SessionCache::default().save(&path).expect("save");
         assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).expect("stat").permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_cache_directory_is_0700_so_the_files_in_it_stay_private() {
+        // Two 0600 files inside a 0755 directory are still two files every
+        // local user can stat and watch grow.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = Paths::with_base(dir.path()).session_file();
+        SessionCache::default().save(&path).expect("save");
+        let cache_dir = path.parent().expect("parent");
+        assert_eq!(mode_of(cache_dir), 0o700, "got {:o}", mode_of(cache_dir));
+
+        // A directory left open by an earlier version is exactly the one that
+        // has to be narrowed, so an existing directory is tightened too.
+        tighten(cache_dir, 0o755).expect("chmod");
+        SessionCache::default().save(&path).expect("save again");
+        assert_eq!(mode_of(cache_dir), 0o700, "got {:o}", mode_of(cache_dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_log_file_is_created_0600_and_tightened_if_it_was_not() {
+        // The log can carry a sid — the same bearer credential `session.json`
+        // is 0600 for. `init_logging`'s own result is ignored: a global tracing
+        // subscriber can only be installed once per process, and what is under
+        // test is the file it opens, which it opens either way.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = Paths::with_base(dir.path()).log_file();
+
+        drop(init_logging(&log));
+        assert!(log.exists());
+        assert_eq!(mode_of(&log), 0o600, "got {:o}", mode_of(&log));
+        let parent = log.parent().expect("parent");
+        assert_eq!(mode_of(parent), 0o700, "got {:o}", mode_of(parent));
+
+        // Appending to a log a previous version left world-readable must not
+        // inherit its mode.
+        tighten(&log, 0o644).expect("chmod");
+        drop(init_logging(&log));
+        assert_eq!(mode_of(&log), 0o600, "got {:o}", mode_of(&log));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_the_user_named_is_never_re_chmodded() {
+        // `--log-file` can point anywhere, including a shared directory that is
+        // not this program's to narrow. Chmodding /tmp to 0700 would be worse
+        // than the leak it was meant to close.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = dir.path().join("shared");
+        fs::create_dir(&shared).expect("mkdir");
+        tighten(&shared, 0o755).expect("chmod");
+
+        create_dir_for(&shared).expect("existing directory");
+        assert_eq!(mode_of(&shared), 0o755, "got {:o}", mode_of(&shared));
+
+        // One it creates itself is its own, and starts closed.
+        let ours = dir.path().join("ours");
+        create_dir_for(&ours).expect("new directory");
+        assert_eq!(mode_of(&ours), 0o700, "got {:o}", mode_of(&ours));
     }
 }

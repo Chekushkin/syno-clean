@@ -41,7 +41,12 @@ version to have changed anything from.
 - Distinct empty states for "the NAS has no tasks" and "a filter or search is hiding
   everything", the latter naming how many rows are hidden and by what.
 - `?` help overlay documenting every binding, generated from the same data a test
-  checks against the actual keymap.
+  checks against the actual keymap, and naming `--no-delete-files` — the one remedy
+  that is a flag rather than a key.
+- A results modal listing every item a batch skipped or failed **with its reason**, on
+  screen rather than in the log: it opens by itself when a batch finishes with something
+  to report and `v` reopens it. Reasons are wrapped, never truncated, in both modals,
+  and the footer drops its context before it clips a message.
 
 #### Deleting
 

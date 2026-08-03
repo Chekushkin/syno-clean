@@ -249,7 +249,13 @@ fn is_volume_component(component: &str) -> bool {
 /// from the file list is what BitTorrent actually wrote, so finding nothing
 /// there really does mean somebody already cleaned up; a path built from the
 /// display title is a **guess**, and finding nothing there is at least as
-/// likely to mean the guess was wrong. See `event::decide_file_phase`.
+/// likely to mean the guess was wrong.
+///
+/// ⚠️ It is the *second* question `event::decide_file_phase` asks, never the
+/// first. A guess is only worth refusing over when there was a payload to guess
+/// at ([`payload_should_exist`]): every non-BitTorrent task resolves its name
+/// from the title, so treating provenance as decisive on its own made a task
+/// that had downloaded nothing impossible to delete at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NameSource {
     /// Rule 1: the shared top-level component of the task's file list.
