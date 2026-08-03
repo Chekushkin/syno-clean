@@ -40,8 +40,17 @@ pub fn is_session_error(code: i32) -> bool {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Transport-level failure: DNS, TLS, connection refused, timeout.
-    #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    ///
+    /// Carries a **rendered, query-stripped** message rather than deriving one
+    /// from the source on demand — see [`http_message`]. The `reqwest::Error`
+    /// rides along as the error source for anything that wants to inspect it,
+    /// but nothing that displays this variant may reach for it.
+    #[error("HTTP request failed: {message}")]
+    Http {
+        message: String,
+        #[source]
+        source: reqwest::Error,
+    },
 
     /// The NAS answered, but with `success: false` and a numeric code.
     #[error("{api} failed: {} (DSM error {code})", dsm_message(*code, api))]
@@ -74,6 +83,48 @@ pub enum Error {
         api: String,
         reason: ApiUnavailableReason,
     },
+}
+
+/// The one place a `reqwest::Error` becomes an [`Error`], so the redaction
+/// below cannot be bypassed by a `?`.
+impl From<reqwest::Error> for Error {
+    fn from(source: reqwest::Error) -> Self {
+        Error::Http {
+            message: http_message(&source),
+            source,
+        }
+    }
+}
+
+/// A transport error's own text, with any **query string removed**.
+///
+/// reqwest appends `" for url (<the whole url>)"` to every error it can
+/// attribute to a request, and every non-login request this client makes puts
+/// `_sid=<the session id>` in that query (`api::client::send`). A sid is a
+/// bearer credential — the reason `session.json` and the log file are both mode
+/// `0600` — and that text travels a long way: into `tracing::warn!(%err, …)`,
+/// into a delete's per-item failure reason, into the footer, and onto stderr
+/// during the shutdown drain.
+///
+/// Stripped **here, at the one boundary where a `reqwest::Error` enters this
+/// crate**, rather than at each of the places that render one: there is no
+/// second copy of the rule to forget. The scheme, host and path survive, which
+/// is the half that says which endpoint failed.
+fn http_message(err: &reqwest::Error) -> String {
+    redact_query(&err.to_string(), err.url())
+}
+
+/// [`http_message`] with the URL passed in, so the substitution is testable
+/// without a network stack to produce a real `reqwest::Error` from.
+fn redact_query(text: &str, url: Option<&reqwest::Url>) -> String {
+    match url {
+        Some(url) if url.query().is_some() => {
+            let mut redacted = url.clone();
+            redacted.set_query(None);
+            text.replace(url.as_str(), redacted.as_str())
+        }
+        _ => text.to_string(),
+    }
 }
 
 impl Error {
@@ -228,7 +279,7 @@ fn is_auth_failure(err: &Error) -> bool {
 /// different next steps.
 pub fn connection_hint(err: &Error) -> String {
     match err {
-        Error::Http(_) => "check the host, the port and that DSM is reachable — HTTPS is 5001 \
+        Error::Http { .. } => "check the host, the port and that DSM is reachable — HTTPS is 5001 \
              and HTTP is 5000 by default, and a self-signed certificate needs --insecure"
             .to_string(),
         Error::Dsm { code, api } if api == AUTH_API => auth_hint(*code).to_string(),
@@ -563,6 +614,68 @@ mod tests {
             "{diagnostic}"
         );
         assert!(diagnostic.contains("Package Center"), "{diagnostic}");
+    }
+
+    // ---- the sid must not ride out on a transport error ---------------------
+
+    /// The text reqwest produces: its own description, then the whole URL.
+    fn reqwest_style(url: &str) -> String {
+        format!("error sending request for url ({url})")
+    }
+
+    #[test]
+    fn a_transport_errors_url_is_rendered_without_its_query() {
+        // Every non-login request carries `_sid=<bearer credential>` in the
+        // query, and reqwest appends the whole URL to the error it hands back.
+        // That text reaches the log, the footer and stderr.
+        let url = reqwest::Url::parse(
+            "https://nas.local:5001/webapi/entry.cgi\
+             ?api=SYNO.FileStation.List&method=list&_sid=SECRET-SESSION-ID",
+        )
+        .expect("a valid url");
+        let redacted = redact_query(&reqwest_style(url.as_str()), Some(&url));
+
+        assert!(!redacted.contains("_sid"), "{redacted}");
+        assert!(!redacted.contains("SECRET-SESSION-ID"), "{redacted}");
+        // The half that says which endpoint failed survives.
+        assert!(
+            redacted.contains("https://nas.local:5001/webapi/entry.cgi"),
+            "{redacted}"
+        );
+        assert!(redacted.starts_with("error sending request"), "{redacted}");
+    }
+
+    #[test]
+    fn an_error_with_no_query_or_no_url_is_left_exactly_as_it_was() {
+        let bare = reqwest::Url::parse("https://nas.local:5001/webapi/entry.cgi").expect("url");
+        let text = reqwest_style(bare.as_str());
+        assert_eq!(redact_query(&text, Some(&bare)), text);
+        assert_eq!(redact_query("connection closed", None), "connection closed");
+    }
+
+    #[tokio::test]
+    async fn a_real_transport_failure_reaches_display_with_no_sid_in_it() {
+        // The end-to-end path: a `?` on a reqwest call, through `From`, out of
+        // `Display`. Port 1 on the loopback refuses immediately, so this is a
+        // genuine `reqwest::Error` carrying a genuine URL and no network.
+        let result: Result<String> = async {
+            let text = reqwest::Client::new()
+                .get("http://127.0.0.1:1/webapi/entry.cgi")
+                .query(&[("api", "SYNO.FileStation.List"), ("_sid", "SECRET")])
+                .send()
+                .await?
+                .text()
+                .await?;
+            Ok(text)
+        }
+        .await;
+
+        let err = result.expect_err("nothing listens on port 1");
+        let rendered = err.to_string();
+        assert!(matches!(err, Error::Http { .. }), "{rendered}");
+        assert!(!rendered.contains("_sid"), "{rendered}");
+        assert!(!rendered.contains("SECRET"), "{rendered}");
+        assert!(rendered.contains("127.0.0.1:1"), "{rendered}");
     }
 
     #[test]

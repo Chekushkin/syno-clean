@@ -145,7 +145,8 @@ library, where it is testable.
   `SYNO_CLEAN_PASSWORD` or an interactive `rpassword` prompt, taken **before**
   the alternate screen is entered. 2FA likewise via `SYNO_CLEAN_OTP` or a prompt
   when DSM answers 403.
-- Session `sid` cache lives at `~/.cache/syno-clean/session.json`, mode `0600`,
+- Session `sid` cache lives at `~/.cache/syno-clean/session.json`, mode `0600`
+  inside a `0700` cache directory (the log file next to it is `0600` too),
   keyed by `{host}:{port}/{username}` so multiple NASes/accounts never evict
   each other. Normal quit does **not** log out — that would invalidate the cache
   and defeat it; only `--logout` does. A corrupt cache is discarded with a
@@ -278,11 +279,15 @@ needs must be `info!` or higher. `--log-file` changes only *where* the file goes
 - Credentials are redacted in a hand-written `Debug`. Keep it that way:
   `SynoClient` derives `Debug` and holds them, so one `{:?}` would otherwise put
   a password in the log file.
-- **The redaction guarantee covers the password, not the `sid`.** `SynoClient`'s
-  derived `Debug` prints its `sid` field, and a sid is a bearer credential (it is
-  why the session cache is `0600`). Never `{:?}` a `SynoClient` or log a raw
-  request URL, and do not tell users the log is credential-free — say the
-  password is redacted and the sid may not be.
+- **The `sid` is a bearer credential and is kept out of the log by two separate
+  rules.** `SynoClient` derives `Debug` and prints its `sid` field, so never
+  `{:?}` a `SynoClient`; and every non-login request carries `_sid=` in its query
+  string, so `error::Error`'s `From<reqwest::Error>` strips the query out of the
+  message reqwest builds (`" for url (…)"`) at the single boundary where a
+  transport error enters the crate. Do not render a `reqwest::Error` any other
+  way, and do not log a raw request URL with its query attached. The log file and
+  the session cache are both `0600`, and the cache directory `0700`, because a
+  formatting mistake here is a credential on disk.
 
 ### Two DSM shapes that are easy to get wrong
 
@@ -537,16 +542,30 @@ deleted.
   skips the pause *call* for a genuinely idle task, so DSM's "already paused"
   per-task error cannot fail an otherwise good delete.
 - **An absent path is only benign when something explains the absence**
-  (`event::decide_file_phase`). Three inputs decide it:
-  `DeleteItem::name_source` (`FileList` or `Title` — a name guessed from the
-  display title is at least as likely to have missed as to have been tidied up),
-  the task's status (above), and `event::DeletedPaths` — the set of paths *this
-  process* has already deleted successfully. The last one is what keeps the
-  strictness from becoming a trap: an item whose files went but whose
-  post-delete re-check could not be made fails and keeps its task, and the
-  obvious retry would otherwise hit the refusal for ever. Record the fact where
-  it is known (the delete returning success) rather than reading a failed lookup
-  as a success.
+  (`event::decide_file_phase`). Three inputs decide it, **and the order they are
+  asked in is load-bearing**:
+  1. `event::DeletedPaths` — the set of paths *this process* already deleted
+     successfully. This is what keeps the strictness below from becoming a trap:
+     an item whose files went but whose post-delete re-check could not be made
+     fails and keeps its task, and the obvious retry would otherwise hit the
+     refusal for ever. Record the fact where it is known (the delete returning
+     success) rather than reading a failed lookup as a success.
+  2. `delete::payload_should_exist` — the ratcheted status *and* counters. If the
+     task never wrote a payload, there is nothing on the volume to orphan and the
+     absence is benign.
+  3. only then `DeleteItem::name_source` (`FileList` or `Title`). A name guessed
+     from the display title is at least as likely to have missed as to have been
+     tidied up — but **only if there was a payload to guess at**. Asking
+     provenance first made every non-BitTorrent task (HTTP/FTP/NZB/eMule all
+     resolve their name from the title) that had downloaded nothing permanently
+     undeletable: `Missing` + `Title` hard-failed, the task delete was cancelled,
+     and every retry did the same. Keep the hard failure for a title-named path
+     that is missing when the payload *should* be there; do not reinstate it for
+     one that never existed.
+
+  A path with no provenance at all (`name_source: None`, a refused item, which
+  resolves no path and so cannot reach the file phase) is still refused outright
+  ahead of all of this: nothing named it, so nothing authorizes acting on it.
 - **The existence check has four answers, not three.** `PathInfo::Unknown` is a
   `getinfo` response carrying no entry attributable to the requested path — an
   empty `files` array (which is what a shape this client cannot parse produces,
@@ -619,6 +638,30 @@ deleted.
 - **`App::error` is not `App::status_message`.** The error banner is cleared
   automatically by the next successful refresh and rendered red with `⚠`; the
   status message survives underneath and returns when the banner clears.
+- **The footer is one line and cannot hold a reason.** Every per-item outcome
+  that lands in it is overwritten by the next one, and the `OpDone` summary that
+  replaces them all carries counts only. So `AppEvent::OpProgress` carries an
+  `event::ItemReport` (title + `ItemOutcome`) as *data*, not a preformatted line:
+  `App` writes the footer from it **and** keeps the non-successes, folding them
+  into an `app::OpReport` when the batch finishes. That is what the results modal
+  (`Mode::Results`, `v`) lists. A message that still will not fit is elided by
+  `ui::fit_footer`, which drops the sort and then the selection before it
+  truncates the message, and marks the truncation with an ellipsis.
+- **A modal is never replaced under a user who is reading one.** The results
+  modal auto-opens on a batch with problems, but only from `Mode::Normal`; the
+  report is kept either way and `v` reaches it later. `Mode::Results` does *not*
+  close on any key the way `Mode::Help` does — it scrolls, so `j` and `k` have to
+  mean something — and it blocks no refresh, because it describes what already
+  happened rather than a snapshot the list could invalidate.
+- **Refusal reasons are wrapped, never truncated** (`format::wrap`, used by both
+  modals). The remedy a refusal names (`--no-delete-files`) is at the *end* of the
+  sentence and the modal is capped at 82 cells however wide the terminal is, so
+  truncating put it out of reach at every terminal size. The confirmation and the
+  results modal also both carry `dialog::SKIP_REMEDY` as a standing line that
+  cannot scroll away, and the `?` overlay names the flag in its footer: it is the
+  one escape hatch that is not a key, and there is deliberately **no in-app
+  toggle** for it — a key that silently re-aims a delete at "task only" is worse
+  than a restart.
 
 ### Selection
 

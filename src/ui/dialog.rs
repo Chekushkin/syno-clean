@@ -46,9 +46,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 
-use crate::app::ConfirmFocus;
+use crate::app::{ConfirmFocus, OpReport};
 use crate::delete::{self, DeleteItem, DeleteOptions, DeletePlan};
-use crate::format::{self, display_width, truncate_ellipsis};
+use crate::format::{self, display_width};
 
 /// Bullet in front of a task that will be deleted.
 pub const DELETE_MARKER: &str = "•";
@@ -59,6 +59,23 @@ pub const SKIP_MARKER: &str = "SKIPPED";
 
 /// Prefix on the title while `--dry-run` is active.
 pub const DRY_RUN_MARKER: &str = "DRY RUN";
+
+/// Flag in front of an item a finished batch could not complete.
+pub const FAILED_MARKER: &str = "FAILED";
+
+/// The way out of every refusal this program can produce, said where the user
+/// is looking at one.
+///
+/// Each refusal reason already names `--no-delete-files`, but a reason is a long
+/// sentence at the end of a list; this is one short line that stands still. It
+/// exists because the flag was, measurably, unreachable: the reasons were
+/// truncated at the modal's border, the footer clipped them, the `?` overlay
+/// never mentioned the flag, and there is no in-app toggle for it — the option
+/// changes what a confirmed `y` does, and a key that silently re-aims a delete
+/// at "task only" is not a key this program is going to grow.
+pub const SKIP_REMEDY: &str = "Skipped tasks can be removed with --no-delete-files: \
+                               that deletes the Download Station task only and never \
+                               touches the volume.";
 
 /// Label of the button that closes the dialog without deleting anything.
 pub const CANCEL_LABEL: &str = "Cancel (Esc)";
@@ -117,6 +134,10 @@ pub struct ConfirmSummary {
     pub effect: String,
     /// The scrollable body: two lines per item, in snapshot order.
     pub lines: Vec<SummaryLine>,
+    /// A standing line under the list — [`SKIP_REMEDY`] — shown when some row
+    /// will be skipped. Outside [`Self::lines`] deliberately: the list scrolls,
+    /// and the one line naming the way out must not be able to scroll away.
+    pub note: Option<String>,
     /// The count-and-bytes line under the list.
     pub totals: String,
     /// How many tasks will be deleted.
@@ -217,6 +238,7 @@ pub fn build_confirmation(plan: &DeletePlan, options: DeleteOptions) -> ConfirmS
         title: title(delete_count, options),
         effect: effect(options, discarded.count > 0),
         lines,
+        note: (skipped_count > 0).then(|| SKIP_REMEDY.to_string()),
         totals: totals(delete_count, skipped_count, total_size, discarded, options),
         delete_count,
         skipped_count,
@@ -399,10 +421,15 @@ pub fn render_confirm(
     // Borders and the one-cell padding either side.
     let inner_width = width.saturating_sub(4).max(1);
     let effect_rows = wrapped_height(&summary.effect, inner_width);
-    let body_rows = u16::try_from(summary.line_count()).unwrap_or(u16::MAX);
-    // effect + blank + body + blank + totals + buttons, inside the border.
+    let body_rows = wrapped_rows(&summary.lines, inner_width);
+    let note_rows = summary.note.as_deref().map_or(0, |note| {
+        wrapped_height(note, inner_width).saturating_add(1)
+    });
+    // effect + blank + body + blank + note + totals + buttons, inside the
+    // border.
     let height = effect_rows
         .saturating_add(body_rows)
+        .saturating_add(note_rows)
         .saturating_add(4)
         .saturating_add(2)
         .min(area.height)
@@ -424,9 +451,10 @@ pub fn render_confirm(
         return;
     }
 
-    let [effect_area, body_area, totals_area, buttons_area] = Layout::vertical([
+    let [effect_area, body_area, note_area, totals_area, buttons_area] = Layout::vertical([
         Constraint::Length(effect_rows + 1),
         Constraint::Min(0),
+        Constraint::Length(note_rows),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -439,18 +467,13 @@ pub fn render_confirm(
         effect_area,
     );
 
-    let visible = usize::from(body_area.height);
-    let offset = scroll.min(summary.line_count().saturating_sub(visible));
-    let body: Vec<Line> = summary
-        .lines
-        .iter()
-        .skip(offset)
-        .take(visible)
-        .map(|line| body_line(line, body_area.width))
-        .collect();
+    let (body, more) = body_rows_from(&summary.lines, scroll, body_area);
     frame.render_widget(Paragraph::new(body), body_area);
 
-    let more = summary.line_count() > offset + visible || offset > 0;
+    if let Some(note) = &summary.note {
+        render_note(frame, note_area, note);
+    }
+
     frame.render_widget(Paragraph::new(totals_line(summary, more)), totals_area);
     frame.render_widget(
         Paragraph::new(buttons_line(focus, summary)).centered(),
@@ -476,21 +499,73 @@ fn effect_style(summary: &ConfirmSummary) -> Style {
     }
 }
 
-/// One body line, truncated to the modal's width at display width so a CJK
-/// title cannot spill past the border.
-fn body_line(line: &SummaryLine, width: u16) -> Line<'static> {
-    let style = match line.kind {
+/// Draw the standing remedy line, one blank row below the list it follows.
+///
+/// The blank is the whole reason this is not an inline `render_widget`: the note
+/// is not another item, and a line of prose butted straight against the last
+/// reason reads as part of it. Both modals reserve the row (see the `note_rows`
+/// each computes) and both spend it here, so they cannot drift.
+fn render_note(frame: &mut Frame, area: Rect, note: &str) {
+    let [_, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(note.to_string())
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(Color::Yellow)),
+        body,
+    );
+}
+
+/// How one kind of body line is drawn.
+fn line_style(kind: LineKind) -> Style {
+    match kind {
         LineKind::Delete => Style::default(),
         LineKind::Path => Style::default().add_modifier(Modifier::DIM),
         LineKind::Skipped => Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
         LineKind::Reason => Style::default().fg(Color::Yellow),
-    };
-    Line::from(Span::styled(
-        truncate_ellipsis(&line.text, usize::from(width)),
-        style,
-    ))
+    }
+}
+
+/// The screen rows a list of body lines needs at `width`, once wrapped.
+fn wrapped_rows(lines: &[SummaryLine], width: u16) -> u16 {
+    let rows: usize = lines
+        .iter()
+        .map(|line| format::wrap(&line.text, usize::from(width)).len())
+        .sum();
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+/// The rows to draw in `area`, starting from body line `scroll`, and whether
+/// anything is off screen above or below.
+///
+/// **Wrapped, not truncated.** A refusal reason names its remedy
+/// (`--no-delete-files`) at the *end* of the sentence, and the modal is capped at
+/// [`MAX_MODAL_WIDTH`] however wide the terminal is — so truncation put that
+/// remedy beyond reach at every terminal size there is. Titles and paths are
+/// wrapped for the same reason: the path is what the user checks the aim
+/// against, and half a path is not a path.
+///
+/// `scroll` indexes **body lines**, not screen rows, which is what lets
+/// `App::scroll_confirm` clamp it without knowing the terminal width. The last
+/// line is therefore always reachable; only its own wrapped tail can sit below
+/// the fold, which the scroll hint says.
+fn body_rows_from(lines: &[SummaryLine], scroll: usize, area: Rect) -> (Vec<Line<'static>>, bool) {
+    let visible = usize::from(area.height);
+    let offset = scroll.min(lines.len().saturating_sub(1));
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    for line in &lines[offset.min(lines.len())..] {
+        let style = line_style(line.kind);
+        rows.extend(
+            format::wrap(&line.text, usize::from(area.width))
+                .into_iter()
+                .map(|text| Line::from(Span::styled(text, style))),
+        );
+    }
+
+    let more = offset > 0 || rows.len() > visible;
+    rows.truncate(visible);
+    (rows, more)
 }
 
 /// The totals, plus a scroll hint when the list does not fit.
@@ -539,6 +614,112 @@ fn button(label: &str, focused: bool, colour: Color) -> Span<'static> {
     Span::styled(format!("[ {label} ]"), style)
 }
 
+// ---- the results modal -----------------------------------------------------
+
+/// Footer of the results modal. Unlike the help overlay this one scrolls, so it
+/// names the key that closes it rather than claiming any key does.
+pub const RESULTS_DISMISS: &str = "Esc closes · ↑/↓ scroll";
+
+/// The body of the results modal: two lines per problem, in batch order.
+///
+/// Built as data for the same reason [`build_confirmation`] is — this is the
+/// part worth asserting on, and it is testable from an [`OpReport`] with no
+/// frame in sight.
+pub fn build_results(report: &OpReport) -> Vec<SummaryLine> {
+    let mut lines = Vec::with_capacity(report.line_count());
+    for problem in &report.problems {
+        let (marker, kind) = if problem.outcome.is_failure() {
+            (FAILED_MARKER, LineKind::Skipped)
+        } else {
+            (SKIP_MARKER, LineKind::Skipped)
+        };
+        lines.push(SummaryLine::new(
+            kind,
+            format!("{marker}  {}", problem.title),
+        ));
+        lines.push(SummaryLine::new(
+            LineKind::Reason,
+            format!(
+                "    {}",
+                problem.outcome.problem().unwrap_or("no reason given")
+            ),
+        ));
+    }
+    lines
+}
+
+/// Draw what the last batch could not do.
+///
+/// The counterpart of the confirmation: that screen says what *will* happen and
+/// this one says what did, in the same shape — same scrollable list, same
+/// wrapping, same yellow — because they are read one after the other and a user
+/// who has just read one should not have to learn a second layout.
+pub fn render_results(frame: &mut Frame, area: Rect, report: &OpReport, scroll: usize) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let lines = build_results(report);
+    let width = area
+        .width
+        .saturating_sub(MODAL_MARGIN)
+        .clamp(1, MAX_MODAL_WIDTH);
+    let inner_width = width.saturating_sub(4).max(1);
+    let note_rows = wrapped_height(SKIP_REMEDY, inner_width).saturating_add(1);
+    // body + blank + note + footer, inside the border.
+    let height = wrapped_rows(&lines, inner_width)
+        .saturating_add(note_rows)
+        .saturating_add(3)
+        .min(area.height)
+        .max(3);
+
+    let modal = centred(area, width, height);
+    frame.render_widget(Clear, modal);
+
+    let failed = report.failed > 0;
+    let block = Block::bordered()
+        .title(format!(" {} ", results_title(report)))
+        .border_style(Style::default().fg(if failed { Color::Red } else { Color::Yellow }))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let [body_area, note_area, footer_area] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(note_rows),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let (body, more) = body_rows_from(&lines, scroll, body_area);
+    frame.render_widget(Paragraph::new(body), body_area);
+
+    render_note(frame, note_area, SKIP_REMEDY);
+
+    let mut footer = vec![Span::styled(
+        RESULTS_DISMISS,
+        Style::default().add_modifier(Modifier::DIM),
+    )];
+    if more {
+        footer.push(Span::styled(
+            " · more below",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(footer)).centered(), footer_area);
+}
+
+/// The results modal's border title: what ran, and how it came out.
+///
+/// Reuses the counts the footer reports rather than recomputing them from the
+/// listed problems, which are only the items that did not succeed.
+fn results_title(report: &OpReport) -> String {
+    crate::app::op_summary(report.op, report.succeeded, report.skipped, report.failed)
+}
+
 // ---- the help overlay ------------------------------------------------------
 
 /// Border title of the `?` overlay.
@@ -547,6 +728,21 @@ pub const HELP_TITLE: &str = "Keybindings";
 /// Footer of the `?` overlay. The overlay binds nothing itself — **any** key
 /// closes it — so this is the only instruction it needs.
 pub const HELP_DISMISS: &str = "any key closes this help";
+
+/// Appended to [`HELP_DISMISS`]: the one thing a user cannot discover from a
+/// keymap, because it is not a key.
+///
+/// There is no in-app toggle for `--no-delete-files` — it changes what a
+/// confirmed `y` does, and a key that silently re-aims a delete is worse than a
+/// restart — so the flag has to be nameable from the screen the user opens when
+/// they are stuck. Short enough to sit beside the dismissal on one row; see
+/// [`SKIP_REMEDY`] for the full sentence, which the dialogs carry.
+pub const HELP_SKIP_NOTE: &str = "--no-delete-files removes skipped tasks";
+
+/// The overlay's whole footer row.
+fn help_footer() -> String {
+    format!("{HELP_DISMISS} · {HELP_SKIP_NOTE}")
+}
 
 /// Cells between the two columns when both fit.
 const HELP_COLUMN_GAP: u16 = 2;
@@ -651,6 +847,10 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry {
                 keys: "r",
                 action: "refresh now",
+            },
+            HelpEntry {
+                keys: "v",
+                action: "last results, with why",
             },
         ],
     },
@@ -888,7 +1088,14 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
     let spaced = rows(true).saturating_add(3) <= area.height;
     let content_rows = rows(spaced);
 
-    let width = content_width.saturating_add(HELP_CHROME).min(area.width);
+    // The footer names a flag rather than a key, so it can be wider than the
+    // two columns are; the card grows to hold it rather than clipping the one
+    // line that answers "how do I get rid of a skipped row".
+    let footer_width = u16::try_from(display_width(&help_footer())).unwrap_or(u16::MAX);
+    let width = content_width
+        .max(footer_width)
+        .saturating_add(HELP_CHROME)
+        .min(area.width);
     let height = content_rows.saturating_add(3).min(area.height);
 
     let modal = centred(area, width, height);
@@ -921,7 +1128,7 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            HELP_DISMISS,
+            help_footer(),
             Style::default().add_modifier(Modifier::DIM),
         )))
         .centered(),
@@ -1340,6 +1547,86 @@ mod tests {
         assert_eq!(wrapped_height("anything", 0), 1);
     }
 
+    // ---- the standing remedy line ------------------------------------------
+
+    #[test]
+    fn a_plan_with_a_skipped_row_carries_the_remedy_as_a_standing_line() {
+        // Every refusal reason names `--no-delete-files` at the end of a long
+        // sentence, inside a list that scrolls. This one line does not scroll
+        // and is the same whatever was refused.
+        let skipping = summary(&["dbid_001", "dbid_013"]);
+        assert_eq!(skipping.note.as_deref(), Some(SKIP_REMEDY));
+        assert!(SKIP_REMEDY.contains("--no-delete-files"));
+
+        // Nothing skipped, nothing to say.
+        assert_eq!(summary(&["dbid_001"]).note, None);
+    }
+
+    #[test]
+    fn no_delete_files_skips_nothing_so_it_needs_no_remedy_line() {
+        // In that mode a refused item is deleted like any other, so the line
+        // would be advice about a state the user is already in.
+        let options = DeleteOptions {
+            delete_files: false,
+            dry_run: false,
+        };
+        let summary = build_confirmation(&plan(&["dbid_001", "dbid_013"]), options);
+        assert_eq!(summary.skipped_count, 0);
+        assert_eq!(summary.note, None);
+    }
+
+    // ---- the results modal --------------------------------------------------
+
+    fn report(problems: Vec<crate::event::ItemReport>) -> OpReport {
+        OpReport {
+            op: crate::event::OpKind::Delete,
+            succeeded: 1,
+            skipped: 1,
+            failed: 1,
+            problems,
+        }
+    }
+
+    fn item(title: &str, outcome: crate::event::ItemOutcome) -> crate::event::ItemReport {
+        crate::event::ItemReport {
+            title: title.to_string(),
+            outcome,
+        }
+    }
+
+    #[test]
+    fn the_results_body_is_a_heading_and_a_reason_for_each_problem() {
+        use crate::event::ItemOutcome;
+
+        let report = report(vec![
+            item("Bad.Release", ItemOutcome::Failed("nothing at /x".into())),
+            item("Mixed.Root", ItemOutcome::Skipped("no common root".into())),
+        ]);
+        let lines = build_results(&report);
+
+        assert_eq!(lines.len(), report.line_count());
+        assert!(lines[0].text.contains(FAILED_MARKER), "{:?}", lines[0].text);
+        assert!(lines[0].text.contains("Bad.Release"));
+        assert_eq!(lines[1].kind, LineKind::Reason);
+        assert!(lines[1].text.contains("nothing at /x"));
+        // A skip is flagged as a skip, not as a failure.
+        assert!(lines[2].text.contains(SKIP_MARKER), "{:?}", lines[2].text);
+        assert!(
+            !lines[2].text.contains(FAILED_MARKER),
+            "{:?}",
+            lines[2].text
+        );
+        assert!(lines[3].text.contains("no common root"));
+    }
+
+    #[test]
+    fn a_report_with_nothing_wrong_renders_no_lines_at_all() {
+        let report = report(Vec::new());
+        assert!(!report.has_problems());
+        assert_eq!(report.line_count(), 0);
+        assert!(build_results(&report).is_empty());
+    }
+
     // ---- the help overlay --------------------------------------------------
 
     /// Every key token the overlay documents, `keys` split on whitespace.
@@ -1382,6 +1669,7 @@ mod tests {
             "S",
             "f",
             "/",
+            "v",
             "?",
             "q",
             "Ctrl-C",

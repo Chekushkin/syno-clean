@@ -208,7 +208,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     } else {
         table::render(frame, app, body, &visible);
     }
-    frame.render_widget(footer_bar(app), footer);
+    frame.render_widget(footer_bar(app, footer.width), footer);
 
     // `pending_delete` and `Mode::Confirm` are set together, but the render
     // path asks for both rather than assuming: a mode with no plan behind it
@@ -224,6 +224,14 @@ pub fn render(frame: &mut Frame, app: &App) {
             app.confirm_scroll(),
             app.confirm_focus(),
         );
+    }
+
+    // Same "ask for both" rule as the confirmation: a mode with no report
+    // behind it draws nothing rather than an empty box.
+    if app.mode == Mode::Results
+        && let Some(report) = app.last_op_report()
+    {
+        dialog::render_results(frame, frame.area(), report, app.results_scroll());
     }
 
     if app.mode == Mode::Help {
@@ -390,7 +398,7 @@ fn view_summary(view: &View) -> String {
 /// While the search box has focus the whole line becomes the input
 /// ([`search_bar`]): the query is the only state the user is manipulating, and
 /// it must be legible with a long one typed.
-fn footer_bar(app: &App) -> Paragraph<'static> {
+fn footer_bar(app: &App, width: u16) -> Paragraph<'static> {
     if app.mode == Mode::Search {
         return search_bar(&app.view.search);
     }
@@ -411,8 +419,45 @@ fn footer_bar(app: &App) -> Paragraph<'static> {
     let mut segments: Vec<String> = Vec::new();
     segments.extend(selection_summary(app));
     segments.push(view_summary(&app.view));
-    segments.push(tail);
-    Paragraph::new(Line::from(format!(" {} ", segments.join(" · ")))).style(style)
+    Paragraph::new(Line::from(fit_footer(&segments, &tail, width))).style(style)
+}
+
+/// The footer line, narrowed to `width` by **dropping context before clipping
+/// the message**.
+///
+/// The line is one row and does not wrap, so something has to go on a narrow
+/// terminal. Ratatui's own answer is to clip the right-hand end — which is the
+/// message, the only part that is new. So the *context* is dropped first, from
+/// the right: the sort goes first (the header carries its marker anyway), then
+/// the selection (every selected row is marked in the table). Only when nothing
+/// but the message is left is it truncated, with an ellipsis, so that it is at
+/// least visibly incomplete rather than silently sheared.
+///
+/// The whole message is never in here anyway when it is a delete failure: those
+/// run past 200 characters and live in the results modal (`v`). This is about
+/// not lying about how much of it is on screen.
+fn fit_footer(segments: &[String], tail: &str, width: u16) -> String {
+    let render = |parts: &[&str]| format!(" {} ", parts.join(" · "));
+    let fits = |line: &str| format::display_width(line) <= usize::from(width);
+
+    let mut context: Vec<&str> = segments.iter().map(String::as_str).collect();
+    loop {
+        let mut parts = context.clone();
+        parts.push(tail);
+        let line = render(&parts);
+        if fits(&line) {
+            return line;
+        }
+        if context.pop().is_none() {
+            break;
+        }
+    }
+
+    // Nothing but the message left, and it is still too long.
+    format!(
+        " {} ",
+        format::truncate_ellipsis(tail, usize::from(width).saturating_sub(2))
+    )
 }
 
 /// The search input line, drawn in place of the footer while typing.
@@ -1043,6 +1088,18 @@ mod tests {
         }
     }
 
+    /// [`frame_words`] with the modal's vertical borders dropped, so a sentence
+    /// that wraps across rows reads as one string. The whole point of wrapping
+    /// is that the tail of a long reason is on screen, and nothing else can
+    /// assert that.
+    fn unboxed(app: &App, width: u16, height: u16) -> String {
+        frame_words(app, width, height)
+            .split_whitespace()
+            .filter(|word| *word != "│")
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     // ---- the delete confirmation modal -------------------------------------
 
     /// An app with the confirmation modal open over the named fixture tasks.
@@ -1156,6 +1213,170 @@ mod tests {
             for line in frame_lines(&app, width, height) {
                 assert_eq!(line.chars().count(), width as usize, "{width}x{height}");
             }
+        }
+    }
+
+    #[test]
+    fn a_refusal_reason_is_wrapped_rather_than_cut_off_at_the_border() {
+        // The modal is capped at `MAX_MODAL_WIDTH` however wide the terminal
+        // is, so truncating a reason put the remedy it names beyond reach at
+        // *every* terminal size. A torrent that arrives with no file list is
+        // the refusal whose sentence *ends* in that remedy: it has to arrive
+        // whole, at 80 columns and at 150.
+        let torrent = Task {
+            files: Vec::new(),
+            ..crate::testutil::fixture_task("dbid_001")
+        };
+        let mut app = App::new(vec![torrent]);
+        app.begin_delete();
+
+        for width in [80_u16, 120, 150] {
+            let text = unboxed(&app, width, 30);
+            assert!(
+                text.contains(
+                    "refusing to guess it from the title (use --no-delete-files to \
+                     remove the task without touching the volume)"
+                ),
+                "{width} columns: the reason is cut off:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plan_with_a_skipped_row_carries_the_standing_remedy_line() {
+        // The reasons scroll; this line does not, so a user looking at a
+        // SKIPPED row always has the way out in front of them.
+        let app = confirming(&["dbid_001", "dbid_013"]);
+        let text = frame_words(&app, 120, 30);
+        assert!(text.contains("--no-delete-files"), "{text}");
+
+        // Nothing skipped, nothing to say.
+        let clean = frame_words(&confirming(&["dbid_001"]), 120, 30);
+        assert!(!clean.contains("--no-delete-files"), "{clean}");
+    }
+
+    // ---- the results modal ---------------------------------------------------
+
+    /// An app that has just finished a delete batch with one failure and one
+    /// skip, both with reasons far too long for the footer.
+    fn after_a_bad_batch() -> App {
+        let mut app = App::new(fixture_tasks());
+        app.apply_event(crate::event::AppEvent::OpProgress {
+            op: crate::event::OpKind::Delete,
+            done: 1,
+            total: 2,
+            item: crate::event::ItemReport {
+                title: "Broken.Release.2019.720p".to_string(),
+                outcome: crate::event::ItemOutcome::Failed(
+                    "nothing at /downloads/Broken.Release.2019.720p, but this task has finished \
+                     downloading, so its data should be there (use --no-delete-files to remove \
+                     the task anyway)"
+                        .to_string(),
+                ),
+            },
+        });
+        app.apply_event(crate::event::AppEvent::OpProgress {
+            op: crate::event::OpKind::Delete,
+            done: 2,
+            total: 2,
+            item: crate::event::ItemReport {
+                title: "Mixed.Root.Release".to_string(),
+                outcome: crate::event::ItemOutcome::Skipped(
+                    "the task's 3 files share no single top-level directory".to_string(),
+                ),
+            },
+        });
+        app.apply_event(crate::event::AppEvent::OpDone {
+            op: crate::event::OpKind::Delete,
+            succeeded: 0,
+            skipped: 1,
+            failed: 1,
+        });
+        assert_eq!(app.mode, Mode::Results, "the modal must have opened");
+        app
+    }
+
+    #[test]
+    fn the_results_modal_names_every_item_and_its_whole_reason() {
+        let app = after_a_bad_batch();
+        let text = frame_words(&app, 120, 30);
+
+        assert!(text.contains("1 skipped, 1 failed"), "{text}");
+        assert!(text.contains("Broken.Release.2019.720p"), "{text}");
+        assert!(text.contains("Mixed.Root.Release"), "{text}");
+        assert!(
+            text.contains("share no single top-level directory"),
+            "{text}"
+        );
+        assert!(text.contains("--no-delete-files"), "{text}");
+        assert!(text.contains(dialog::FAILED_MARKER), "{text}");
+        assert!(text.contains(dialog::SKIP_MARKER), "{text}");
+        assert!(text.contains(dialog::RESULTS_DISMISS), "{text}");
+    }
+
+    #[test]
+    fn the_results_modal_is_gone_once_dismissed_and_never_drawn_without_a_report() {
+        let mut app = after_a_bad_batch();
+        app.close_results();
+        assert!(!frame_words(&app, 120, 30).contains(dialog::RESULTS_DISMISS));
+
+        let mut bare = App::new(fixture_tasks());
+        bare.mode = Mode::Results;
+        assert!(!frame_words(&bare, 120, 30).contains(dialog::RESULTS_DISMISS));
+    }
+
+    #[test]
+    fn the_results_modal_never_overflows_the_terminal() {
+        let app = after_a_bad_batch();
+        for (width, height) in [(1_u16, 1_u16), (10, 4), (40, 8), (120, 24), (200, 60)] {
+            let lines = frame_lines(&app, width, height);
+            assert_eq!(lines.len(), usize::from(height), "{width}x{height}");
+            for line in &lines {
+                assert_eq!(line.chars().count(), usize::from(width), "{width}x{height}");
+            }
+        }
+    }
+
+    // ---- the footer ----------------------------------------------------------
+
+    #[test]
+    fn a_footer_too_long_for_the_terminal_drops_context_before_the_message() {
+        let sort = "sort added↓".to_string();
+        let selection = "2 selected · 1.0 GiB".to_string();
+        let segments = vec![selection.clone(), sort.clone()];
+        let tail = "⚠ delete finished: 1 succeeded, 1 failed · v for the reasons";
+
+        // Wide enough for everything.
+        let wide = fit_footer(&segments, tail, 120);
+        assert!(wide.contains(&selection) && wide.contains(&sort), "{wide}");
+        assert!(wide.contains(tail), "{wide}");
+
+        // The sort goes first, then the selection — the message is the part the
+        // user has not read yet.
+        let narrow = fit_footer(&segments, tail, 70);
+        assert!(!narrow.contains(&sort), "{narrow}");
+        assert!(narrow.contains(tail), "{narrow}");
+
+        let narrower = fit_footer(&segments, tail, 64);
+        assert!(!narrower.contains(&selection), "{narrower}");
+        assert!(narrower.contains(tail), "{narrower}");
+    }
+
+    #[test]
+    fn a_message_that_cannot_fit_at_all_is_elided_not_sheared() {
+        let tail = "⚠ delete finished: 1 succeeded, 1 failed · v for the reasons";
+        let line = fit_footer(&[], tail, 30);
+        assert!(format::display_width(&line) <= 30, "{line:?}");
+        assert!(line.contains('…'), "{line:?}");
+        assert!(line.starts_with(" ⚠ delete finished"), "{line:?}");
+
+        // Degenerate widths must not panic.
+        for width in [0_u16, 1, 2, 3] {
+            let line = fit_footer(&[], tail, width);
+            assert!(
+                format::display_width(&line) <= usize::from(width).max(2),
+                "{line:?}"
+            );
         }
     }
 
