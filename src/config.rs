@@ -87,17 +87,30 @@ pub struct Config {
     pub https: Option<bool>,
     pub insecure: Option<bool>,
     pub username: Option<String>,
+    /// The DSM password, in plain text.
+    ///
+    /// Optional and **not** the recommended place for it — `SYNO_CLEAN_PASSWORD`
+    /// keeps it out of a file entirely, and a cached session means an absent
+    /// password costs one prompt, not one per launch. It is supported because
+    /// the alternative people actually reach for is a shell alias with the
+    /// password on the command line, where `ps` can read it.
+    ///
+    /// [`Config::load`] warns when the file holding one is readable by anyone
+    /// but its owner. See [`resolve_password`] for where this sits in the
+    /// precedence order.
+    pub password: Option<String>,
     pub refresh_secs: Option<u64>,
     pub delete_files: Option<bool>,
 }
 
 /// Keys this version understands; anything else in the file is ignored.
-pub const KNOWN_KEYS: [&str; 7] = [
+pub const KNOWN_KEYS: [&str; 8] = [
     "host",
     "port",
     "https",
     "insecure",
     "username",
+    "password",
     "refresh_secs",
     "delete_files",
 ];
@@ -132,6 +145,9 @@ impl Config {
                 "unknown config key ignored"
             );
         }
+        if config.password.is_some() {
+            warn_if_world_readable(path);
+        }
         Ok(config)
     }
 
@@ -148,6 +164,11 @@ impl Config {
             https: parse_env(get, env_vars::HTTPS, parse_bool)?,
             insecure: parse_env(get, env_vars::INSECURE, parse_bool)?,
             username: get(env_vars::USERNAME).filter(|v| !v.trim().is_empty()),
+            // The password does not travel through the layer merge. It is a
+            // secret with one consumer (`resolve_password`), and putting it in
+            // `ResolvedConfig` would drag it through a struct that is logged at
+            // startup. `SYNO_CLEAN_PASSWORD` is read directly there instead.
+            password: None,
             refresh_secs: parse_env(get, env_vars::REFRESH_SECS, |v| v.parse::<u64>().ok())?,
             // No `SYNO_CLEAN_DELETE_FILES`: `--no-delete-files` and the config
             // key cover it, and an env var that silently disables the tool's
@@ -306,15 +327,23 @@ pub const CONFIG_TEMPLATE: &str = r#"# syno-clean configuration
 # `host` and `username` are required. Uncomment and fill them in below, or
 # pass --host and --user on the command line.
 #
-# The password is never stored here: set SYNO_CLEAN_PASSWORD or type it at
-# the prompt. A 2-step verification code comes from SYNO_CLEAN_OTP or the
-# prompt DSM asks for.
+# A 2-step verification code comes from SYNO_CLEAN_OTP or the prompt DSM
+# asks for after a login attempt.
 
 # DSM hostname or IP address (required).
 # host = "nas.local"
 
 # DSM account name (required).
 # username = "admin"
+
+# DSM password. Optional, and the least private of the three options —
+# it sits in this file in plain text. Prefer SYNO_CLEAN_PASSWORD, which
+# beats this key. With neither set you are asked once, and the cached
+# session means you are not asked again until DSM expires it.
+#
+# If you do set it, keep the file to yourself: chmod 600 this file.
+# syno-clean warns on startup when it is readable by anyone else.
+# password = "..."
 
 # DSM management port. Defaults to 5001 with https, 5000 without.
 # port = 5001
@@ -460,18 +489,75 @@ pub fn merge(file: Config, env: Config, cli: &Cli) -> Result<ResolvedConfig> {
 ///
 /// It is never read from, or written to, the config file. The prompt must
 /// happen **before** the alternate screen is entered.
-pub fn resolve_password(get: EnvLookup<'_>, username: &str, host: &str) -> Result<String> {
-    if let Some(password) = get(env_vars::PASSWORD).filter(|p| !p.is_empty()) {
+pub fn resolve_password(
+    get: EnvLookup<'_>,
+    from_file: Option<&str>,
+    username: &str,
+    host: &str,
+) -> Result<String> {
+    if let Some(password) = stored_password(get, from_file) {
         return Ok(password);
     }
+    prompt_password(username, host)
+}
+
+/// The password from a source that costs the user nothing — `SYNO_CLEAN_PASSWORD`
+/// first, then `password` in the config file. `None` means the only way to get
+/// one is to ask.
+///
+/// Split out from [`resolve_password`] because the difference matters at the
+/// call site: with a valid cached session, a *stored* password is worth
+/// attaching (it lets the client renew a session that expires mid-run) while a
+/// *promptable* one is not worth interrupting the user for. Resolving them
+/// together is what made every launch ask for a password it did not need.
+pub fn stored_password(get: EnvLookup<'_>, from_file: Option<&str>) -> Option<String> {
+    get(env_vars::PASSWORD)
+        .filter(|p| !p.is_empty())
+        .or_else(|| from_file.filter(|p| !p.is_empty()).map(str::to_string))
+}
+
+/// Ask for the password on the terminal. Must happen before the alternate
+/// screen is entered.
+pub fn prompt_password(username: &str, host: &str) -> Result<String> {
     let prompt = format!("DSM password for {username}@{host}: ");
     rpassword::prompt_password(prompt).map_err(|err| {
         Error::config(format!(
-            "no password available: {} is unset and the prompt failed: {err}",
+            "no password available: {} is unset, the config file has no `password`, \
+             and the prompt failed: {err}",
             env_vars::PASSWORD
         ))
     })
 }
+
+/// Warn when a file holding a password is readable by anyone but its owner.
+///
+/// A warning rather than a refusal: it is the user's machine and their file,
+/// and hard-failing a startup over a permission bit they may have set
+/// deliberately would be worse than telling them. Unix-only — Windows ACLs do
+/// not map onto a mode, and the tool does not target Windows.
+#[cfg(unix)]
+fn warn_if_world_readable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(meta) = fs::metadata(path) else { return };
+    let mode = meta.permissions().mode() & 0o077;
+    if mode != 0 {
+        tracing::warn!(
+            path = %path.display(),
+            mode = format!("{:o}", meta.permissions().mode() & 0o777),
+            "the config file holds a password and is readable by others; chmod 600 it"
+        );
+        eprintln!(
+            "warning: {} contains a password and is readable by others.\n\
+             Run: chmod 600 {}",
+            path.display(),
+            path.display()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_world_readable(_path: &Path) {}
 
 /// A 2FA code, if one was supplied up front. DSM only asks for it after a
 /// login attempt returns 403, so an absent code is normal.
@@ -906,6 +992,8 @@ delete_files = true
             https: Some(true),
             insecure: Some(false),
             username: Some("fileuser".into()),
+            // Not part of the merge — `resolve_password` reads it directly.
+            password: None,
             refresh_secs: Some(3),
             delete_files: Some(true),
         }
@@ -1283,9 +1371,55 @@ delete_files = true
     fn password_comes_from_the_environment_when_set() {
         let env = env_of(&[(env_vars::PASSWORD, "hunter2")]);
         assert_eq!(
-            resolve_password(&env, "eduard", "nas.local").expect("env password"),
+            resolve_password(&env, None, "eduard", "nas.local").expect("env password"),
             "hunter2"
         );
+    }
+
+    #[test]
+    fn the_environment_beats_a_password_in_the_config_file() {
+        // Same direction as every other key: env over file. Someone exporting
+        // the variable for one run must not be silently overridden by the file
+        // they are trying to bypass.
+        let env = env_of(&[(env_vars::PASSWORD, "from-env")]);
+        assert_eq!(
+            stored_password(&env, Some("from-file")).as_deref(),
+            Some("from-env")
+        );
+    }
+
+    #[test]
+    fn a_password_in_the_config_file_is_used_when_the_environment_has_none() {
+        assert_eq!(
+            stored_password(&empty_env(), Some("from-file")).as_deref(),
+            Some("from-file")
+        );
+    }
+
+    #[test]
+    fn a_blank_password_from_either_source_counts_as_absent() {
+        // `None` is what tells `authenticate` to skip the prompt only when a
+        // session is cached; an empty string reaching `login` would be a
+        // confusing 400 from DSM instead.
+        assert_eq!(stored_password(&empty_env(), None), None);
+        assert_eq!(stored_password(&empty_env(), Some("")), None);
+        assert_eq!(
+            stored_password(&env_of(&[(env_vars::PASSWORD, "")]), None),
+            None
+        );
+        // …and a blank env var still falls through to the file.
+        assert_eq!(
+            stored_password(&env_of(&[(env_vars::PASSWORD, "")]), Some("from-file")).as_deref(),
+            Some("from-file")
+        );
+    }
+
+    #[test]
+    fn password_is_a_known_config_key_and_parses() {
+        let (config, unknown) =
+            parse_config("host = \"nas\"\npassword = \"hunter2\"\n").expect("valid toml");
+        assert_eq!(config.password.as_deref(), Some("hunter2"));
+        assert!(unknown.is_empty(), "password must not warn as unknown");
     }
 
     #[test]
