@@ -235,16 +235,37 @@ async fn poll_once(client: &SynoClient, tx: &Sender) -> bool {
 /// How long a paused task is given to actually report itself paused.
 ///
 /// Download Station accepting a `pause` says the request was queued, not that
-/// the task has stopped writing. Short, because this blocks the delete of every
-/// later item in the batch.
+/// the task has stopped writing.
+///
+/// ⚠️ **This was 15s, and a real NAS blew through it.** Pausing normally settles
+/// in ~0.1s — measured over repeated runs against a seeding 20 GiB torrent — but
+/// one delete in a run of seven back-to-back deletes had its pause accepted
+/// (`error: 0`) and the task still reporting `seeding` 15s later. The most
+/// likely cause is the tracker "stopped" announce that stopping a *seeding*
+/// torrent triggers: that is a network round trip to a third party, it can hang
+/// for as long as the tracker's own timeout, and Download Station was busy
+/// finishing six other deletes at the time.
+///
+/// So the bound has to cover a slow third party rather than a slow NAS. The cost
+/// of it being generous is a delete that looks stuck for up to a minute — which
+/// [`SLOW_PAUSE_NOTICE`] makes visible in the log — while the cost of it being
+/// tight is a spurious failure on a task that was about to stop, which is what
+/// happened.
 ///
 /// Public because it is part of the *longest legitimate silence* of a single
 /// item, which is what the quit-time no-progress grace in `main` has to exceed:
 /// no [`AppEvent::OpProgress`] is sent until the whole item is done, pause
 /// confirmation included.
-pub const PAUSE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
+pub const PAUSE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often the pause is re-checked.
 const PAUSE_CONFIRM_INTERVAL: Duration = Duration::from_millis(500);
+/// How long to wait before saying, once, that the pause is taking a while.
+///
+/// The 15s failure above logged **nothing** between "paused Download Station
+/// tasks" and the timeout, so the log could not distinguish "DSM never applied
+/// it" from "this client never noticed". One line at the point it stops being
+/// instant is what makes that answerable from a bug report.
+const SLOW_PAUSE_NOTICE: Duration = Duration::from_secs(3);
 
 /// Everything a spawned operation needs: something to call, somewhere to
 /// report, the poller poke that refreshes the table when it is done — and what
@@ -1153,22 +1174,46 @@ async fn pause_and_confirm(client: &SynoClient, item: &DeleteItem) -> Result<Pau
     let results = download_station::pause_tasks(client, &ids).await?;
     download_station::check_task_result(id, &results)?;
 
-    let deadline = Instant::now() + PAUSE_CONFIRM_TIMEOUT;
+    let started = Instant::now();
+    let deadline = started + PAUSE_CONFIRM_TIMEOUT;
+    let mut noticed_slow = false;
     loop {
         let current = download_station::task_info(client, &ids).await?;
         // Folds this read in *and* answers whether the task stopped, so the read
         // that ends the loop cannot be the one that goes unrecorded. See
         // `PauseRead::observe`.
         if !read.observe(task_with_id(&current, id)) {
+            if noticed_slow {
+                tracing::info!(
+                    id,
+                    waited_secs = started.elapsed().as_secs_f32(),
+                    "the pause took effect"
+                );
+            }
             return Ok(read);
         }
 
         if Instant::now() + PAUSE_CONFIRM_INTERVAL >= deadline {
             return Err(Error::timed_out(format!(
-                "task {id} did not report itself paused within {}s",
+                "Download Station accepted the pause for task {id} but it was still running \
+                 {}s later. Nothing was deleted. Stopping a seeding torrent makes it announce \
+                 to its tracker, which can hang on a slow one — trying again usually works, \
+                 and pausing it yourself first (p) makes the delete skip this step",
                 PAUSE_CONFIRM_TIMEOUT.as_secs()
             )));
         }
+
+        // Once, at the point it stops looking instant: the run this bound was
+        // widened for logged nothing at all for its whole 15s wait.
+        if !noticed_slow && started.elapsed() >= SLOW_PAUSE_NOTICE {
+            noticed_slow = true;
+            tracing::info!(
+                id,
+                timeout_secs = PAUSE_CONFIRM_TIMEOUT.as_secs(),
+                "still waiting for the pause to take effect"
+            );
+        }
+
         tokio::time::sleep(PAUSE_CONFIRM_INTERVAL).await;
     }
 }
@@ -1961,13 +2006,13 @@ mod tests {
                     filename: "Odd.Release".to_string(),
                     size: 512,
                     priority: "normal".to_string(),
-                    selected: true,
+                    wanted: true,
                 },
                 crate::model::TaskFile {
                     filename: "Odd.Release".to_string(),
                     size: 512,
                     priority: "normal".to_string(),
-                    selected: true,
+                    wanted: true,
                 },
             ],
             ..fixture_task("dbid_001")

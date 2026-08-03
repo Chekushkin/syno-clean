@@ -40,7 +40,8 @@ Nothing is installed on the NAS: it is a plain HTTP client for the documented DS
 >
 > ⚠️ **A real terminal screenshot (or an asciinema recording) against a live NAS is
 > still outstanding and must be added before v0.1.0 is published.** The fixture behind
-> this frame is itself provisional — see [Contributing](CONTRIBUTING.md).
+> this frame takes its wire shape from a real DSM 7 capture and its titles from
+> nowhere — see [Contributing](CONTRIBUTING.md).
 
 ## Features
 

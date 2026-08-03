@@ -244,8 +244,19 @@ pub struct TaskFile {
     pub priority: String,
     /// Whether this file is part of the download. Absent means yes — a file
     /// DSM bothered to list is downloaded unless it says otherwise.
-    #[serde(default = "yes")]
-    pub selected: bool,
+    ///
+    /// ⚠️ The wire name is **`wanted`**. This field was called `selected` and
+    /// deserialized from that name until a real DSM 7 capture showed no such key
+    /// exists: it had been silently defaulting to `true` on every NAS this
+    /// program has ever talked to. Nothing depended on the value — the delete
+    /// path reads only `filename` — but the wrong name is the kind of thing that
+    /// stays wrong until something is captured, so it is spelled out here.
+    ///
+    /// A real entry also carries `index` and `size_downloaded`; neither is
+    /// modelled, because nothing reads them and this crate drops wire fields it
+    /// does not use.
+    #[serde(default = "yes", rename = "wanted")]
+    pub wanted: bool,
 }
 
 /// One Download Station task, flattened out of the DSM wire shape.
@@ -468,12 +479,14 @@ mod tests {
     use super::*;
     use crate::api::client::parse_envelope;
 
-    /// The checked-in list response. Still hand-written and marked
-    /// PROVISIONAL inside the file itself — no NAS was reachable when it was
-    /// written. Re-capturing it from a real NAS with `--dump-tasks-json` is
-    /// outstanding work; these tests are the regression net for when it lands,
-    /// and `the_fixture_is_still_marked_provisional` fails the moment the
-    /// marker goes without them being re-checked.
+    /// The checked-in list response: **shape captured from a real DSM 7 NAS,
+    /// content synthetic.** Every key name, nesting level and value type is the
+    /// real one; the titles and filenames are invented so the file can live in a
+    /// public repository.
+    ///
+    /// That capture is what caught `TaskFile`'s `selected` field, which DSM has
+    /// never sent — the real key is `wanted` — and it is why the fixture no
+    /// longer carries the invented `detail.priority` or `status_extra`.
     const FIXTURE: &str = include_str!("../tests/fixtures/task_list.json");
 
     const DS_TASK: &str = "SYNO.DownloadStation.Task";
@@ -493,13 +506,31 @@ mod tests {
     // ---- fixture shape ----------------------------------------------------
 
     #[test]
-    fn the_fixture_is_still_marked_provisional() {
-        // If this fails because the marker is gone, the fixture came from a
-        // real NAS — delete this test along with the marker.
-        assert!(
-            FIXTURE.contains("PROVISIONAL"),
-            "provisional marker missing"
-        );
+    fn the_fixture_still_carries_only_keys_a_real_nas_sends() {
+        // The fixture's shape came from a real capture; its content did not.
+        // This is the guard against drifting back to invented keys — the
+        // previous fixture had three (`selected` on a file, `priority` on the
+        // detail block, `status_extra` on the task), and `selected` was
+        // deserialized by the model for the whole of the project's life without
+        // ever matching a byte DSM sent.
+        for invented in ["\"selected\"", "\"status_extra\""] {
+            assert!(
+                !FIXTURE.contains(invented),
+                "{invented} is not a key any real DSM 7 response carries"
+            );
+        }
+        // …and the real names that replaced them are present.
+        for real in [
+            "\"wanted\"",
+            "\"index\"",
+            "\"size_downloaded\"",
+            "\"seedelapsed\"",
+        ] {
+            assert!(
+                FIXTURE.contains(real),
+                "{real} is a real key and should be modelled"
+            );
+        }
     }
 
     #[test]
@@ -551,11 +582,11 @@ mod tests {
                     .to_string(),
                 size: 6_231_818_240,
                 priority: "normal".to_string(),
-                selected: true,
+                wanted: true,
             }
         );
         // A deselected file is still listed, and says so.
-        assert!(!task.files[2].selected);
+        assert!(!task.files[2].wanted);
         assert_eq!(task.files[2].priority, "low");
     }
 
@@ -563,7 +594,7 @@ mod tests {
     fn a_file_entry_without_selected_defaults_to_selected() {
         let task = task("dbid_011");
         assert_eq!(task.files.len(), 1);
-        assert!(task.files[0].selected);
+        assert!(task.files[0].wanted);
     }
 
     #[test]

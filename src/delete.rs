@@ -981,7 +981,7 @@ mod tests {
             filename: filename.to_string(),
             size: 1,
             priority: "normal".to_string(),
-            selected: true,
+            wanted: true,
         }
     }
 
@@ -1075,7 +1075,7 @@ mod tests {
         // Deliberate: `selected` describes what was downloaded, not what is on
         // disk, and a list that disagrees with itself must refuse either way.
         let mut skipped = file("Other.Release/extra.mkv");
-        skipped.selected = false;
+        skipped.wanted = false;
         let files = [file("Some.Release/a.mkv"), skipped];
         assert_eq!(common_root(&files), None);
     }
