@@ -332,7 +332,8 @@ needs must be `info!` or higher. `--log-file` changes only *where* the file goes
 `tests/fixtures/task_list.json` is a full `list` envelope covering every known
 status plus an unknown one (`captcha_needed`), missing/partial `additional`
 blocks, an empty file list, a non-BT download, a zero-size task, a CJK title, an
-emoji title, a file list with **no common root** (the `delete.rs` refusal case)
+emoji title, a file list with **no common root** (`delete.rs` rule 2, the
+title-named container)
 and a `/volume1/...` destination. Numbers appear in both the JSON-number and
 string forms on purpose. It drives the `model.rs` parser tests, the layout tests
 and the offline `--fixture` mode.
@@ -350,21 +351,45 @@ Deriving "which directory holds this torrent" is the one place this tool can
 destroy the wrong data. Everything here is built to **refuse rather than guess**,
 and the bulk of the test suite lives in `delete.rs` for that reason.
 
-### Path resolution (`delete::resolve_delete_path`)
+### Path resolution (`delete::resolve_delete_target`)
 
-1. File list present with a single common top-level component → use it. That is
-   the authoritative on-disk name, even when the display title differs.
-2. File list present but entries share **no** single top-level component →
-   **REFUSE**, report the item as skipped. Never fall back to `title` here; a
-   guessed path could match an unrelated folder and be recursively deleted.
-3. File list absent or empty **on a type that has none** (HTTP/FTP/NZB/eMule) →
-   fall back to `title`.
-4. File list absent or empty **on a BitTorrent task** → **REFUSE**. A torrent
-   always has a file list; its absence is an anomaly, and rule 3 was written for
-   the types that legitimately have none. `TaskType::file_list_is_mandatory`
-   draws the line, and only `bt` is on the strict side — an unrecognized type is
-   *not* assumed to be a torrent, since that would strand tasks over a string.
-5. Normalize `destination`: strip a leading `/volumeN`, trim surrounding
+**The on-disk name is the task's `title`, always.** Download Station names what
+it writes after the task — a container directory for a multi-file torrent, and
+for a single-file torrent the title *is* the filename. The BitTorrent spec
+agrees: `info.name` is the directory for a multi-file torrent and the file name
+for a single-file one, and DSM reports `info.name` as the title.
+
+The file list **never contains that container**, so it cannot name the payload.
+It says what *shape* to expect:
+
+| file list | expectation |
+|---|---|
+| one entry, no separator | `ExpectedKind::File` — single-file torrent |
+| anything else non-empty | `ExpectedKind::Dir` — Download Station made a container |
+| empty, on HTTP/FTP/NZB/eMule | `ExpectedKind::AnyFromTitle` — accept either |
+| empty, on **BitTorrent** | **REFUSE** — a torrent always has a list, so its absence means the record is not understood. `TaskType::file_list_is_mandatory` draws the line, and only `bt` is on the strict side: an unrecognized type is *not* assumed to be a torrent, since that would strand tasks over a string. `--no-delete-files` still removes it. |
+
+⚠️ **This used to take the file list's common top-level component as the name,
+and that was wrong in a way that could delete the wrong directory** — not merely
+fail. Measured on a real DSM 7 NAS, 41-task library:
+
+- `{destination}/{title}` existed with the expected kind for **40 of 40** tasks
+  that had a destination and a file list.
+- The old rule **refused 15** of them (entries shared no top-level component) —
+  37% of the library, undeletable.
+- For **2** more it produced a wrong path: two Blu-ray torrents list `BDMV/…`,
+  so it aimed at `/video/BDMV` when the payload is `/video/{title}/BDMV/…`.
+  Nothing was at `/video/BDMV` so they failed safely — but an unrelated
+  `/video/BDMV` is what would have been recursively deleted.
+- It agreed with the current rule on the other 38 only because a single-file
+  torrent's title *is* its filename.
+
+There is therefore **no name provenance any more**. `NameSource` is gone; how to
+read an *absent* path is decided by the task's counters (`payload_should_exist`),
+not by which rule named it. `DeleteItem::named` survives only to mark a refused
+item, whose absent path authorizes nothing whatever the counters say.
+
+4. Normalize `destination`: strip a leading `/volumeN`, trim surrounding
    slashes. Join as `/{destination}/{name}`.
 
 Resolution also records an `ExpectedKind` — `Dir` for a multi-entry file list (or
@@ -605,7 +630,7 @@ deleted.
   SKIPPED, and removing the task would orphan precisely the data whose location
   is in doubt. **Under `--no-delete-files` it is an ordinary deletable row**: no
   path is used, so the refusal protects nothing, and those tasks (no destination,
-  or a file list with several top-level roots) are exactly the ones that flag
+  or a torrent with no file list at all) are exactly the ones that flag
   exists for — refusing them there left them unremovable by this tool by any
   route. `delete::will_act` is the single rule; `ui::dialog` reads it too, so the
   dialog and the executor cannot disagree about which rows are skipped.

@@ -1200,12 +1200,12 @@ mod tests {
     fn the_modal_shows_a_refused_task_as_skipped_with_its_reason() {
         // Never silently dropped: the user has to be able to see that this one
         // was left alone, and why.
-        let app = confirming(&["dbid_001", "dbid_013"]);
+        let app = confirming(&["dbid_001", "dbid_010"]);
         let text = frame_text(&app, 120, 30);
 
         assert!(text.contains(dialog::SKIP_MARKER), "{text}");
-        assert!(text.contains("Mixed.Root.Release"), "{text}");
-        assert!(text.contains("no single top-level"), "{text}");
+        assert!(text.contains("Hosted.Archive.Part1of3"), "{text}");
+        assert!(text.contains("no destination"), "{text}");
         assert!(text.contains("1 skipped"), "{text}");
     }
 
@@ -1276,7 +1276,7 @@ mod tests {
     #[test]
     fn the_modal_never_overflows_the_terminal() {
         for (width, height) in [(1_u16, 1_u16), (10, 4), (40, 8), (120, 24), (200, 60)] {
-            let app = confirming(&["dbid_001", "dbid_013"]);
+            let app = confirming(&["dbid_001", "dbid_010"]);
             for line in frame_lines(&app, width, height) {
                 assert_eq!(line.chars().count(), width as usize, "{width}x{height}");
             }
@@ -1301,7 +1301,7 @@ mod tests {
             let text = unboxed(&app, width, 30);
             assert!(
                 text.contains(
-                    "refusing to guess it from the title (use --no-delete-files to \
+                    "refusing to aim a recursive delete at it (use --no-delete-files to \
                      remove the task without touching the volume)"
                 ),
                 "{width} columns: the reason is cut off:\n{text}"
@@ -1313,7 +1313,7 @@ mod tests {
     fn a_plan_with_a_skipped_row_carries_the_standing_remedy_line() {
         // The reasons scroll; this line does not, so a user looking at a
         // SKIPPED row always has the way out in front of them.
-        let app = confirming(&["dbid_001", "dbid_013"]);
+        let app = confirming(&["dbid_001", "dbid_010"]);
         let text = frame_words(&app, 120, 30);
         assert!(text.contains("--no-delete-files"), "{text}");
 

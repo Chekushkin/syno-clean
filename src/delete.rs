@@ -18,25 +18,43 @@
 //! `additional.detail.destination` is normally share-relative with no leading
 //! slash (`downloads`, `video/movies`), though some configurations surface an
 //! absolute `/volumeN/share/…`. File Station wants a path rooted at the share.
-//! The on-disk *name* comes from, in order:
+//! **The on-disk name is the task's `title`.** Download Station names what it
+//! writes after the task: a container directory for a multi-file torrent, and
+//! for a single-file torrent the title *is* the filename. The BitTorrent spec
+//! says the same — `info.name` is the directory name for a multi-file torrent
+//! and the file name for a single-file one, and DSM reports `info.name` as the
+//! title.
 //!
-//! 1. **The file list, when its entries share a single top-level component** —
-//!    that component. This is authoritative: it is what BitTorrent actually
-//!    wrote, and it is frequently *not* the display title (a release renamed by
-//!    the indexer, a `.rar` set inside a differently-named folder).
-//! 2. **The file list, when its entries share no single top-level component** —
-//!    **REFUSE**. This is the critical rule. Never fall back to `title` here:
-//!    the title is precisely the value the file list just contradicted, and a
-//!    guessed directory name can easily match an unrelated folder that already
-//!    exists next to it — which is then recursively deleted.
-//! 3. **No file list at all, on a task type that has none** (HTTP/FTP/NZB/eMule,
-//!    which carry no `file` block) — the `title`, which for those task types
-//!    *is* the on-disk name.
-//! 4. **No file list on a BitTorrent task** — **REFUSE**. Rule 3 was written for
-//!    the types that legitimately have no list; for a torrent the list is
-//!    metadata DSM had before it wrote a byte, so its absence is an anomaly and
-//!    the title is exactly the value rule 2 already refuses to trust. See
-//!    [`crate::model::TaskType::file_list_is_mandatory`].
+//! The **file list never contains that container**, so it cannot name the
+//! payload. What it does is say what *shape* to expect inside:
+//!
+//! | file list | expectation | why |
+//! |---|---|---|
+//! | one entry, no separator | [`ExpectedKind::File`] | a single-file torrent; the title is that filename |
+//! | anything else non-empty | [`ExpectedKind::Dir`] | a multi-file torrent, which Download Station gave a container |
+//! | empty, on HTTP/FTP/NZB/eMule | [`ExpectedKind::AnyFromTitle`] | nothing said which; accept either |
+//! | empty, on **BitTorrent** | **REFUSE** | a torrent always has a list, so its absence means this client does not understand the record — and nothing corroborates the shape. `--no-delete-files` still removes the task. See [`crate::model::TaskType::file_list_is_mandatory`]. |
+//!
+//! ⚠️ **This used to derive the name from the file list's common top-level
+//! component, and that was wrong in a way that could delete the wrong
+//! directory** rather than merely failing. Measured against a real DSM 7 NAS
+//! over a 41-task library:
+//!
+//! * `{destination}/{title}` existed, with the expected kind, for **40 of the
+//!   40** tasks that had a destination and a file list.
+//! * The old rule refused **15** of them outright, because their entries shared
+//!   no top-level component — 37% of the library, undeletable by this tool.
+//! * For **2** more it produced a path that was simply wrong: two Blu-ray
+//!   torrents list `BDMV/…`, so it aimed at `/video/BDMV` when the payload is
+//!   `/video/{title}/BDMV/…`. Nothing existed at `/video/BDMV`, so they failed
+//!   safely — but any unrelated `/video/BDMV` is what would have been
+//!   recursively deleted instead.
+//! * It agreed with this rule on the other 38 only because a single-file
+//!   torrent's title *is* its filename.
+//!
+//! There is consequently no "provenance" any more: every name comes from the
+//! same place, so how to read an *absent* path is decided by the task's own
+//! counters ([`payload_should_exist`]) rather than by which rule named it.
 //!
 //! Resolution also records what *kind* of object it expects to find
 //! ([`ExpectedKind`]), because a path is only the right path if the thing at it
@@ -243,28 +261,6 @@ fn is_volume_component(component: &str) -> bool {
     !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-/// Where the on-disk name in a resolved path came from.
-///
-/// The executor needs this to read an *absent* path correctly. A path built
-/// from the file list is what BitTorrent actually wrote, so finding nothing
-/// there really does mean somebody already cleaned up; a path built from the
-/// display title is a **guess**, and finding nothing there is at least as
-/// likely to mean the guess was wrong.
-///
-/// ⚠️ It is the *second* question `event::decide_file_phase` asks, never the
-/// first. A guess is only worth refusing over when there was a payload to guess
-/// at ([`payload_should_exist`]): every non-BitTorrent task resolves its name
-/// from the title, so treating provenance as decisive on its own made a task
-/// that had downloaded nothing impossible to delete at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NameSource {
-    /// Rule 1: the shared top-level component of the task's file list.
-    FileList,
-    /// Rule 3: the task's display title, the only thing a task with no file
-    /// list offers.
-    Title,
-}
-
 /// What kind of object the resolution expects to find at the path.
 ///
 /// The existence check answers "is there something here"; this is what makes
@@ -280,7 +276,7 @@ pub enum NameSource {
 /// consult is a reason to accept what is there, metadata that says something
 /// self-contradictory is a reason to refuse. The two therefore have separate
 /// variants rather than a shared `Unknown` that a caller has to remember to
-/// qualify by [`NameSource`].
+/// qualify elsewhere.
 ///
 /// See [`crate::event::decide_file_phase`], which turns a mismatch — and an
 /// indeterminate expectation over a path that exists — into a failed item
@@ -358,12 +354,20 @@ impl ExpectedKind {
 /// what it said does not describe a payload. Guessing either way would let a
 /// malformed answer authorize the recursive delete.
 fn expected_kind_of(files: &[TaskFile]) -> ExpectedKind {
-    if files.iter().any(|file| file.filename.contains('/')) {
-        return ExpectedKind::Dir;
-    }
     match files {
-        [_] => ExpectedKind::File,
-        _ => ExpectedKind::Indeterminate,
+        // No list to consult. Only reachable for the task types that
+        // legitimately have none (HTTP/FTP/NZB/eMule) — a torrent without one is
+        // refused in `resolve_name` — and for those nothing says whether the
+        // payload is a file or a directory, so accept either.
+        [] => ExpectedKind::AnyFromTitle,
+        // Exactly one entry, no separator: a single-file torrent, whose title
+        // *is* that filename. The payload is the file itself, not a container.
+        [only] if !only.filename.contains('/') => ExpectedKind::File,
+        // Anything else is a multi-file torrent, and Download Station wrote it
+        // into a container directory named after the task. That holds whether
+        // the entries are loose (`e01.mkv`, `e02.mkv`) or nested (`BDMV/…`) —
+        // the container is never itself in the list.
+        _ => ExpectedKind::Dir,
     }
 }
 
@@ -371,13 +375,13 @@ fn expected_kind_of(files: &[TaskFile]) -> ExpectedKind {
 /// and what should be found there.
 ///
 /// The three travel together because the executor needs all three to read the
-/// existence check: the path to look up, [`NameSource`] to know whether an
-/// *absent* answer is benign, and [`ExpectedKind`] to know whether a *present*
-/// one is even the right object.
+/// existence check: the path to look up and [`ExpectedKind`] to know whether a
+/// *present* answer is even the right object. Whether an *absent* one is benign
+/// is [`payload_should_exist`]'s question, asked of the task's own counters
+/// rather than of where the name came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedTarget {
     pub path: String,
-    pub name_source: NameSource,
     pub expected_kind: ExpectedKind,
 }
 
@@ -387,15 +391,15 @@ pub struct ResolvedTarget {
 /// This is the only function permitted to answer "what does deleting this task
 /// remove from the volume" — [`DeleteItem::for_task`] is its one production
 /// caller — and it answers with an error far more readily than with a path. See
-/// the module docs for the resolution order; the short version is that a file
-/// list which disagrees with itself is refused outright rather than resolved
-/// from the title.
+/// the module docs for the resolution order; the short version is that the name
+/// is the task's title, the file list says what shape to expect there, and a
+/// torrent that reports no file list at all is refused.
 ///
 /// The returned path has already been through [`validate_path`]. It is
 /// re-validated immediately before the File Station call anyway — the check is
 /// free and the value crosses a task boundary in between.
 pub fn resolve_delete_target(task: &Task) -> Result<ResolvedTarget> {
-    let (name, name_source) = resolve_name(task)?;
+    let (name, expected_kind) = resolve_name(task)?;
 
     let destination = normalize_destination(&task.destination);
     if destination.is_empty() {
@@ -409,82 +413,54 @@ pub fn resolve_delete_target(task: &Task) -> Result<ResolvedTarget> {
 
     let path = format!("/{destination}/{name}");
     validate_path(&path)?;
-    let expected_kind = match name_source {
-        NameSource::FileList => expected_kind_of(&task.files),
-        NameSource::Title => ExpectedKind::AnyFromTitle,
-    };
     Ok(ResolvedTarget {
         path,
-        name_source,
         expected_kind,
     })
 }
 
-/// The on-disk name of a task's payload — rules 1 to 4 of the resolution order.
-fn resolve_name(task: &Task) -> Result<(String, NameSource)> {
-    let (name, source) = if task.files.is_empty() {
-        // Rule 4 before rule 3: a torrent always has a file list, so one that
-        // arrives without it is not the "no list to have" case rule 3 was
-        // written for. It is a task whose on-disk name is unknown, and the
-        // title is the value rule 2 already refuses to trust — a guessed
-        // directory name that happens to match an unrelated folder is
-        // recursively deleted.
-        if task.task_type.file_list_is_mandatory() {
-            return Err(Error::unsafe_path(
-                &task.title,
-                format!(
-                    "this {} task reports no files, though a torrent always has a file list, \
-                     so its on-disk name cannot be determined; refusing to guess it from the \
-                     title (use --no-delete-files to remove the task without touching the \
-                     volume)",
-                    task.task_type
-                ),
-            ));
-        }
-        // Rule 3: no file list to be authoritative, so the title is all there
-        // is. Non-BT tasks are named after the file they fetch.
-        (task.title.clone(), NameSource::Title)
-    } else {
-        // Rules 1 and 2.
-        let root = common_root(&task.files).ok_or_else(|| {
-            Error::unsafe_path(
-                &task.title,
-                format!(
-                    "the task's {} files share no single top-level directory (found {}), \
-                     so the on-disk name cannot be determined; refusing to guess it from \
-                     the title",
-                    task.files.len(),
-                    describe_roots(&task.files)
-                ),
-            )
-        })?;
-        (root, NameSource::FileList)
-    };
-
-    validate_name(&name)?;
-    Ok((name, source))
-}
-
-/// The distinct first components of a file list, for a refusal message that
-/// tells the user *why* their torrent was skipped.
-fn describe_roots(files: &[TaskFile]) -> String {
-    let mut seen: Vec<&str> = Vec::new();
-    for file in files {
-        let component = first_component(&file.filename).unwrap_or("");
-        if !seen.contains(&component) {
-            seen.push(component);
-        }
+/// The on-disk name of a task's payload, and the shape to expect there.
+///
+/// **It is always the title.** Download Station names what it writes after the
+/// task: for a multi-file torrent that is a container directory, and for a
+/// single-file torrent the title *is* the filename. The BitTorrent spec agrees —
+/// `info.name` is the directory for a multi-file torrent and the file name for a
+/// single-file one, and DSM reports `info.name` as the title.
+///
+/// The **file list never contains that container**, so it cannot name the
+/// payload; it only says what shape to expect. Verified against a real DSM 7 NAS
+/// over a 41-task library: `{destination}/{title}` existed for **40 of the 40**
+/// tasks that had both a destination and a file list.
+///
+/// ⚠️ This used to derive the name from the file list's common top-level
+/// component, and that was **wrong in a way that could have deleted the wrong
+/// directory** rather than merely failing. Two Blu-ray torrents in that library
+/// list `BDMV/…`, so the old rule resolved them to `/video/BDMV` when the payload
+/// is really `/video/{title}/BDMV/…`. Nothing existed at `/video/BDMV`, so they
+/// failed safely — but any unrelated `/video/BDMV` is what would have been
+/// recursively deleted instead. The old rule agreed with this one on 38 of 40
+/// only because a single-file torrent's title *is* its filename.
+fn resolve_name(task: &Task) -> Result<(String, ExpectedKind)> {
+    // A torrent always has a file list, so one arriving without it is an
+    // anomaly. The path would still be `{destination}/{title}`, but nothing
+    // corroborates the shape and nothing shows DSM had the metadata at all, so
+    // refuse rather than aim a recursive delete using a task record this client
+    // evidently does not understand. `--no-delete-files` still removes the task.
+    if task.files.is_empty() && task.task_type.file_list_is_mandatory() {
+        return Err(Error::unsafe_path(
+            &task.title,
+            format!(
+                "this {} task reports no files, though a torrent always has a file list, \
+                 so what it wrote cannot be confirmed; refusing to aim a recursive delete \
+                 at it (use --no-delete-files to remove the task without touching the \
+                 volume)",
+                task.task_type
+            ),
+        ));
     }
-    let shown: Vec<String> = seen
-        .iter()
-        .take(4)
-        .map(|root| format!("{root:?}"))
-        .collect();
-    if seen.len() > shown.len() {
-        format!("{}, …", shown.join(", "))
-    } else {
-        shown.join(", ")
-    }
+
+    validate_name(&task.title)?;
+    Ok((task.title.clone(), expected_kind_of(&task.files)))
 }
 
 /// Guard the single path component a task's data lives under, before it is
@@ -608,9 +584,15 @@ pub struct DeleteItem {
     /// path is looked at at all.
     pub status: TaskStatus,
     pub target: Target,
-    /// Which resolution rule produced the on-disk name, or `None` for a refused
-    /// item. Decides how an *absent* path is read; see [`NameSource`].
-    pub name_source: Option<NameSource>,
+    /// Whether resolution produced a path at all — `false` for a refused item.
+    ///
+    /// The one thing the file phase still needs to know beyond the path itself:
+    /// "nothing named this path" authorizes nothing, whatever the counters say.
+    /// There used to be a `NameSource` here distinguishing a name read from the
+    /// file list from one taken from the title, because the latter was a guess
+    /// worth refusing over. That distinction is gone: the name is *always* the
+    /// title, and the title is what Download Station actually writes.
+    pub named: bool,
     /// What should be found at the path. [`ExpectedKind::Indeterminate`] — the
     /// variant that authorizes nothing — for a refused item, which resolved no
     /// path to find anything at.
@@ -621,24 +603,20 @@ impl DeleteItem {
     /// Resolve one task into a snapshot item. A refusal is recorded on the
     /// item rather than returned, so one bad torrent never aborts the batch.
     fn for_task(task: &Task) -> Self {
-        let (target, name_source, expected_kind) = match resolve_delete_target(task) {
-            Ok(resolved) => (
-                Target::Path(resolved.path),
-                Some(resolved.name_source),
-                resolved.expected_kind,
-            ),
+        let (target, named, expected_kind) = match resolve_delete_target(task) {
+            Ok(resolved) => (Target::Path(resolved.path), true, resolved.expected_kind),
             // A refused item carries the expectation that accepts *nothing*.
             // It has no path, so no lookup can reach it — but the permissive
             // expectation belongs to the title fallback alone, and a refusal is
             // the furthest thing from "whatever is there will do".
             Err(Error::UnsafePath { reason, .. }) => {
-                (Target::Refused(reason), None, ExpectedKind::Indeterminate)
+                (Target::Refused(reason), false, ExpectedKind::Indeterminate)
             }
             // `resolve_delete_target` only produces `UnsafePath` today; anything
             // else is still a refusal, never a fallthrough to deletion.
             Err(other) => (
                 Target::Refused(other.to_string()),
-                None,
+                false,
                 ExpectedKind::Indeterminate,
             ),
         };
@@ -649,7 +627,7 @@ impl DeleteItem {
             downloaded: task.downloaded,
             status: task.status.clone(),
             target,
-            name_source,
+            named,
             expected_kind,
         }
     }
@@ -996,24 +974,7 @@ mod tests {
     /// **HTTP**, not BitTorrent: it carries no file list, and for a torrent that
     /// is itself a refusal (rule 4). The tests that hand it a `files` vector
     /// override the type where the distinction matters.
-    fn bare() -> Task {
-        Task {
-            id: "synthetic".to_string(),
-            title: "Some.Release".to_string(),
-            status: TaskStatus::Finished,
-            task_type: TaskType::Http,
-            size: 1024,
-            downloaded: 1024,
-            uploaded: 0,
-            download_speed: 0,
-            upload_speed: 0,
-            destination: "downloads".to_string(),
-            files: Vec::new(),
-            seeders: 0,
-            leechers: 0,
-            create_time: None,
-        }
-    }
+    use crate::testutil::bare_task as bare;
 
     fn file(filename: &str) -> TaskFile {
         TaskFile {
@@ -1243,7 +1204,7 @@ mod tests {
         };
         assert_eq!(
             resolve_delete_path(&task).unwrap(),
-            "/usbshare1-2/download/X"
+            "/usbshare1-2/download/Some.Release"
         );
     }
 
@@ -1269,29 +1230,34 @@ mod tests {
 
     #[test]
     fn a_nested_destination_is_preserved() {
-        // dbid_002 also proves the file list wins over a differing title: the
-        // title carries an emoji the on-disk directory does not.
         let task = task("dbid_002");
-        assert_eq!(task.title, "Big.Buck.Bunny.2008.1080p.🐰.BluRay.x264");
+        assert_eq!(task.destination, "video/movies");
         assert_eq!(
             resolve_delete_path(&task).unwrap(),
-            "/video/movies/Big.Buck.Bunny.2008.1080p.BluRay.x264"
+            "/video/movies/Big.Buck.Bunny.2008.1080p.🐰.BluRay.x264"
         );
     }
 
     #[test]
-    fn the_file_list_beats_a_title_that_disagrees_with_it() {
-        // The whole point of rule 1: the display title has a suffix the actual
-        // directory does not, and deleting by title would miss (or hit the
-        // wrong thing).
+    fn the_title_wins_even_when_the_file_list_root_disagrees_with_it() {
+        // The inverse of what this test used to assert, and the reason for the
+        // change: Download Station writes into a container named after the
+        // *task*, and the file list is relative to that container — so a root
+        // that differs from the title is a directory *inside* the payload, not
+        // the payload. dbid_006's list is rooted at a name without the audio
+        // suffix; on a real NAS the payload is still at the title.
+        //
+        // Getting this backwards is not a near miss. Two real Blu-ray torrents
+        // list `BDMV/…`, and the old rule aimed them at `/video/BDMV`.
         let task = task("dbid_006");
         assert_eq!(task.title, "千と千尋の神隠し.2001.1080p.日本語音声");
-        let path = resolve_delete_path(&task).unwrap();
-        assert_eq!(path, "/video/movies/千と千尋の神隠し.2001.1080p");
-        assert!(
-            !path.contains("日本語音声"),
-            "resolved from the title: {path}"
+        assert_eq!(
+            common_root(&task.files).as_deref(),
+            Some("千と千尋の神隠し.2001.1080p")
         );
+
+        let path = resolve_delete_path(&task).unwrap();
+        assert_eq!(path, "/video/movies/千と千尋の神隠し.2001.1080p.日本語音声");
     }
 
     #[test]
@@ -1358,47 +1324,74 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn a_file_list_with_no_common_root_is_refused_and_never_guessed_from_the_title() {
-        // The single most important test in this project. dbid_013's files are
-        // "Disc1/…", "Disc2/…" and "readme.nfo": there is no directory that
-        // holds exactly this task's data, and /video/tv/Mixed.Root.Release may
-        // well be an unrelated folder that already exists.
+    fn a_file_list_with_no_common_root_resolves_to_the_container_dsm_made() {
+        // dbid_013's files are "Disc1/…", "Disc2/…" and "readme.nfo" — several
+        // things at the torrent's own root. Download Station puts that in a
+        // directory named after the torrent, so the payload is the title path
+        // and the file list is what proves a container exists.
+        //
+        // This rule refused until it met a real NAS, where 15 of 41 tasks had
+        // this shape and every one of them resolved to an existing directory of
+        // exactly this name.
         let task = task("dbid_013");
         assert_eq!(task.title, "Mixed.Root.Release");
         assert_eq!(task.destination, "video/tv");
         assert_eq!(task.files.len(), 3);
 
-        let reason = refusal(resolve_delete_path(&task));
-        assert!(
-            reason.contains("no single top-level"),
-            "unhelpful reason: {reason}"
-        );
-        // It must not have quietly resolved via the title by any other route.
-        assert!(
-            !reason.contains("/video/tv/Mixed.Root.Release"),
-            "the title path leaked into the refusal: {reason}"
-        );
+        let resolved = resolve_delete_target(&task).expect("rule 2 resolves");
+        assert_eq!(resolved.path, "/video/tv/Mixed.Root.Release");
+        // The file list says a container exists, so a *file* found there cannot
+        // be this payload — unlike a task with no list at all, which accepts
+        // either kind.
+        assert_eq!(resolved.expected_kind, ExpectedKind::Dir);
     }
 
     #[test]
-    fn the_refusal_names_the_conflicting_roots() {
-        let reason = refusal(resolve_delete_path(&task("dbid_013")));
-        for root in ["Disc1", "Disc2", "readme.nfo"] {
-            assert!(reason.contains(root), "{root} missing from: {reason}");
-        }
-    }
-
-    #[test]
-    fn a_no_common_root_task_is_refused_even_when_the_title_would_be_valid() {
-        // Same shape as dbid_013 but with a title that passes every guard, to
-        // prove the refusal is about the file list and not about the title.
-        let task = Task {
-            title: "Perfectly.Fine.Name".to_string(),
+    fn rule_two_expects_a_directory_where_rule_three_accepts_anything() {
+        // The distinction is the whole reason rule 2 is safe to resolve: both
+        // are named from the title, but only one has a file list behind it
+        // saying a container must be there.
+        let with_list = Task {
+            title: "Season.Pack".to_string(),
             destination: "downloads".to_string(),
-            files: vec![file("A/one.bin"), file("B/two.bin")],
+            files: vec![file("e01.mkv"), file("e02.mkv")],
             ..bare()
         };
-        refusal(resolve_delete_path(&task));
+        let without_list = Task {
+            title: "Season.Pack".to_string(),
+            destination: "downloads".to_string(),
+            task_type: TaskType::Http,
+            files: Vec::new(),
+            ..bare()
+        };
+
+        let a = resolve_delete_target(&with_list).expect("rule 2");
+        let b = resolve_delete_target(&without_list).expect("rule 3");
+        assert_eq!(a.path, b.path, "same name, different expectation");
+        assert_eq!(a.expected_kind, ExpectedKind::Dir);
+        assert_eq!(b.expected_kind, ExpectedKind::AnyFromTitle);
+    }
+
+    #[test]
+    fn a_common_root_still_wins_over_the_title() {
+        // Rule 1 is untouched and still takes precedence: when the list agrees
+        // on a root, that root is authoritative even though the title differs.
+        let task = Task {
+            title: "Display.Title.Nobody.Wrote".to_string(),
+            destination: "downloads".to_string(),
+            files: vec![
+                file("Actual.On.Disk.Name/a.bin"),
+                file("Actual.On.Disk.Name/b.bin"),
+            ],
+            ..bare()
+        };
+        // The file list's own root is NOT the answer: Download Station writes
+        // into a container named after the task, and the list is relative to
+        // it. Aiming at the list's root is what sent two real Blu-ray torrents
+        // (file list `BDMV/…`) at `/video/BDMV`.
+        let resolved = resolve_delete_target(&task).expect("resolvable");
+        assert_eq!(resolved.path, "/downloads/Display.Title.Nobody.Wrote");
+        assert_eq!(resolved.expected_kind, ExpectedKind::Dir);
     }
 
     // -----------------------------------------------------------------------
@@ -1525,20 +1518,18 @@ mod tests {
     }
 
     #[test]
-    fn a_root_from_the_file_list_is_guarded_too() {
-        // Not just the title fallback: a hostile or corrupt file list gets the
-        // same treatment.
-        let task = Task {
-            files: vec![file("../a.mkv"), file("../b.mkv")],
-            ..bare()
-        };
-        refusal(resolve_delete_path(&task));
-
-        let task = Task {
-            files: vec![file("./a.mkv")],
-            ..bare()
-        };
-        refusal(resolve_delete_path(&task));
+    fn a_hostile_title_is_guarded() {
+        // The name is always the title now, so the title is what the guards
+        // have to hold. A traversal or a separator in it would otherwise aim
+        // the delete outside the destination entirely.
+        for hostile in ["..", ".", "../escape", "a/b", "   ", ""] {
+            let task = Task {
+                title: hostile.to_string(),
+                files: vec![file("a.mkv"), file("b.mkv")],
+                ..bare()
+            };
+            refusal(resolve_delete_path(&task));
+        }
     }
 
     #[test]
@@ -1681,7 +1672,7 @@ mod tests {
 
     #[test]
     fn an_unresolvable_task_is_a_per_item_skip_not_an_aborted_batch() {
-        let tasks = [task("dbid_001"), task("dbid_013"), task("dbid_003")];
+        let tasks = [task("dbid_001"), task("dbid_010"), task("dbid_003")];
         let plan = DeletePlan::snapshot(tasks.iter());
 
         assert_eq!(plan.len(), 3);
@@ -1689,18 +1680,18 @@ mod tests {
         assert_eq!(plan.refused().count(), 1);
 
         let skipped = plan.refused().next().unwrap();
-        assert_eq!(skipped.id, "dbid_013");
+        assert_eq!(skipped.id, "dbid_010");
         assert!(skipped.path().is_none(), "a refused item has no path");
         assert!(skipped.refusal().is_some_and(|r| !r.is_empty()));
         // Order is snapshot order, so the dialog lists rows as the user sees
         // them.
-        assert_eq!(plan.items[1].id, "dbid_013");
+        assert_eq!(plan.items[1].id, "dbid_010");
     }
 
     #[test]
     fn the_total_excludes_refused_items() {
         let resolvable = task("dbid_001");
-        let refused = task("dbid_013");
+        let refused = task("dbid_010");
         assert!(refused.size > 0, "the refused task must have a size");
 
         let plan = DeletePlan::snapshot([&resolvable, &refused]);
@@ -1750,7 +1741,7 @@ mod tests {
         // dbid_008 is a torrent with an empty file list; dbid_010 and dbid_011
         // have no destination; dbid_013 has no common root. Everything else is
         // unambiguous.
-        assert_eq!(refused, ["dbid_008", "dbid_010", "dbid_011", "dbid_013"]);
+        assert_eq!(refused, ["dbid_008", "dbid_010", "dbid_011"]);
 
         for item in plan.deletable() {
             let path = item.path().expect("deletable items have a path");
@@ -1984,7 +1975,7 @@ mod tests {
         // Not even the DSM task: the row was shown to the user as SKIPPED, and
         // deleting the task would orphan precisely the data whose location is
         // in doubt.
-        let refused = DeleteItem::for_task(&task("dbid_013"));
+        let refused = DeleteItem::for_task(&task("dbid_010"));
         assert!(refused.is_refused());
         assert_eq!(plan_delete_ops(&refused, DeleteOptions::default()), vec![]);
         assert_eq!(plan_delete_ops(&refused, DeleteOptions::dry_run()), vec![]);
@@ -2002,7 +1993,7 @@ mod tests {
             delete_files: false,
             dry_run: false,
         };
-        for id in ["dbid_010", "dbid_011", "dbid_013"] {
+        for id in ["dbid_010", "dbid_011"] {
             let refused = DeleteItem::for_task(&task(id));
             assert!(refused.is_refused(), "{id} is meant to be refused");
             assert_eq!(
@@ -2168,36 +2159,22 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // NameSource — how an absent path is allowed to be read
+    // `named` — whether anything resolved a path at all
     // -----------------------------------------------------------------------
 
     #[test]
-    fn a_path_from_the_file_list_records_that_provenance() {
+    fn a_resolved_item_is_marked_as_named() {
         let resolved = resolve_delete_target(&task("dbid_001")).expect("resolvable");
         assert_eq!(resolved.path, "/downloads/Ubuntu.24.04.3.LTS.Desktop.amd64");
-        assert_eq!(resolved.name_source, NameSource::FileList);
-        assert_eq!(
-            DeleteItem::for_task(&task("dbid_001")).name_source,
-            Some(NameSource::FileList)
-        );
+        assert!(DeleteItem::for_task(&task("dbid_001")).named);
     }
 
     #[test]
-    fn a_path_guessed_from_the_title_is_marked_as_such() {
-        // dbid_007 is an HTTP task with no file block: the on-disk name is the
-        // display title and nothing corroborates it.
-        let resolved = resolve_delete_target(&task("dbid_007")).expect("resolvable");
-        assert_eq!(resolved.name_source, NameSource::Title);
-        assert_eq!(
-            DeleteItem::for_task(&task("dbid_012")).name_source,
-            Some(NameSource::Title),
-            "an empty file list on a non-BT task is still a guess"
-        );
-    }
-
-    #[test]
-    fn a_refused_item_records_no_provenance_at_all() {
-        assert_eq!(DeleteItem::for_task(&task("dbid_013")).name_source, None);
+    fn a_refused_item_is_not_named() {
+        // The one input that authorizes nothing whatever the counters say:
+        // `event::decide_file_phase` refuses an absent path outright when
+        // nothing named it.
+        assert!(!DeleteItem::for_task(&task("dbid_010")).named);
     }
 
     // -----------------------------------------------------------------------
@@ -2225,7 +2202,7 @@ mod tests {
 
         let item = DeleteItem::for_task(&bt);
         assert!(item.is_refused());
-        assert_eq!(item.name_source, None);
+        assert!(!item.named);
         // …and the escape hatch really is one: with no file delete there is no
         // path to be unsure about, so the row can still be removed.
         assert_eq!(
@@ -2340,7 +2317,7 @@ mod tests {
         // A refused item never reaches a lookup, but it must not carry an
         // expectation that would authorize one either.
         assert_eq!(
-            DeleteItem::for_task(&task("dbid_013")).expected_kind,
+            DeleteItem::for_task(&task("dbid_010")).expected_kind,
             ExpectedKind::Indeterminate
         );
     }
@@ -2356,42 +2333,24 @@ mod tests {
     }
 
     #[test]
-    fn several_identically_named_flat_entries_are_left_undetermined() {
-        // A shape DSM should never send. Neither answer is defensible — but
-        // this list *was* consulted and answered with something that describes
-        // no payload, which is a reason to refuse rather than to accept
-        // whatever happens to be at the path. Unlike the title fallback, which
-        // has no metadata to be malformed.
+    fn a_malformed_file_list_still_expects_the_container() {
+        // Several entries carrying one identical filename is a shape DSM should
+        // never send. It used to make the *expectation* indeterminate, because
+        // the list was what named the path and a self-contradicting list could
+        // not be trusted to describe it.
+        //
+        // The list no longer names anything: the payload is the title, and a
+        // multi-entry list means Download Station made a container whatever the
+        // entries say. So the malformed part cannot mislead the path, and the
+        // expectation is an ordinary directory. `Indeterminate` now belongs to
+        // refused items alone.
         let task = Task {
             task_type: TaskType::BitTorrent,
             files: vec![file("Some.Release"), file("Some.Release")],
             ..bare()
         };
         let resolved = resolve_delete_target(&task).expect("resolvable");
-        assert_eq!(resolved.name_source, NameSource::FileList);
-        assert_eq!(resolved.expected_kind, ExpectedKind::Indeterminate);
-        assert!(!resolved.expected_kind.accepts(true));
-        assert!(!resolved.expected_kind.accepts(false));
-    }
-
-    // -----------------------------------------------------------------------
-    // describe_roots
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn a_refusal_naming_many_roots_is_truncated_rather_than_unbounded() {
-        // A torrent of loose files would otherwise put hundreds of names in a
-        // one-line footer message.
-        let files: Vec<TaskFile> = (0..9).map(|n| file(&format!("root{n}/a.bin"))).collect();
-        let described = describe_roots(&files);
-        assert!(described.ends_with(", …"), "{described}");
-        assert_eq!(described.matches("root").count(), 4, "{described}");
-
-        // Exactly four distinct roots is the boundary: shown in full, no
-        // ellipsis.
-        let files: Vec<TaskFile> = (0..4).map(|n| file(&format!("root{n}/a.bin"))).collect();
-        let described = describe_roots(&files);
-        assert!(!described.contains('…'), "{described}");
-        assert_eq!(described.matches("root").count(), 4, "{described}");
+        assert_eq!(resolved.path, "/downloads/Some.Release");
+        assert_eq!(resolved.expected_kind, ExpectedKind::Dir);
     }
 }
