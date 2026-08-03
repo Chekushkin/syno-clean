@@ -61,11 +61,12 @@ version to have changed anything from.
   checking *what* is there, not only that something is: a path whose kind disagrees with
   what the task resolved to — or whose file list describes no shape at all — is refused
   rather than removed recursively. A payload that should exist (a finished task, or one
-  whose counters say it downloaded everything) and does not keeps its task, judged from
-  the pause phase's reads rather than the dialog's snapshot: every read is folded in,
-  status and counters each ratcheting toward "the payload must exist", so a task that
-  completes while the pause settles is judged as complete and the `Paused` the pause
-  itself causes never weakens the answer.
+  whose counters say it downloaded everything) and does not keeps its task. Every read
+  of the task is folded into that judgement — the dialog's snapshot seeds it, the pause
+  phase's reads follow — with status and counters each ratcheting toward "the payload
+  must exist", so a task that completes while the pause settles is judged as complete
+  and no later read, the `Paused` the pause itself causes included, can weaken what an
+  earlier one already proved.
 - Three-phase delete ordered for recoverability: pause an active task and **confirm by
   re-reading it** that it actually stopped, then delete the files, then delete the task.
   Any phase failing skips every later phase, so a task is never removed while its data

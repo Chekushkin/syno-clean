@@ -793,10 +793,10 @@ pub fn requires_pause(status: &TaskStatus) -> bool {
 ///
 /// A separate type because the executor must assemble it from the freshest
 /// evidence for each half rather than from one read: `event::PauseRead` folds
-/// each half across every read of the task, ratcheting both toward "the payload
-/// must exist", and [`DeleteItem::payload_state`] (the confirmation snapshot)
-/// fills in whatever the pause phase never observed. Passing the fields around
-/// loose is how the stale one gets used by accident.
+/// each half across every read of the task — starting from
+/// [`DeleteItem::payload_state`], the confirmation snapshot, and ratcheting both
+/// toward "the payload must exist". Passing the fields around loose is how the
+/// stale one gets used by accident.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PayloadState {
     pub status: TaskStatus,
@@ -867,12 +867,13 @@ pub fn payload_should_exist(state: &PayloadState) -> bool {
 /// The status arm of [`payload_should_exist`], on its own.
 ///
 /// Named separately because `event::PauseRead` ratchets the status it hands the
-/// file phase along exactly this ordering: a read taken while the pause settles
-/// replaces the one before it only when its status is one of these. That is what
-/// keeps a status *upgrade* (the task finished mid-pause) while rejecting the
-/// *downgrade* this program inflicts on itself (`Paused`, which is not here).
-/// Asking [`payload_should_exist`] instead would let the counters answer a
-/// question about the status.
+/// file phase along exactly this ordering: any later read — including the very
+/// first live one, taken after the confirmation snapshot seeded the fold —
+/// replaces the status held only when its own is one of these. That is what
+/// keeps a status *upgrade* (the task finished mid-pause) while rejecting every
+/// *downgrade*, among them the one this program inflicts on itself (`Paused`,
+/// which is not here). Asking [`payload_should_exist`] instead would let the
+/// counters answer a question about the status.
 pub fn status_implies_payload(status: &TaskStatus) -> bool {
     matches!(
         status,
