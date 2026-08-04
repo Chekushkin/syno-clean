@@ -725,18 +725,23 @@ async fn logout(resolved: &ResolvedConfig, paths: &Paths) -> Result<()> {
 /// cached session, and none available from `SYNO_CLEAN_PASSWORD` or the config
 /// file's `password`. So the cache saves the typing, not just the round trip.
 ///
-/// The trade-off that buys: with a cached session and no stored password the
-/// client carries no credentials, so `api::client`'s transparent
-/// re-login-once retry cannot fire and a session DSM expires mid-run ends the
-/// operation with "the session expired and no credentials are available to
-/// renew it". Re-running logs in fresh. That is better than the alternative —
-/// prompting for a password from underneath the alternate screen — and storing
-/// a password anywhere restores the renewal.
+/// With a cached session and no stored password the client carries no
+/// credentials, so `api::client`'s transparent re-login-once retry cannot
+/// fire. A dead cached sid would then fail every poll with a session-shaped
+/// DSM error (105 on a real DSM 7 — see [`error::may_be_stale_session`]) and
+/// nothing would ever repair it: the cache entry is only rewritten after a
+/// successful renewal, so every relaunch reused the same dead sid. An
+/// unrenewable cached session is therefore **verified here**, while a password
+/// prompt is still possible — the alternate screen has not been entered — and
+/// a refusal falls through to the ordinary fresh login below. A session that
+/// expires *mid-run* still ends the operation with "the session expired and no
+/// credentials are available to renew it"; re-running now genuinely logs in
+/// fresh, which is what that message promises.
 ///
 /// `file_password` comes from the config file layer rather than
 /// [`ResolvedConfig`], which is logged at startup.
 async fn authenticate(
-    client: SynoClient,
+    mut client: SynoClient,
     resolved: &ResolvedConfig,
     paths: &Paths,
     file_password: Option<&str>,
@@ -748,7 +753,7 @@ async fn authenticate(
     // Only sources that cost the user nothing. Resolving the password *before*
     // consulting the cache is what made every launch prompt for one it did not
     // need — the cached session saved a round trip and never the typing.
-    let stored = config::stored_password(&config::system_env, file_password);
+    let mut stored = config::stored_password(&config::system_env, file_password);
     let otp = config::otp_from_env(&config::system_env);
     let make_credentials = |password: String| {
         let credentials = Credentials::new(&resolved.username, password);
@@ -759,20 +764,39 @@ async fn authenticate(
     };
 
     if let Some(sid) = cache.sid(&key).map(str::to_string) {
-        tracing::info!(
-            %key,
-            renewable = stored.is_some(),
-            "reusing the cached session"
-        );
-        // Credentials are attached only when they were free. Without them the
-        // client cannot renew a session that expires mid-run — `can_relogin()`
-        // is false and the request fails with a message saying so, which beats
-        // stopping to ask for a password from underneath the alternate screen.
-        let client = client.with_sid(sid);
-        return Ok(match stored {
-            Some(password) => client.with_credentials(make_credentials(password)),
-            None => client,
-        });
+        // With a stored password the transparent re-login retry repairs a
+        // stale sid on its first use, so the cached session is adopted as-is.
+        if let Some(password) = stored.take() {
+            tracing::info!(%key, renewable = true, "reusing the cached session");
+            return Ok(client
+                .with_sid(sid)
+                .with_credentials(make_credentials(password)));
+        }
+
+        // No password anywhere, so the retry cannot fire and a dead sid can
+        // only be repaired from here. The probe is the very call the poller
+        // makes — the same API, the same permission — so a pass here is not a
+        // guess about what the TUI will need.
+        client = client.with_sid(sid);
+        match download_station::list_tasks(&client).await {
+            Ok(_) => {
+                tracing::info!(%key, renewable = false, "reusing the cached session");
+                return Ok(client);
+            }
+            Err(Error::Dsm { code, .. }) if error::may_be_stale_session(code) => {
+                // Ambiguous by design: this is either a stale sid or a real
+                // permission problem, and logging in fresh is what settles it.
+                tracing::info!(
+                    %key,
+                    code,
+                    "DSM refused the cached session and no password is stored \
+                     to renew it; discarding it and logging in fresh"
+                );
+                cache.remove(&key);
+                client.clear_sid();
+            }
+            Err(err) => return Err(err),
+        }
     }
 
     // No usable session, so a password is genuinely required: use a stored one

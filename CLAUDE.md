@@ -151,7 +151,16 @@ library, where it is testable.
   each other. Normal quit does **not** log out — that would invalidate the cache
   and defeat it; only `--logout` does. A corrupt cache is discarded with a
   warning (`SessionCache::load` returns `Self`, not `Result<Self>`) — it is an
-  optimization and must never block startup.
+  optimization and must never block startup. **An *unrenewable* cached session
+  (no password stored anywhere) is verified with one `list` call before the TUI
+  is entered** (`main::authenticate`): without credentials the client's
+  re-login retry cannot fire, and a dead sid — which nothing rewrites except a
+  successful renewal — used to fail every poll on every launch with DSM 105
+  until `session.json` was deleted by hand. A session-shaped refusal
+  (`error::may_be_stale_session`) discards the entry and falls through to the
+  ordinary fresh login, whose prompt still precedes the alternate screen; a
+  cached session with a stored password skips the probe, because the transparent
+  retry repairs it on first use.
 
 `main` initializes logging *before* loading the config, so config warnings reach
 the log file, and holds the `tracing_appender::WorkerGuard` for the whole of
