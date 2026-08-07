@@ -24,6 +24,7 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModif
 
 use crate::api::client::parse_envelope;
 use crate::api::download_station::DS_TASK_API;
+use crate::api::file_station::VolumeUsage;
 use crate::delete::{DeleteOptions, DeletePlan};
 use crate::error::Result;
 use crate::event::{AppEvent, ItemReport, OpKind, TaskOp, TaskRef};
@@ -188,6 +189,18 @@ pub struct App {
     /// as a warning and, crucially, cleared automatically by the next
     /// successful refresh: the UI recovers on its own.
     pub error: Option<String>,
+    /// How full each volume is, one entry per volume, as of the last
+    /// successful storage read.
+    ///
+    /// **Empty means "no storage read has succeeded yet"**, and that is the
+    /// whole of the band's existence test: the renderer gives the storage band
+    /// zero rows while this is empty, so a NAS whose account cannot list
+    /// shares, a NAS that has not been asked yet, and `--fixture` (which has no
+    /// client at all) all show the same thing — no band and no empty gutter.
+    /// There is deliberately no separate "asked and failed" flag: a failed
+    /// storage read is silent by design (see [`crate::event`]), so there is
+    /// nothing for one to say.
+    pub storage: Vec<VolumeUsage>,
     /// How far `PageUp`/`PageDown` jump: the height of the table body, as of
     /// the last frame. See [`DEFAULT_PAGE_SIZE`].
     page_size: usize,
@@ -268,6 +281,7 @@ impl Default for App {
             connection: None,
             loaded: false,
             error: None,
+            storage: Vec::new(),
             page_size: DEFAULT_PAGE_SIZE,
             refresh_requested: false,
             search_backup: None,
@@ -397,11 +411,22 @@ impl App {
         match event {
             AppEvent::Tasks(tasks) => self.apply_tasks(tasks),
             AppEvent::Error(message) => self.set_error(message),
-            // Placeholder: `App` has no storage field yet, and the band that
-            // reads it does not exist. Wired up in the next task; dropped here
-            // rather than left to a catch-all arm so the compiler still names
-            // every future variant that needs handling.
-            AppEvent::Storage(_) => {}
+            // Applied **unconditionally**, including in `Mode::Confirm` —
+            // unlike `AppEvent::Tasks`, which is dropped outright while the
+            // dialog is open. `Tasks` is dropped because the confirmation shows
+            // an owned snapshot of the task list and what the user reads has to
+            // be exactly what gets deleted; storage is not part of that
+            // snapshot and no volume figure can make a `DeletePlan` stale, so
+            // there is nothing to freeze.
+            //
+            // The honest cost: the confirmation modal is centred rather than
+            // full-screen, so the *first* `Storage` event to arrive while it is
+            // open grows the band from zero rows to one and shifts the table
+            // visible around the modal down a row. Cosmetic, it happens at most
+            // once per session, and it is accepted rather than solved —
+            // deferring the update would mean holding a pending value for a
+            // modal that may never be dismissed.
+            AppEvent::Storage(volumes) => self.storage = volumes,
             AppEvent::OpProgress {
                 op,
                 done,
