@@ -355,12 +355,15 @@ above 90%. The line is emitted as a `Line` of spans, composed once.
 **Files:**
 - Modify: `src/format.rs`
 
-- [ ] add `pub fn gauge(fraction: f64, width: usize) -> String` using `█`
+- [x] add `pub fn gauge(fraction: f64, width: usize) -> String` using `█`
       (U+2588) and `░` (U+2591)
-- [ ] clamp the fraction and map non-finite to 0, mirroring `percent`
-- [ ] return an empty string for `width == 0` rather than panicking
-- [ ] document that both glyphs are single-cell and that this is load-bearing
-- [ ] full gate
+- [x] clamp the fraction and map non-finite to 0, mirroring `percent`
+- [x] return an empty string for `width == 0` rather than panicking
+- [x] document that both glyphs are single-cell and that this is load-bearing
+- [x] full gate
+- ➕ the two glyphs are named consts (`format::GAUGE_FILLED` / `GAUGE_EMPTY`)
+      beside `DASH` / `INFINITY` / `ELLIPSIS`, so the single-cell rule has one
+      documented home rather than being a literal buried in the function
 
 ### Task 4: `AppEvent::Storage` and the throttled poller fetch
 
