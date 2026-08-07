@@ -406,17 +406,24 @@ above 90%. The line is emitted as a `Line` of spans, composed once.
 **Files:**
 - Modify: `src/app.rs`
 
-- [ ] add `pub storage: Vec<VolumeUsage>` to `App`, with a doc comment: empty
+- [x] add `pub storage: Vec<VolumeUsage>` to `App`, with a doc comment: empty
       means "no storage read has succeeded yet", which is what the renderer keys
       the band's existence off
-- [ ] add it to the hand-written `impl Default for App`, which lists every field
-- [ ] add `AppEvent::Storage(volumes) => self.storage = volumes` to
+- [x] add it to the hand-written `impl Default for App`, which lists every field
+- [x] add `AppEvent::Storage(volumes) => self.storage = volumes` to
       `apply_event` — applied unconditionally, **including in `Mode::Confirm`**,
       unlike `AppEvent::Tasks`. It is not part of the frozen delete plan and
       cannot make it stale. Note the honest cost: the confirmation modal is
       centred, not full-screen, so the first `Storage` event arriving while it is
       open shifts the table *around* it down one row. Cosmetic, and accepted
-- [ ] full gate
+- [x] full gate
+- ➕ the placeholder arm Task 4 left behind is gone; the doc comment on the real
+      arm also records *why* `AppEvent::Tasks` is the one that must be dropped in
+      `Mode::Confirm` (it feeds the frozen snapshot) so the asymmetry reads as a
+      decision rather than an oversight. There is deliberately no
+      "asked and failed" companion flag: a failed storage read is silent, so a
+      flag would have nothing to say and would only offer the renderer a second,
+      contradictable existence test.
 
 ### Task 6: The band in the frame, and the page size
 
