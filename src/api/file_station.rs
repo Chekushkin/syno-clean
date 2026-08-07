@@ -34,12 +34,18 @@
 //!   the kind the task resolved to, since `recursive=true` on the wrong kind of
 //!   object removes something that is not this task's payload;
 //! * an **error** or an unattributable answer is never read as absence.
+//!
+//! One thing here is **not** part of a delete: [`volume_usage`] reads
+//! `list_share` for the storage band. It lives in this module because it is the
+//! same API and the same version pin, but it is display-only, it is the one call
+//! in the crate that deliberately bypasses [`SynoClient::call`], and its failure
+//! is never fatal. See its doc comment before touching it.
 
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::api::client::{SynoClient, VersionRange};
+use crate::api::client::{SynoClient, VersionRange, parse_envelope};
 use crate::error::{Error, Result};
 
 /// Path lookup — used for the pre-delete existence check.
@@ -130,6 +136,20 @@ pub fn build_fs_delete_params(paths: &[String]) -> Vec<(&'static str, String)> {
 /// Query parameters for `SYNO.FileStation.Delete` `method=status`.
 pub fn build_fs_delete_status_params(taskid: &str) -> Vec<(&'static str, String)> {
     vec![("taskid", taskid.to_string())]
+}
+
+/// Query parameters for `SYNO.FileStation.List` `method=list_share`.
+///
+/// `volume_status` is the free/total pair the storage band draws; `real_path` is
+/// what makes the answer *dedupable*, since every share on one volume reports
+/// the same numbers and only the resolved path names the volume they belong to.
+///
+/// The array goes through `serde_json` for the same reason
+/// [`encode_path_list`] does — the encoding is owned in one place rather than
+/// spelled as a literal that a later edit can quietly malform.
+pub fn build_list_share_params() -> Vec<(&'static str, String)> {
+    let additional = serde_json::Value::from(vec!["real_path", "volume_status"]).to_string();
+    vec![("additional", additional)]
 }
 
 // ---------------------------------------------------------------------------
@@ -351,10 +371,184 @@ async fn await_delete(client: &SynoClient, taskid: &str, timeout: Duration) -> R
     }
 }
 
+// ---------------------------------------------------------------------------
+// list_share — how full the volumes are
+// ---------------------------------------------------------------------------
+
+/// The `data` object of `SYNO.FileStation.List` `method=list_share`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ShareList {
+    #[serde(default)]
+    pub shares: Vec<Share>,
+}
+
+/// One share as `list_share` reports it.
+///
+/// Every field below `shares` is optional, exactly as `model.rs` treats a
+/// task's `additional` sub-blocks and for the same reason: one share DSM
+/// describes oddly must not blank the whole band. A share this client cannot
+/// read fully is skipped by [`collect_volume_usage`], not fatal.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Share {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub additional: Option<ShareAdditional>,
+}
+
+/// The `additional` block requested by [`build_list_share_params`].
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ShareAdditional {
+    /// The resolved path — `/volume1/downloads` where `path` says `/downloads`.
+    /// Its first component is the mount point, which is the only thing in the
+    /// response that distinguishes one volume from another.
+    #[serde(default)]
+    pub real_path: Option<String>,
+    #[serde(default)]
+    pub volume_status: Option<VolumeStatus>,
+}
+
+/// Free and total bytes of the volume a share lives on.
+///
+/// Both sizes go through `model::de_u64` because DSM sends the same
+/// numeric field as a JSON number on one build and as a string on the next — a
+/// plain `u64` here is the bug the task model already guards against, and it
+/// would fail the *whole* payload rather than one field.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct VolumeStatus {
+    #[serde(default, deserialize_with = "crate::model::de_u64")]
+    pub freespace: u64,
+    #[serde(default, deserialize_with = "crate::model::de_u64")]
+    pub totalspace: u64,
+}
+
+/// One volume's occupancy, deduped across the shares that live on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeUsage {
+    /// The mount point as DSM spells it — `volume1`, `volumeUSB1`, … Display
+    /// only: nothing resolves a path through it.
+    pub name: String,
+    pub total: u64,
+    pub free: u64,
+}
+
+impl VolumeUsage {
+    /// Bytes in use. Saturating, because a NAS that reports `free > total`
+    /// mid-scrub is a display oddity, not a panic.
+    pub fn used(&self) -> u64 {
+        self.total.saturating_sub(self.free)
+    }
+
+    /// Occupancy as a `0.0..=1.0` fraction, matching what
+    /// [`crate::format::percent`] takes — and what the storage bar will.
+    ///
+    /// A zero-size volume is ordinary rather than an error — the same guarded
+    /// denominator as [`crate::model::Task::progress`].
+    pub fn fraction(&self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        self.used() as f64 / self.total as f64
+    }
+}
+
+/// Collapse a `list_share` payload into one entry per volume. Pure.
+///
+/// Shares on one volume all report the *same* `volume_status`, so the raw list
+/// would draw the same bar once per share. The rules, in order:
+///
+/// 1. a share with no `volume_status`, or whose `totalspace` is 0, is skipped —
+///    there is nothing to draw a bar of;
+/// 2. the volume key is the first component of `real_path` when that path is
+///    absolute and the component is a mount point;
+/// 3. a share whose `real_path` is absent or does not look like a mount is
+///    **skipped**, never given a synthetic key. Keying on `{total}:{free}`
+///    instead would merge two genuinely distinct volumes and label them with a
+///    name DSM never sent — refusing to display beats displaying an invention;
+/// 4. the first share seen for a key wins, and the result is sorted by name so
+///    the band keeps a stable order across polls instead of reshuffling under
+///    the user every time DSM returns the shares in a different order.
+pub fn collect_volume_usage(list: &ShareList) -> Vec<VolumeUsage> {
+    let mut volumes: Vec<VolumeUsage> = Vec::new();
+
+    for share in &list.shares {
+        let Some(additional) = share.additional.as_ref() else {
+            continue;
+        };
+        let Some(status) = additional.volume_status.as_ref() else {
+            continue;
+        };
+        if status.totalspace == 0 {
+            continue;
+        }
+        let Some(name) = additional.real_path.as_deref().and_then(mount_component) else {
+            continue;
+        };
+        if volumes.iter().any(|known| known.name == name) {
+            continue;
+        }
+        volumes.push(VolumeUsage {
+            name: name.to_string(),
+            total: status.totalspace,
+            free: status.freespace,
+        });
+    }
+
+    volumes.sort_by(|left, right| left.name.cmp(&right.name));
+    volumes
+}
+
+/// The mount component of an absolute DSM path, if it has one.
+///
+/// On DSM the first component of an absolute *real* path is always the mount
+/// point, and every spelling starts with `volume` (`/volume1`, `/volumeUSB1`,
+/// `/volumeSATA2`, the bare `/volume`).
+///
+/// This deliberately does **not** reuse `delete`'s stricter mount test, and the
+/// duplication is the point: there, mis-reading a component re-roots a
+/// recursive delete, so the rule matches by exact shape. Here the component is
+/// only ever a label on a progress bar and a dedupe key, so the looser prefix
+/// test costs nothing if it is ever wrong — and coupling a display helper to a
+/// guard whose whole job is to be paranoid invites "simplifying" the guard.
+fn mount_component(real_path: &str) -> Option<&str> {
+    let first = real_path.strip_prefix('/')?.split('/').next()?;
+    first.starts_with("volume").then_some(first)
+}
+
+/// Ask the NAS how full its volumes are.
+///
+/// ⚠️ **This deliberately does not go through [`SynoClient::call`], and must
+/// never be "simplified" to.** `call` treats DSM 105 as a possibly-stale
+/// session: it throws away the working sid, re-logs-in, and — if 105 survives
+/// the fresh session — latches `permission_is_real` **client-wide, not per
+/// API**. That latch then disables the 105 retry for every API, including
+/// `SYNO.DownloadStation.Task`.
+///
+/// A restricted download-only account is exactly what this tool is usually
+/// pointed at, and exactly the kind that answers 105 to `list_share`. Routing
+/// the storage read through `call` would therefore force a re-login on the first
+/// storage poll and then leave a genuinely stale Download Station session
+/// unrepairable — reinstating the failure where every poll fails until
+/// `session.json` is deleted by hand.
+///
+/// So this uses the documented no-retry escape hatch: [`SynoClient::endpoint`] +
+/// [`SynoClient::send`] + [`parse_envelope`]. The cost is that a storage read
+/// against a genuinely expired session simply fails; the *task* poller repairs
+/// the session a moment later and the next storage read succeeds. That is the
+/// right trade for a display-only number.
+pub async fn volume_usage(client: &SynoClient) -> Result<Vec<VolumeUsage>> {
+    let endpoint = client.endpoint(FS_LIST_API, FS_LIST_SUPPORTED)?;
+    let params = build_list_share_params();
+    let body = client
+        .send(&endpoint, "list_share", &params, client.sid())
+        .await?;
+    let list: ShareList = parse_envelope(&body, FS_LIST_API)?;
+    Ok(collect_volume_usage(&list))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::client::parse_envelope;
     use crate::api::download_station::build_ds_id_params;
 
     fn paths(items: &[&str]) -> Vec<String> {
