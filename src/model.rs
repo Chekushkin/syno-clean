@@ -460,7 +460,14 @@ fn de_i64_opt<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>,
 /// Read an unsigned 64-bit count, tolerating the string form. Anything
 /// negative or unparseable becomes `0` — byte counts and speeds have no
 /// meaningful negative value.
-fn de_u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+///
+/// This is the crate-wide answer to DSM sending the same numeric field as a
+/// JSON number on one build and as a string on the next, so every module that
+/// deserializes a DSM byte count uses it rather than a plain `u64` — see the
+/// `api::file_station` volume sizes. It is `pub(crate)` and not `pub`
+/// deliberately: it is an internal convention about *this* program's wire
+/// parsing, not something a dependent should be able to build on.
+pub(crate) fn de_u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
     Ok(de_i64_opt(deserializer)?.unwrap_or(0).max(0) as u64)
 }
 
