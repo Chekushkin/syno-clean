@@ -362,7 +362,7 @@ async fn event_loop(
         // A page jump is a screenful of the table, so the app is told how tall
         // that is after every draw — including after a resize, and including
         // after the storage band appears, which costs the body a row.
-        app.set_page_size(terminal.page_size(app)?);
+        app.set_page_size(terminal.page_size(ui::storage_band_height(app))?);
 
         let read =
             pending_read.get_or_insert_with(|| tokio::task::spawn_blocking(terminal_event::read));

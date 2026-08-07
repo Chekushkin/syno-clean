@@ -24,11 +24,10 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModif
 
 use crate::api::client::parse_envelope;
 use crate::api::download_station::DS_TASK_API;
-use crate::api::file_station::VolumeUsage;
 use crate::delete::{DeleteOptions, DeletePlan};
 use crate::error::Result;
 use crate::event::{AppEvent, ItemReport, OpKind, TaskOp, TaskRef};
-use crate::model::{Task, TaskList};
+use crate::model::{Task, TaskList, VolumeUsage};
 use crate::ui::{dialog, table};
 use crate::view::{self, View};
 
@@ -426,7 +425,20 @@ impl App {
             // once per session, and it is accepted rather than solved —
             // deferring the update would mean holding a pending value for a
             // modal that may never be dismissed.
-            AppEvent::Storage(volumes) => self.storage = volumes,
+            //
+            // ⚠️ **An empty read never retracts a band that is already drawn.**
+            // Assigning unconditionally meant one poll that attributed nothing
+            // — a share momentarily unmountable, a DSM answer this client could
+            // not read — made the band disappear and shifted the whole table up
+            // a row, then back down a minute later. "The read came back with
+            // nothing" is not evidence that the volumes went away, and a last
+            // known figure is more use than a hole. The zero-volume case is
+            // logged where it is known, in `file_station::volume_usage`.
+            AppEvent::Storage(volumes) => {
+                if !volumes.is_empty() {
+                    self.storage = volumes;
+                }
+            }
             AppEvent::OpProgress {
                 op,
                 done,

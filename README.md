@@ -186,7 +186,7 @@ port         = 5001      # default: 5001 with https, 5000 without
 https        = true      # default: true
 insecure     = false     # accept a self-signed / invalid TLS certificate
 username     = "eduard"
-refresh_secs = 3         # must be > 0
+refresh_secs = 3         # must be > 0; the task list only, not the storage bar
 delete_files = true      # false = remove the DSM task only, leave the files
 ```
 
@@ -201,7 +201,7 @@ delete_files = true      # false = remove the DSM task only, leave the files
 | `SYNO_CLEAN_USERNAME` | DSM account name |
 | `SYNO_CLEAN_PASSWORD` | password (otherwise prompted for) |
 | `SYNO_CLEAN_OTP` | 2-step verification code (otherwise prompted for when DSM asks) |
-| `SYNO_CLEAN_REFRESH_SECS` | seconds between automatic refreshes |
+| `SYNO_CLEAN_REFRESH_SECS` | seconds between automatic task-list refreshes (the storage bar has its own slower clock) |
 
 There is deliberately **no** `SYNO_CLEAN_DELETE_FILES`: an environment variable that
 silently disables the program's main function is a footgun. Use `--no-delete-files` or
@@ -257,7 +257,7 @@ authoritative one.
 | `d` | delete — opens the confirmation |
 | `p` | pause the selection, or the row under the cursor |
 | `u` | resume the selection, or the row under the cursor |
-| `r` | refresh now |
+| `r` | refresh now — the task list *and* the storage bar, which otherwise updates once a minute |
 | `v` | the last batch's results, with the reason for every skip and failure |
 
 `d`, `p` and `u` act on the selection when there is one, and on the row under the

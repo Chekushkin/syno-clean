@@ -83,6 +83,12 @@ version to have changed anything from.
   keystroke, `Enter` commits and `Esc` restores the query you started with.
 - Distinct empty states for "the NAS has no tasks" and "a filter or search is hiding
   everything", the latter naming how many rows are hidden and by what.
+- A storage band above the table: one coloured bar per volume with the percentage used
+  and the free-of-total figure, so "did reclaiming that space work?" is answerable
+  without leaving the TUI. It reads `SYNO.FileStation.List` `list_share` on its own
+  slower clock (once a minute, and on every `r`), needs no admin account, and takes up
+  **no row at all** until a read has succeeded — a NAS or account that refuses the call
+  renders exactly the frame it did before, never an error banner.
 - `?` help overlay documenting every binding, generated from the same data a test
   checks against the actual keymap, and naming `--no-delete-files` — the one remedy
   that is a flag rather than a key.

@@ -464,9 +464,12 @@ above 90%. The line is emitted as a `Line` of spans, composed once.
       the band is taking a row it should not
 - ➕ the band's existence is a single named predicate, `ui::storage_band_height`,
       read by **both** `render` (as the layout constraint) and
-      `TerminalGuard::page_size` (as chrome to subtract), so the frame and the
-      page size cannot disagree about whether the row is there. That is what
-      made `page_size` take `&App` rather than deriving from the terminal alone
+      the `main::event_loop` call site that feeds `TerminalGuard::page_size`
+      (as chrome to subtract), so the frame and the page size cannot disagree
+      about whether the row is there. It first made `page_size` take `&App`;
+      Task 10 put that back to `extra_chrome: u16` — the predicate is still the
+      single definition either way, and the terminal guard has no business
+      knowing about application state
 - ➕ the three-rung ladder is driven off **one** definition of the segment text
       (`storage_spans`, measured by `spans_width`), so the width being measured
       is by construction the width being drawn. Rung 3 drops the colour with it:
@@ -533,7 +536,10 @@ above 90%. The line is emitted as a `Line` of spans, composed once.
 - [x] full gate one final time — `cargo fmt --all && cargo build && cargo clippy
       --all-targets -- -D warnings && cargo test` all clean: **636 tests pass**
       (629 lib + 7 bin), and the branch adds **zero** `#[test]` items, so the
-      existing suite is passing untouched as the waiver requires
+      waiver holds. ⚠️ "untouched" is not quite right and was corrected in review:
+      one existing call site did change (`src/ui/mod.rs`,
+      `table_page_size(12)` → `table_page_size(12, storage_band_height(&app))`,
+      the new parameter). No expectation and no assertion changed
 - ➕ one further probe, beyond the listed criteria, because the degradation
       ladder is the untested width arithmetic this feature leans on:
       `storage_line` was exercised at **every** width from 0 to 200 for one, two
@@ -574,6 +580,91 @@ above 90%. The line is emitted as a `Line` of spans, composed once.
       back at the `SynoClient::call` bypass as the one rule that makes the waiver
       safe. Splitting them into two bullets separated that dependency
 
+### Task 9: Code-review follow-ups
+
+Raised by the review pass after Task 8 and fixed in one commit. Recorded here
+because several of them changed *behaviour*, not just wording:
+
+- [x] `volume_usage` logs one `info!` naming `shares_seen` when a read succeeds
+      and attributes no volume — on screen that case is indistinguishable from
+      "never asked", and the log is the manual pass's only signal
+- [x] `additional` / `volume_status` read through a lenient
+      `Option`-or-anything-else deserializer, so a share DSM answers with `[]`
+      or `""` is skipped rather than failing the whole envelope and blanking the
+      band. The tolerance `Share`'s doc comment claimed now exists
+- [x] `format::gauge` → `format::gauge_cells`: the count, not a rendered bar the
+      one caller immediately scanned back for the boundary the producer knew
+- [x] `mount_component` keys on the **whole** mount point, taking a second
+      component after `volumeUSB*`/`volumeSATA*`, so two partitions of one
+      external disk are two bars rather than one and a silent omission
+- [x] the give-up latch is **two** consecutive permission refusals, not one: this
+      call bypasses the re-login retry, so a single 105 from a momentarily dead
+      sid used to cost the band until restart
+- [x] an explicit refresh (`r`) bypasses the storage throttle — it is the key
+      pressed right after a delete, and the free-space figure is what the delete
+      was for
+- [x] an empty `Storage` event no longer retracts a band already on screen
+- [x] `is_permission_refusal` names a File-Station-local 403 const: on
+      `SYNO.FileStation.*` 403 is *permission denied*, not the Auth API's 2FA
+- [x] `list_share` sends `limit=0` (File Station's documented "all") explicitly
+- [x] `VolumeUsage` moved to `model.rs`, following the crate's layering — `api`
+      collapses wire shapes into `model`, and `app`/`ui` depend on `model`
+- [x] dropped what nothing reads: `Share::name`, `VolumeUsage::used`, and the
+      unused `Clone`/`Default` derives on the four wire structs
+- [x] the three-rung ladder is three explicit rungs rather than a loop over a
+      bool that then rebuilt the discarded spans a third time
+- [x] documentation: the CHANGELOG bullet, `CLAUDE.md`'s module map, its
+      `SynoClient::send` callers, its mount-rule shape wording, its testing-scope
+      clause, `README.md`'s three refresh mentions, and `event.rs`'s module
+      header and "twentyfold" arithmetic
+### Task 10: Code-smell follow-ups
+
+A second review pass, after Task 9. One of these is a real bug; the rest are
+placement and duplication:
+
+- [x] ⚠️ `is_permission_refusal` matched `Error::Dsm { code, .. }` and threw the
+      `api` away, so an Auth 403 — a *2FA prompt* — latched the band off for the
+      session. It now matches `api == file_station::FS_LIST_API` as well, the way
+      every lookup in `error.rs` keys on the `(code, api)` pair. The constant's
+      own doc comment had spelled out the distinction the predicate then ignored
+- [x] `Error::ApiUnavailable` is a give-up, immediately: File Station absent is
+      reachable under `--no-delete-files`, discovery runs once at startup, and
+      the old code retried a read that cannot work once a minute with a `warn!`
+      each time
+- [x] the 403 const moved to `api/file_station.rs` beside `FS_NO_SUCH_FILE` — the
+      module owns its API's codes; `event.rs` was a third home for the same
+      knowledge
+- [x] `de_lenient_opt` moved to `model.rs` as `pub(crate)`, next to `de_u64`,
+      which this feature had already widened for `api` to share. One home for the
+      permissive DSM deserializers
+- [x] `format::clamp_fraction` extracted: `gauge_cells` had a verbatim copy of
+      `percent`'s non-finite/clamp guard, and the band prints both from the same
+      number
+- [x] `App::apply_event`'s `|| self.storage.is_empty()` dropped — the second
+      disjunct could never change the outcome, so it read as a rule that did not
+      exist
+- [x] `TerminalGuard::page_size` takes `extra_chrome: u16` again rather than
+      `&App`; `main::event_loop` passes `ui::storage_band_height(app)`. The guard
+      is the terminal-lifecycle type and this module's split runs one way only
+- [x] `STORAGE_SEPARATOR` moved into the header const block with the other
+      `STORAGE_*` consts
+- [x] visibility: `ShareList`, `Share`, `ShareAdditional`, `VolumeStatus`,
+      `collect_volume_usage`, `build_list_share_params` and `ui::storage_line`
+      are private — nothing outside their module reads them, and with tests
+      waived here nothing would flag a `pub` one that a later edit orphaned
+- ➕ noted, **not** changed: `model.rs`'s own `RawTask::additional` and
+      `RawAdditional` sub-blocks have the identical `[]`-instead-of-object
+      fragility `de_lenient_opt` exists for. Applying it there changes how a
+      malformed *task* parses, which is pre-existing behaviour outside this
+      feature's scope and a change to argue for on its own evidence — see the
+      follow-ups below
+
+- ⚠️ **declined:** a staleness marker on a band that has stopped updating. It
+      needs a second piece of state and a second thing on screen to explain, for
+      a failure the log already records, on a feature whose whole justification
+      is that it is cheap. No documentation claims the band self-reports
+      staleness
+
 ## Post-Completion
 
 *No checkboxes — these need a real NAS and are the agreed substitute for tests.*
@@ -603,8 +694,14 @@ above 90%. The line is emitted as a `Line` of spans, composed once.
 
 **Possible follow-ups, deliberately not in scope:**
 
-- Spawn the storage read as a detached task if the inline read is observed to
-  stall the poller.
+- Read `model.rs`'s own `additional` sub-blocks through `model::de_lenient_opt`.
+  `RawTask::additional` and `RawAdditional`'s `detail`/`transfer`/`file` are
+  plain `Option<T>` behind `#[serde(default)]`, so a DSM build that fills one
+  with `[]` fails the whole `list` envelope and blanks the *table* — the same
+  failure the storage band now guards against, on a payload where it costs far
+  more. Left alone deliberately: it is pre-existing behaviour, no capture has
+  shown DSM doing it to a task, and changing how a malformed task parses wants
+  its own evidence rather than riding along with a helper's move.
 - Poke the storage read from `event::OpContext` after a delete batch, so the
   reclaimed space shows immediately.
 - Warn in the UI when a share has the DSM Recycle Bin enabled and a delete
