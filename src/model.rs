@@ -335,6 +335,28 @@ pub struct TaskList {
     pub tasks: Vec<Task>,
 }
 
+/// One volume's occupancy, deduped across the shares that live on it. A domain
+/// type, so it lives beside [`Task`] rather than in `api::file_station`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeUsage {
+    /// The mount point as DSM spells it (`volume1`, `volumeUSB1/usbshare1-2`).
+    /// Display only: nothing resolves a path through it.
+    pub name: String,
+    pub total: u64,
+    pub free: u64,
+}
+
+impl VolumeUsage {
+    /// Occupancy as a `0.0..=1.0` fraction; guarded denominator, saturating
+    /// subtraction.
+    pub fn fraction(&self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        self.total.saturating_sub(self.free) as f64 / self.total as f64
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire shape
 // ---------------------------------------------------------------------------
@@ -460,13 +482,30 @@ fn de_i64_opt<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>,
 /// Read an unsigned 64-bit count, tolerating the string form. Anything
 /// negative or unparseable becomes `0` — byte counts and speeds have no
 /// meaningful negative value.
-fn de_u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+///
+/// The crate-wide answer to DSM sending numbers as JSON numbers or strings per
+/// build; `pub(crate)` so `api` modules use it instead of a plain `u64`.
+pub(crate) fn de_u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
     Ok(de_i64_opt(deserializer)?.unwrap_or(0).max(0) as u64)
 }
 
 /// As [`de_u64`], saturating into `u32` for peer counts.
 fn de_u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
     Ok(de_u64(deserializer)?.min(u32::MAX as u64) as u32)
+}
+
+/// Read an optional sub-block, treating **anything unexpected as absent**.
+/// `#[serde(default)]` only tolerates a *missing* key; DSM fills a slot it
+/// cannot compute with `[]`/`""`/`false`, which would otherwise fail the whole
+/// payload. (This module's own `additional` sub-blocks deliberately do not use
+/// it yet — changing how a malformed task parses is its own decision.)
+pub(crate) fn de_lenient_opt<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: serde::de::DeserializeOwned,
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(T::deserialize(value).ok())
 }
 
 /// `#[serde(default = ...)]` needs a function, and `true` is not one.

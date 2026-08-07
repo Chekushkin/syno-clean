@@ -36,7 +36,8 @@ Nothing is installed on the NAS: it is a plain HTTP client for the documented DS
 > (`tests/fixtures/task_list.json`) into an in-memory buffer, with the top two rows
 > selected — the same `ratatui` `TestBackend` path the layout tests use. Colour and the
 > cursor highlight are lost in plain text; everything else is exactly what the terminal
-> gets, footer hints and all.
+> gets, footer hints and all. The storage bar is missing for the same reason it is
+> missing under `--fixture`: there is no NAS to ask, so the band takes no rows at all.
 >
 > ⚠️ **A real terminal screenshot (or an asciinema recording) against a live NAS is
 > still outstanding and must be added before v0.1.0 is published.** The fixture behind
@@ -52,6 +53,9 @@ Nothing is installed on the NAS: it is a plain HTTP client for the documented DS
   about to go, with the total it will free — then deletes the files *and* the task.
 - Sort by eight keys, filter by status, live substring search over titles.
 - Live auto-refresh in the background; the UI never blocks on the network.
+- A one-line storage bar above the table showing how full each volume is, so you can
+  see whether reclaiming space worked. It refreshes on its own slower clock and is
+  simply absent — no gap, no error — on a NAS or account that will not report it.
 - Pause (`p`) and resume (`u`) the selection.
 - Correct column alignment for CJK and emoji titles (display width, not character
   count).
@@ -182,7 +186,7 @@ port         = 5001      # default: 5001 with https, 5000 without
 https        = true      # default: true
 insecure     = false     # accept a self-signed / invalid TLS certificate
 username     = "eduard"
-refresh_secs = 3         # must be > 0
+refresh_secs = 3         # must be > 0; the task list only, not the storage bar
 delete_files = true      # false = remove the DSM task only, leave the files
 ```
 
@@ -197,7 +201,7 @@ delete_files = true      # false = remove the DSM task only, leave the files
 | `SYNO_CLEAN_USERNAME` | DSM account name |
 | `SYNO_CLEAN_PASSWORD` | password (otherwise prompted for) |
 | `SYNO_CLEAN_OTP` | 2-step verification code (otherwise prompted for when DSM asks) |
-| `SYNO_CLEAN_REFRESH_SECS` | seconds between automatic refreshes |
+| `SYNO_CLEAN_REFRESH_SECS` | seconds between automatic task-list refreshes (the storage bar has its own slower clock) |
 
 There is deliberately **no** `SYNO_CLEAN_DELETE_FILES`: an environment variable that
 silently disables the program's main function is a footgun. Use `--no-delete-files` or
@@ -253,7 +257,7 @@ authoritative one.
 | `d` | delete — opens the confirmation |
 | `p` | pause the selection, or the row under the cursor |
 | `u` | resume the selection, or the row under the cursor |
-| `r` | refresh now |
+| `r` | refresh now — the task list *and* the storage bar, which otherwise updates once a minute |
 | `v` | the last batch's results, with the reason for every skip and failure |
 
 `d`, `p` and `u` act on the selection when there is one, and on the row under the
