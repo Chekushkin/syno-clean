@@ -370,26 +370,36 @@ above 90%. The line is emitted as a `Line` of spans, composed once.
 **Files:**
 - Modify: `src/event.rs`
 
-- [ ] add `AppEvent::Storage(Vec<VolumeUsage>)` with a doc comment saying it is
+- [x] add `AppEvent::Storage(Vec<VolumeUsage>)` with a doc comment saying it is
       display-only and never fatal
-- [ ] add `pub const STORAGE_INTERVAL: Duration = Duration::from_secs(60);` with
+- [x] add `pub const STORAGE_INTERVAL: Duration = Duration::from_secs(60);` with
       the rationale (free space changes on the scale of a finished download, the
       default `refresh_secs` is 3, and this call is not what the user is waiting
       for)
-- [ ] in `spawn_poller`, hold `let mut storage: StorageSchedule` (a tiny local
+- [x] in `spawn_poller`, hold `let mut storage: StorageSchedule` (a tiny local
       struct or just `Option<tokio::time::Instant>` plus a `bool give_up`) across
       the loop and, **after** `poll_once`, call a new `poll_storage_once` when
       the read is due and has not been given up on
-- [ ] `poll_storage_once` returns whether the channel is still open, exactly like
+- [x] `poll_storage_once` returns whether the channel is still open, exactly like
       `poll_once`; on `Err` it logs `tracing::warn!` and **sends nothing** — no
       `AppEvent::Error`, per the Solution Overview
-- [ ] stamp the throttle on **every attempt**, success or failure, so a refusing
+- [x] stamp the throttle on **every attempt**, success or failure, so a refusing
       NAS is asked once a minute rather than every 3 seconds
-- [ ] on a permission-shaped refusal — `Error::Dsm { code, .. }` where
+- [x] on a permission-shaped refusal — `Error::Dsm { code, .. }` where
       `code == error::OTP_REQUIRED_CODE` or the DSM permission code 105 — set the
       give-up flag and log once at `info` that the storage band is disabled for
       this session
-- [ ] full gate
+- [x] full gate
+- ➕ **ordering:** `App::apply_event`'s match is exhaustive, so the new variant
+      does not compile without an arm. A one-line placeholder
+      (`AppEvent::Storage(_) => {}`, commented as such) was added to `src/app.rs`
+      in this task purely to keep the gate green; **Task 5 replaces it** with the
+      real `self.storage = volumes`. A catch-all `_` arm was deliberately not
+      used — it would stop the compiler naming future variants.
+- ➕ `is_permission_refusal` is a small private predicate rather than an inline
+      `matches!`, so the "105 here is not the ambiguous stale-session case"
+      reasoning has one documented home. It uses `error::PERMISSION_DENIED_CODE`
+      rather than a literal `105`.
 
 ### Task 5: `App::storage` and the `apply_event` arm
 

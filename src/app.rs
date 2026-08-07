@@ -397,6 +397,11 @@ impl App {
         match event {
             AppEvent::Tasks(tasks) => self.apply_tasks(tasks),
             AppEvent::Error(message) => self.set_error(message),
+            // Placeholder: `App` has no storage field yet, and the band that
+            // reads it does not exist. Wired up in the next task; dropped here
+            // rather than left to a catch-all arm so the compiler still names
+            // every future variant that needs handling.
+            AppEvent::Storage(_) => {}
             AppEvent::OpProgress {
                 op,
                 done,
