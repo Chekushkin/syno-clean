@@ -38,6 +38,14 @@ pub const INFINITY: &str = "∞";
 /// only by measuring it rather than assuming it.
 pub const ELLIPSIS: &str = "…";
 
+/// The occupied run of a [`gauge`] bar. One cell wide — see [`gauge`] for why
+/// substituting a wider glyph breaks the layout to the bar's right.
+pub const GAUGE_FILLED: char = '█';
+
+/// The free run of a [`gauge`] bar. One cell wide, for the same reason as
+/// [`GAUGE_FILLED`].
+pub const GAUGE_EMPTY: char = '░';
+
 /// Binary size units, smallest first. `TiB` is the ceiling: a Download Station
 /// task larger than 1024 TiB is not a case worth a unit for.
 const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -129,6 +137,44 @@ pub fn percent(fraction: f64) -> String {
         0.0
     };
     format!("{:.1}%", fraction * 100.0)
+}
+
+/// A fixed-width `████░░░░` bar body — exactly `width` cells, no brackets.
+///
+/// **Both glyphs are single-cell, and that is load-bearing.** The caller lays
+/// out the rest of its line assuming the bar occupies precisely `width` cells,
+/// so a two-cell replacement glyph would shear everything to its right — the
+/// same property [`crate::ui::table::SELECTED_MARKER`] is asserted to have,
+/// for the same reason. Keep [`GAUGE_FILLED`] and [`GAUGE_EMPTY`] single-cell.
+///
+/// `fraction` is a fraction in `0.0..=1.0`, matching [`percent`] rather than an
+/// already-multiplied percentage; out-of-range values clamp and a non-finite
+/// one reads as empty, because a `NaN` must not panic mid-frame. `width == 0`
+/// is an empty string rather than a panic: a terminal too narrow for a bar is
+/// a layout to degrade, not a reason to bring the program down.
+///
+/// The filled count is *rounded*, so a bar can read full a hair before 100%.
+/// That errs toward "almost out of space", which is the direction this bar
+/// exists to warn in, and the exact figure is [`percent`]'s job beside it.
+pub fn gauge(fraction: f64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let fraction = if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let filled = ((fraction * width as f64).round() as usize).min(width);
+    let mut bar = String::with_capacity(width * GAUGE_FILLED.len_utf8());
+    for cell in 0..width {
+        bar.push(if cell < filled {
+            GAUGE_FILLED
+        } else {
+            GAUGE_EMPTY
+        });
+    }
+    bar
 }
 
 /// A share ratio as `2.14`, or [`INFINITY`] when it is not a finite number.
