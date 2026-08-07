@@ -36,9 +36,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 
-use crate::api::file_station::VolumeUsage;
 use crate::app::{App, Mode};
 use crate::format;
+use crate::model::VolumeUsage;
 use crate::view::{StatusFilter, View};
 
 /// The backend this program draws on: crossterm over stdout.
@@ -93,6 +93,12 @@ const STORAGE_WARN_FRACTION: f64 = 0.75;
 
 /// Occupancy at which the filled run turns red: a large download may not fit.
 const STORAGE_CRITICAL_FRACTION: f64 = 0.90;
+
+/// What separates one volume's segment from the next.
+///
+/// Three spaces rather than a `·`: the segments already contain spaces and
+/// brackets, and a separator glyph beside a bar reads as part of the bar.
+const STORAGE_SEPARATOR: &str = "   ";
 
 /// Owns the terminal for as long as the TUI is running.
 ///
@@ -150,17 +156,17 @@ impl TerminalGuard {
     /// a page is a screenful of the table rather than a fixed guess — and the
     /// app stays free of any dependency on the terminal.
     ///
-    /// It takes the `App` because the storage band's height is *state*, not a
-    /// property of the terminal: the same window is one body row shorter once a
-    /// storage read has come back. Deriving the page size from the height alone
-    /// made every `PageDown` over-jump by exactly one row whenever the band was
-    /// visible, which is the kind of off-by-one nobody reports and everybody
-    /// notices.
-    pub fn page_size(&self, app: &App) -> io::Result<usize> {
-        Ok(table_page_size(
-            self.terminal.size()?.height,
-            storage_band_height(app),
-        ))
+    /// ⚠️ **`extra_chrome` is a parameter and not read off an [`App`], because
+    /// the dependency runs one way only.** The optional bands' height is
+    /// application *state* — the same window is one body row shorter once a
+    /// storage read has come back, and ignoring that made every `PageDown`
+    /// over-jump by exactly one row whenever the band was visible — but the
+    /// guard is the terminal-lifecycle type and giving it a `&App` inverts the
+    /// split this module documents. The caller passes
+    /// [`storage_band_height`], which stays the single definition of whether the
+    /// band is there.
+    pub fn page_size(&self, extra_chrome: u16) -> io::Result<usize> {
+        Ok(table_page_size(self.terminal.size()?.height, extra_chrome))
     }
 }
 
@@ -346,12 +352,6 @@ fn render_title_bar(
     );
 }
 
-/// What separates one volume's segment from the next.
-///
-/// Three spaces rather than a `·`: the segments already contain spaces and
-/// brackets, and a separator glyph beside a bar reads as part of the bar.
-const STORAGE_SEPARATOR: &str = "   ";
-
 /// The storage band's contents: one segment per volume. **Pure.**
 ///
 /// Split out from the drawing for the same reason
@@ -376,28 +376,34 @@ const STORAGE_SEPARATOR: &str = "   ";
 /// means re-deriving where the cut lands inside the bar, and at a width that
 /// cannot hold `name [bar] pct` the colour is the least of what is missing.
 ///
-/// Every measurement here is [`format::display_width`] — never `str::len` —
-/// because a volume name is a share name and DSM lets those be CJK.
-pub fn storage_line(volumes: &[VolumeUsage], width: usize) -> Line<'static> {
-    // The ladder, rung by rung. Both rungs are built from one definition of
-    // the segment text, so the width being measured is the width being drawn.
-    for with_tail in [true, false] {
-        let spans = storage_spans(volumes, with_tail);
-        if spans_width(&spans) <= width {
-            return Line::from(spans);
-        }
+/// Every measurement here is [`format::display_width`] — never `str::len`. The
+/// mount label is ASCII by construction, but the *composed* line is not
+/// something to reason about a character at a time, and this repository has one
+/// width rule everywhere rather than a per-call judgement about whether the
+/// shortcut happens to be safe here.
+fn storage_line(volumes: &[VolumeUsage], width: usize) -> Line<'static> {
+    // The ladder, rung by rung. Every rung is built from one definition of the
+    // segment text, so the width being measured is the width being drawn.
+    let full = storage_spans(volumes, true);
+    if spans_width(&full) <= width {
+        return Line::from(full);
     }
 
-    let spans = storage_spans(volumes, false);
-    let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+    let trimmed = storage_spans(volumes, false);
+    if spans_width(&trimmed) <= width {
+        return Line::from(trimmed);
+    }
+
+    let text: String = trimmed.iter().map(|span| span.content.as_ref()).collect();
     Line::from(format::truncate_ellipsis(&text, width))
 }
 
 /// The band as styled spans, with or without each segment's size tail.
 ///
-/// The bar arrives from [`format::gauge`] as one string and is split into its
-/// filled and free runs here, so **only the occupied part carries colour**. A
-/// fully coloured bar would say "red" about a volume that is mostly free.
+/// The bar's two runs are built separately from [`format::gauge_cells`]' count,
+/// so **only the occupied part carries colour**. A fully coloured bar would say
+/// "red" about a volume that is mostly free. Both glyphs are one cell wide, so
+/// the bar is exactly [`STORAGE_GAUGE_WIDTH`] cells however the count falls.
 fn storage_spans(volumes: &[VolumeUsage], with_tail: bool) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     for volume in volumes {
@@ -406,23 +412,17 @@ fn storage_spans(volumes: &[VolumeUsage], with_tail: bool) -> Vec<Span<'static>>
         }
 
         let fraction = volume.fraction();
-        let bar = format::gauge(fraction, STORAGE_GAUGE_WIDTH);
-        // The filled run is a prefix of the bar by construction, so its byte
-        // length is where the two runs part. `len_utf8` rather than a character
-        // count: this is a byte index into `bar`, not a width.
-        let filled_bytes: usize = bar
-            .chars()
-            .take_while(|glyph| *glyph == format::GAUGE_FILLED)
-            .map(char::len_utf8)
-            .sum();
-        let (filled, free) = bar.split_at(filled_bytes);
+        let filled_cells = format::gauge_cells(fraction, STORAGE_GAUGE_WIDTH);
+        let filled: String = std::iter::repeat_n(format::GAUGE_FILLED, filled_cells).collect();
+        let free: String =
+            std::iter::repeat_n(format::GAUGE_EMPTY, STORAGE_GAUGE_WIDTH - filled_cells).collect();
 
         spans.push(Span::raw(format!("{} [", volume.name)));
         spans.push(Span::styled(
-            filled.to_string(),
+            filled,
             Style::default().fg(storage_colour(fraction)),
         ));
-        spans.push(Span::raw(free.to_string()));
+        spans.push(Span::raw(free));
         spans.push(Span::raw(format!("] {}", format::percent(fraction))));
 
         if with_tail {

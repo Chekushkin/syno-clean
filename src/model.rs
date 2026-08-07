@@ -335,6 +335,38 @@ pub struct TaskList {
     pub tasks: Vec<Task>,
 }
 
+/// One volume's occupancy, deduped across the shares that live on it.
+///
+/// A **domain** type, not a wire one, which is why it lives here beside
+/// [`Task`] rather than in `api::file_station` where it is derived. The
+/// layering the rest of the crate follows is that `api` collapses DSM's shapes
+/// into `model`, and `app`/`ui` depend on `model` alone — putting this in the
+/// API module made both of them import from `api` for a struct with nothing
+/// wire-shaped left in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeUsage {
+    /// The mount point as DSM spells it — `volume1`, `volumeUSB1/usbshare1-2`,
+    /// … Display only: nothing resolves a path through it.
+    pub name: String,
+    pub total: u64,
+    pub free: u64,
+}
+
+impl VolumeUsage {
+    /// Occupancy as a `0.0..=1.0` fraction, matching what
+    /// [`crate::format::percent`] takes — and what the storage bar draws.
+    ///
+    /// A zero-size volume is ordinary rather than an error — the same guarded
+    /// denominator as [`Task::progress`]. The subtraction saturates because a
+    /// NAS reporting `free > total` mid-scrub is a display oddity, not a panic.
+    pub fn fraction(&self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        self.total.saturating_sub(self.free) as f64 / self.total as f64
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire shape
 // ---------------------------------------------------------------------------
@@ -474,6 +506,34 @@ pub(crate) fn de_u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, 
 /// As [`de_u64`], saturating into `u32` for peer counts.
 fn de_u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
     Ok(de_u64(deserializer)?.min(u32::MAX as u64) as u32)
+}
+
+/// Read an optional sub-block, and read **anything unexpected as absent**.
+///
+/// ⚠️ `#[serde(default)]` alone only tolerates a *missing* key. DSM fills an
+/// `additional` slot it cannot compute with whatever it likes — `[]`, `""`,
+/// `false` — and against a plain `Option<T>` any of those fails the whole
+/// `serde_json::from_str`, so one record the NAS cannot stat blanks the entire
+/// payload. Taking the value as a [`serde_json::Value`] first and only then
+/// asking it to be a `T` turns that into one absent sub-block: a `T` it is not
+/// becomes `None`, and the caller skips the record instead of the response.
+///
+/// It lives here with [`de_u64`] because this is the crate's one home for "DSM
+/// answered in a shape the obvious `serde` attribute rejects" — a second copy in
+/// an `api` module is how the two drift into disagreeing about what the wire may
+/// contain. `pub(crate)` for the same reason `de_u64` is.
+///
+/// ⚠️ **This module's own `additional` sub-blocks do *not* use it yet** — see
+/// the plan's follow-ups. Adding it there changes how a malformed task parses,
+/// which is a behaviour change to argue for on its own evidence, not a tidy-up
+/// to fold into a move.
+pub(crate) fn de_lenient_opt<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: serde::de::DeserializeOwned,
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(T::deserialize(value).ok())
 }
 
 /// `#[serde(default = ...)]` needs a function, and `true` is not one.
