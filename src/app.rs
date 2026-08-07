@@ -188,17 +188,8 @@ pub struct App {
     /// as a warning and, crucially, cleared automatically by the next
     /// successful refresh: the UI recovers on its own.
     pub error: Option<String>,
-    /// How full each volume is, one entry per volume, as of the last
-    /// successful storage read.
-    ///
-    /// **Empty means "no storage read has succeeded yet"**, and that is the
-    /// whole of the band's existence test: the renderer gives the storage band
-    /// zero rows while this is empty, so a NAS whose account cannot list
-    /// shares, a NAS that has not been asked yet, and `--fixture` (which has no
-    /// client at all) all show the same thing — no band and no empty gutter.
-    /// There is deliberately no separate "asked and failed" flag: a failed
-    /// storage read is silent by design (see [`crate::event`]), so there is
-    /// nothing for one to say.
+    /// How full each volume is, as of the last successful storage read.
+    /// Empty means "none has succeeded yet" — the band's whole existence test.
     pub storage: Vec<VolumeUsage>,
     /// How far `PageUp`/`PageDown` jump: the height of the table body, as of
     /// the last frame. See [`DEFAULT_PAGE_SIZE`].
@@ -410,30 +401,9 @@ impl App {
         match event {
             AppEvent::Tasks(tasks) => self.apply_tasks(tasks),
             AppEvent::Error(message) => self.set_error(message),
-            // Applied **unconditionally**, including in `Mode::Confirm` —
-            // unlike `AppEvent::Tasks`, which is dropped outright while the
-            // dialog is open. `Tasks` is dropped because the confirmation shows
-            // an owned snapshot of the task list and what the user reads has to
-            // be exactly what gets deleted; storage is not part of that
-            // snapshot and no volume figure can make a `DeletePlan` stale, so
-            // there is nothing to freeze.
-            //
-            // The honest cost: the confirmation modal is centred rather than
-            // full-screen, so the *first* `Storage` event to arrive while it is
-            // open grows the band from zero rows to one and shifts the table
-            // visible around the modal down a row. Cosmetic, it happens at most
-            // once per session, and it is accepted rather than solved —
-            // deferring the update would mean holding a pending value for a
-            // modal that may never be dismissed.
-            //
-            // ⚠️ **An empty read never retracts a band that is already drawn.**
-            // Assigning unconditionally meant one poll that attributed nothing
-            // — a share momentarily unmountable, a DSM answer this client could
-            // not read — made the band disappear and shifted the whole table up
-            // a row, then back down a minute later. "The read came back with
-            // nothing" is not evidence that the volumes went away, and a last
-            // known figure is more use than a hole. The zero-volume case is
-            // logged where it is known, in `file_station::volume_usage`.
+            // Applied even in `Mode::Confirm` (unlike `Tasks`): storage is not
+            // part of the frozen delete snapshot. An empty read never retracts
+            // a band already drawn — a last known figure beats a hole.
             AppEvent::Storage(volumes) => {
                 if !volumes.is_empty() {
                     self.storage = volumes;

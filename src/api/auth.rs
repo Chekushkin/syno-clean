@@ -132,11 +132,9 @@ pub async fn login(client: &SynoClient, credentials: &Credentials) -> Result<Str
 /// Only `--logout` calls this. Quitting normally keeps the session so the next
 /// start is instant.
 ///
-/// ⚠️ Uses [`SynoClient::send`] rather than [`SynoClient::call`], and must never
-/// be "simplified" onto it. A session code is the one answer the re-login retry
-/// must not paper over here: it would log back in and then invalidate the
-/// *newly created* session, leaving the sid the user asked to forget alive on
-/// the NAS while `--logout` reported success.
+/// ⚠️ Uses [`SynoClient::send`], not [`SynoClient::call`]: the re-login retry
+/// would log back in and invalidate the *new* session, leaving the old sid
+/// alive while `--logout` reported success.
 pub async fn logout(client: &SynoClient) -> Result<()> {
     let endpoint = client.endpoint(AUTH_API, AUTH_SUPPORTED)?;
     let params = build_logout_params(AUTH_SESSION);
