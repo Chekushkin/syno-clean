@@ -325,25 +325,30 @@ above 90%. The line is emitted as a `Line` of spans, composed once.
 **Files:**
 - Modify: `src/api/file_station.rs`
 
-- [ ] add `build_list_share_params()` returning
+- [x] add `build_list_share_params()` returning
       `[("additional", "[\"real_path\",\"volume_status\"]")]`, built with
       `serde_json` rather than a hand-written literal, matching
       `encode_path_list`'s reason for existing. No new method const — every
       existing call site passes the method name as a literal
-- [ ] add the wire structs `ShareList` / `Share` / `ShareAdditional` /
+- [x] add the wire structs `ShareList` / `Share` / `ShareAdditional` /
       `VolumeStatus`, **all `pub`**, every field `#[serde(default)]`, both sizes
       through `model::de_u64`
-- [ ] add `pub struct VolumeUsage` with `used()` and `fraction()`, guarding the
+- [x] add `pub struct VolumeUsage` with `used()` and `fraction()`, guarding the
       `total == 0` denominator
-- [ ] add pure `collect_volume_usage`, implementing the four rules under
+- [x] add pure `collect_volume_usage`, implementing the four rules under
       Technical Details (skip / key from `real_path` / skip unattributable / sort)
-- [ ] add `pub async fn volume_usage(client)` built from
+- [x] add `pub async fn volume_usage(client)` built from
       `client.endpoint(FS_LIST_API, FS_LIST_SUPPORTED)?`,
       `client.send(&endpoint, "list_share", &params, client.sid())` and
       `parse_envelope::<ShareList>` — **not** `client.call`, with a doc comment
       naming the `permission_is_real` latch as the reason so nobody "simplifies"
       it back later
-- [ ] full gate. Watch specifically for `private_interfaces`
+- [x] full gate. Watch specifically for `private_interfaces`
+- ➕ the mount-point test is a **local** private `mount_component` rather than
+      `delete::is_volume_component`, which stays private: Task 7 asserts
+      `git diff` shows no change to `src/delete.rs`, and coupling a display
+      label to a guard whose job is paranoia invites loosening the guard. The
+      duplication is documented at the function.
 
 ### Task 3: `format::gauge`
 
