@@ -131,6 +131,10 @@ pub async fn login(client: &SynoClient, credentials: &Credentials) -> Result<Str
 ///
 /// Only `--logout` calls this. Quitting normally keeps the session so the next
 /// start is instant.
+///
+/// ⚠️ Uses [`SynoClient::send`], not [`SynoClient::call`]: the re-login retry
+/// would log back in and invalidate the *new* session, leaving the old sid
+/// alive while `--logout` reported success.
 pub async fn logout(client: &SynoClient) -> Result<()> {
     let endpoint = client.endpoint(AUTH_API, AUTH_SUPPORTED)?;
     let params = build_logout_params(AUTH_SESSION);

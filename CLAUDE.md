@@ -77,8 +77,9 @@ src/
   cli.rs                   clap definitions
   config.rs                TOML config, env overrides, validation, sid cache, paths
   error.rs                 Error enum, DSM code mapping, startup diagnostics
-  format.rs                human-readable bytes/speed/eta/percent, width-correct truncation
-  model.rs                 Task, TaskFile, TaskStatus, JSON -> Task
+  format.rs                human-readable bytes/speed/eta/percent, gauge fill, width-correct truncation
+  model.rs                 Task, TaskFile, TaskStatus, VolumeUsage, JSON -> Task,
+                           the permissive DSM deserializers every module shares
   view.rs                  SortKey/SortDir/StatusFilter/search -> visible indices
   delete.rs                delete-path resolution, safety guards, op ordering
   app.rs                   App state, key handling, selection, event application
@@ -92,7 +93,7 @@ src/
     client.rs              reqwest client, API discovery, envelope, sid handling, retry
     auth.rs                login / logout
     download_station.rs    list / delete / pause / resume
-    file_station.rs        path info lookup, delete files
+    file_station.rs        path info lookup, delete files, volume usage (list_share)
 tests/fixtures/task_list.json
 ```
 
@@ -271,9 +272,12 @@ needs must be `info!` or higher. `--log-file` changes only *where* the file goes
 - Never build a URL or pick a version by hand. Call
   `client.call::<T>(api, method, SUPPORTED, &params)` — it resolves the
   endpoint from the discovery map, attaches `_sid`, and owns the re-login
-  retry. `SynoClient::send` is the no-retry escape hatch, and
-  `SynoClient::post_form` is the **POST** one: both exist for `auth::login`,
-  which must not recurse into the retry that called it. Login is the only POST
+  retry. `SynoClient::send` is the no-retry escape hatch and
+  `SynoClient::post_form` is the **POST** one (`auth::login` only). Outside
+  `client.rs`, `send` has exactly two sanctioned callers: `auth::logout` (the
+  retry would log back in and end the *new* session) and
+  `file_station::volume_usage` (see [The storage band](#the-storage-band)).
+  Anything else reaching for `send` is a bug. Login is the only POST
   in the program, and it is a POST for a reason — a DSM query string is written
   in full to the NAS's nginx access log, so `passwd=` there would persist the
   account password to disk on every login. Only `api`/`version`/`method` ride in
@@ -334,6 +338,10 @@ needs must be `info!` or higher. `--log-file` changes only *where* the file goes
   field and per build — file sizes and timestamps especially). Every numeric
   field goes through the permissive `de_u64` / `de_u32` / `de_i64_opt`
   deserializers. Do not add a plain `u64` field.
+- **`model.rs` is the one home for the permissive DSM deserializers** — the
+  three numeric ones plus `de_lenient_opt` (a sub-block sent as `[]`/`""`/`false`
+  reads as absent). They are `pub(crate)` so `api` modules share them instead of
+  growing their own.
 - `TaskStatus::Unknown(String)` keeps an unrecognized status verbatim so a row
   is never dropped; `from_dsm_str` trims and case-folds. `TaskStatus::KNOWN`
   lists the ten documented variants, and `Ord` follows declaration order (that
@@ -447,11 +455,17 @@ Supporting rules, each of which exists because the alternative is a guess:
   entries would *resolve* some of the ambiguous cases rule 2 exists to refuse.
 - **Only an absolute destination has its mount point stripped**, and *every*
   DSM mount spelling counts: `/volume1`, `/volume`, `/volumeUSB1/usbshare1-2`,
-  `/volumeSATA1/…` — anything whose first component starts with `volume`, since
-  on DSM the first component of an absolute path is always a mount point. A
-  relative `volume1/downloads` passes through untouched (a share may legally be
+  `/volumeSATA1/…`. The rule is matched by **shape**, not by prefix
+  (`delete::is_volume_component`): `volume`, `volume<N>`, `volumeUSB<N>` and
+  `volumeSATA<N>` only — a share named `volumes`, `volume-media` or `volumeX` is
+  deliberately *not* a mount, because eating that component would re-root a
+  recursive delete into a different share. A relative `volume1/downloads` passes
+  through untouched (a share may legally be
   named `volume1`), and so does an absolute first component that is *not* a
-  mount (`/downloads` is share-rooted and already correct). Leaving `/volumeUSB1`
+  mount (`/downloads` is share-rooted and already correct). The storage band's
+  `file_station::mount_component` is a second, deliberately looser test (prefix,
+  not shape) — one labels a bar, the other authorizes a recursive delete.
+  Leaving `/volumeUSB1`
   in place used to build a path File Station has never heard of, and "it fails
   the existence check later" is **not** harmless: absence is one of the answers
   the executor may read as "already cleaned up".
@@ -814,6 +828,58 @@ deleted.
 - Cursor movement **clamps and never wraps** — a `j` held at the bottom of a long
   list wrapping to the top is how the wrong row gets deleted.
 
+### The storage band (`ui::storage_line`, `event::poll_storage_once`)
+
+A one-row band between the title bar and the table, one segment per volume:
+`volume1 [████░░░░] 78.0%  3.1 TiB free of 14.0 TiB`. Display-only.
+
+- **Data from `SYNO.FileStation.List` `list_share`** (with
+  `additional=["real_path","volume_status"]`, `limit=0`), not
+  `SYNO.Core.Storage.Volume` — that one is admin-gated, and this tool is often
+  pointed at a download-only account. Shares dedupe onto volumes by
+  `real_path`'s mount point; `mount_component` keeps **two** components for
+  `volumeUSB*`/`volumeSATA*` mounts, because each partition of an external disk
+  is its own filesystem. A share with no mount-shaped `real_path` is skipped,
+  never given a synthetic key.
+- Sub-blocks are read via `model::de_lenient_opt` — `#[serde(default)]` only
+  covers an *absent* key, and DSM fills slots it cannot compute with
+  `[]`/`""`/`false`, which would otherwise fail the whole envelope. A read that
+  succeeds but attributes nothing logs one `info!` line (the wire shape is
+  unverified against a real NAS, and that line is the only diagnostic).
+- ⚠️ **The storage read bypasses `SynoClient::call` and must never be
+  "simplified" back onto it.** A 105 from `list_share` (ordinary on a
+  download-only account) would latch `permission_is_real` **client-wide**,
+  disabling the 105 retry for Download Station too — reinstating the bug commit
+  `5507247` fixed. `volume_usage` uses `endpoint` + `send` + `parse_envelope`;
+  on an expired session it just fails and the task poller repairs the session.
+- **Its own clock**: `event::STORAGE_INTERVAL` (60 s) vs the 3 s task poll. The
+  throttle stamps on **every attempt**, so a refusing NAS costs one request a
+  minute, not one per tick. `r` bypasses the throttle. Permission refusals
+  (105 / FS 403, matched on the `(code, api)` pair — a number-only test would
+  read an Auth 2FA 403 as a refusal) latch the read off after **two in a row**,
+  where "in a row" is literal (any non-refusal resets the count);
+  `Error::ApiUnavailable` gives up on the first, since discovery never reruns.
+- **A failed storage read is silent** — it must never send `AppEvent::Error`;
+  that banner belongs to the task poll. The read runs inline after `poll_once`,
+  so a slow `list_share` can delay the next task tick by up to the request
+  timeout — accepted.
+- **`App::storage` empty is the band's whole existence test**; the band is
+  `Constraint::Length(0)` while it is, so `--fixture` and a refusing NAS render
+  the pre-band frame exactly. An empty read never retracts a band already on
+  screen, and `AppEvent::Storage` is applied even in `Mode::Confirm` (it is not
+  part of the frozen delete snapshot).
+- ⚠️ **The band's height is threaded into the page size**:
+  `ui::storage_band_height(&App)` is the single definition, read by `render`
+  and passed by `main::event_loop` to `TerminalGuard::page_size(extra_chrome)`.
+  Fold it back into `CHROME_ROWS` and `PageDown` over-jumps by one row.
+  `page_size` takes a `u16`, not `&App` — the guard stays ignorant of app state.
+- `ui::storage_line` is pure and degrades in three rungs (full → drop the
+  ` free of {total}` tails → `truncate_ellipsis`). Colour is on the filled run
+  only: green, yellow at 75%, red at 90%. `format::gauge_cells` hands out a
+  *count* (sharing `clamp_fraction` with `percent`), and the two gauge glyphs
+  (`GAUGE_FILLED`/`GAUGE_EMPTY`) must stay **single-cell** — nothing asserts it,
+  since this feature ships without tests.
+
 ### The delete confirmation (`ui::dialog`, `App::begin_delete`)
 
 - **`d` never deletes.** It snapshots (`DeletePlan::snapshot`) the target and
@@ -1029,6 +1095,9 @@ the project. Rendering is also covered far beyond the original intent, because
 **Not tested (verified by running the binary):** the terminal lifecycle (raw
 mode, alternate screen, panic hook), live HTTP against DSM.
 
+**The storage band is the one recorded hole in the "Tested" list** — it ships
+with no tests at all, by explicit user waiver (see Known gaps).
+
 Rules that keep the suite honest:
 
 - **No test touches the network, a real timer, the real `$HOME`, or a process env
@@ -1062,6 +1131,11 @@ Real, deliberate, and none of them a regression:
   remains unexercised is listed under Post-Completion in the plan.
 - ⚠️ **The README's terminal frame is a `TestBackend` rendering of the fixture,
   not a screenshot.** A real capture is still owed before publishing.
+- ⚠️ **The storage band ships without tests, by explicit request**, and its
+  `list_share` wire shape is **unverified against a real NAS** — everything
+  downstream skips rather than guesses, so a wrong field name costs the band
+  and nothing else. The one rule the waiver must never weaken is the
+  `SynoClient::call` bypass above.
 - **The repository is `https://github.com/Chekushkin/syno-clean`** — settled, no
   longer a placeholder. It appears in `Cargo.toml`, `README.md`,
   `CONTRIBUTING.md` and `CHANGELOG.md`; keep those four in step.

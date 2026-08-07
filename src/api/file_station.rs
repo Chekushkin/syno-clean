@@ -34,13 +34,18 @@
 //!   the kind the task resolved to, since `recursive=true` on the wrong kind of
 //!   object removes something that is not this task's payload;
 //! * an **error** or an unattributable answer is never read as absence.
+//!
+//! Also here, but not part of a delete: [`volume_usage`], the storage band's
+//! `list_share` read — display-only, and the one call that bypasses
+//! [`SynoClient::call`] (see its doc).
 
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::api::client::{SynoClient, VersionRange};
+use crate::api::client::{SynoClient, VersionRange, parse_envelope};
 use crate::error::{Error, Result};
+use crate::model::VolumeUsage;
 
 /// Path lookup — used for the pre-delete existence check.
 pub const FS_LIST_API: &str = "SYNO.FileStation.List";
@@ -60,6 +65,9 @@ pub const FS_LIST_API: &str = "SYNO.FileStation.List";
 /// negotiating *down* to v1 is what breaks. Requiring v2 turns a NAS that
 /// somehow lacks it into a clear `ApiUnavailable` at startup instead of a 502
 /// mid-delete. DSM 7 always ships v2, which is the only DSM this tool targets.
+///
+/// `list_share`'s `additional` is likewise a JSON array on v2 only, so the
+/// storage read is a second caller that requires this pin.
 ///
 /// Note this is the opposite situation to
 /// [`crate::api::download_station::DS_TASK_SUPPORTED`], which is genuinely
@@ -86,6 +94,10 @@ pub const FS_DELETE_SUPPORTED: VersionRange = (2, 2);
 
 /// File Station's "no such file or directory".
 pub const FS_NO_SUCH_FILE: i32 = 408;
+
+/// File Station's "permission denied" — same number as Auth's 2FA 403, so any
+/// predicate must test the `api` alongside the code.
+pub const FS_PERMISSION_DENIED: i32 = 403;
 
 /// How often the delete task is asked whether it has finished.
 pub const DELETE_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -130,6 +142,14 @@ pub fn build_fs_delete_params(paths: &[String]) -> Vec<(&'static str, String)> {
 /// Query parameters for `SYNO.FileStation.Delete` `method=status`.
 pub fn build_fs_delete_status_params(taskid: &str) -> Vec<(&'static str, String)> {
     vec![("taskid", taskid.to_string())]
+}
+
+/// Query parameters for `list_share`: `volume_status` carries free/total,
+/// `real_path` is what makes shares dedupable per volume. `limit=0` ("all") is
+/// sent explicitly in case a build pages by default.
+fn build_list_share_params() -> Vec<(&'static str, String)> {
+    let additional = serde_json::Value::from(vec!["real_path", "volume_status"]).to_string();
+    vec![("additional", additional), ("limit", "0".to_string())]
 }
 
 // ---------------------------------------------------------------------------
@@ -351,10 +371,131 @@ async fn await_delete(client: &SynoClient, taskid: &str, timeout: Duration) -> R
     }
 }
 
+// ---------------------------------------------------------------------------
+// list_share — how full the volumes are
+// ---------------------------------------------------------------------------
+
+/// The `data` object of `SYNO.FileStation.List` `method=list_share`.
+#[derive(Debug, Deserialize)]
+struct ShareList {
+    #[serde(default)]
+    shares: Vec<Share>,
+}
+
+/// One share as `list_share` reports it. Sub-blocks are lenient so one odd
+/// share is skipped rather than failing the envelope; a non-object `shares`
+/// element still fails it, deliberately.
+#[derive(Debug, Deserialize)]
+struct Share {
+    #[serde(default, deserialize_with = "crate::model::de_lenient_opt")]
+    additional: Option<ShareAdditional>,
+}
+
+/// The `additional` block requested by [`build_list_share_params`].
+#[derive(Debug, Deserialize)]
+struct ShareAdditional {
+    /// The resolved path (`/volume1/downloads`); its mount point is the only
+    /// thing distinguishing one volume from another.
+    #[serde(default)]
+    real_path: Option<String>,
+    #[serde(default, deserialize_with = "crate::model::de_lenient_opt")]
+    volume_status: Option<VolumeStatus>,
+}
+
+/// Free and total bytes of the volume a share lives on. Sizes go through
+/// `model::de_u64` — DSM sends numbers as JSON numbers or strings per build.
+#[derive(Debug, Deserialize)]
+struct VolumeStatus {
+    #[serde(default, deserialize_with = "crate::model::de_u64")]
+    freespace: u64,
+    #[serde(default, deserialize_with = "crate::model::de_u64")]
+    totalspace: u64,
+}
+
+/// Collapse a `list_share` payload into one entry per volume, keyed on
+/// `real_path`'s mount point (shares on one volume repeat the same numbers).
+/// Shares with no usable `volume_status` or mount are skipped; sorted by name
+/// for a stable band order.
+fn collect_volume_usage(list: &ShareList) -> Vec<VolumeUsage> {
+    let mut volumes: Vec<VolumeUsage> = Vec::new();
+
+    for share in &list.shares {
+        let Some(additional) = share.additional.as_ref() else {
+            continue;
+        };
+        let Some(status) = additional.volume_status.as_ref() else {
+            continue;
+        };
+        if status.totalspace == 0 {
+            continue;
+        }
+        let Some(name) = additional.real_path.as_deref().and_then(mount_component) else {
+            continue;
+        };
+        if volumes.iter().any(|known| known.name == name) {
+            continue;
+        }
+        volumes.push(VolumeUsage {
+            name: name.to_string(),
+            total: status.totalspace,
+            free: status.freespace,
+        });
+    }
+
+    volumes.sort_by(|left, right| left.name.cmp(&right.name));
+    volumes
+}
+
+/// The mount point of an absolute DSM path. `volumeUSB*`/`volumeSATA*` mounts
+/// are two components (`/volumeUSB1/usbshare1-2`) — each partition is its own
+/// filesystem, so one component would merge distinct volumes. Deliberately not
+/// `delete`'s stricter mount test: this is only a label and dedupe key.
+fn mount_component(real_path: &str) -> Option<&str> {
+    let rest = real_path.strip_prefix('/')?;
+    let (first, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    if !first.starts_with("volume") {
+        return None;
+    }
+    let two_part = first.starts_with("volumeUSB") || first.starts_with("volumeSATA");
+    let second = tail.split('/').next().unwrap_or_default();
+    if two_part && !second.is_empty() {
+        return Some(&rest[..first.len() + 1 + second.len()]);
+    }
+    Some(first)
+}
+
+/// Ask the NAS how full its volumes are.
+///
+/// ⚠️ **Deliberately bypasses [`SynoClient::call`] — never "simplify" it back.**
+/// A 105 from `list_share` (common on a download-only account) would otherwise
+/// latch `permission_is_real` client-wide and kill the session retry for every
+/// API. On an expired session this read just fails; the task poller repairs the
+/// session and the next read succeeds.
+pub async fn volume_usage(client: &SynoClient) -> Result<Vec<VolumeUsage>> {
+    let endpoint = client.endpoint(FS_LIST_API, FS_LIST_SUPPORTED)?;
+    let params = build_list_share_params();
+    let body = client
+        .send(&endpoint, "list_share", &params, client.sid())
+        .await?;
+    let list: ShareList = parse_envelope(&body, FS_LIST_API)?;
+    let volumes = collect_volume_usage(&list);
+
+    // A success that attributes nothing looks identical to "never asked" on
+    // screen; this info! line is the whole diagnostic (log level is fixed).
+    if volumes.is_empty() {
+        tracing::info!(
+            shares_seen = list.shares.len(),
+            "the NAS answered the storage read but no volume could be attributed; \
+             the storage band stays hidden"
+        );
+    }
+
+    Ok(volumes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::client::parse_envelope;
     use crate::api::download_station::build_ds_id_params;
 
     fn paths(items: &[&str]) -> Vec<String> {

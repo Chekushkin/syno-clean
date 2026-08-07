@@ -38,6 +38,13 @@ pub const INFINITY: &str = "∞";
 /// only by measuring it rather than assuming it.
 pub const ELLIPSIS: &str = "…";
 
+/// The occupied run of a storage bar. Must stay one cell wide — see
+/// [`gauge_cells`].
+pub const GAUGE_FILLED: char = '█';
+
+/// The free run of a storage bar. One cell wide, like [`GAUGE_FILLED`].
+pub const GAUGE_EMPTY: char = '░';
+
 /// Binary size units, smallest first. `TiB` is the ceiling: a Download Station
 /// task larger than 1024 TiB is not a case worth a unit for.
 const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -123,12 +130,30 @@ pub fn duration(secs: Option<u64>) -> String {
 /// outside the range are clamped and a non-finite value reads as `0.0%`: a
 /// progress column is not the place to surface a NaN.
 pub fn percent(fraction: f64) -> String {
-    let fraction = if fraction.is_finite() {
+    format!("{:.1}%", clamp_fraction(fraction) * 100.0)
+}
+
+/// A `0.0..=1.0` fraction from whatever was handed over; non-finite reads as
+/// `0.0`. Shared by [`percent`] and [`gauge_cells`] so the bar and the digits
+/// beside it cannot disagree about an odd input.
+fn clamp_fraction(fraction: f64) -> f64 {
+    if fraction.is_finite() {
         fraction.clamp(0.0, 1.0)
     } else {
         0.0
-    };
-    format!("{:.1}%", fraction * 100.0)
+    }
+}
+
+/// How many of a `width`-cell `████░░░░` bar's cells are filled at `fraction`
+/// (a `0.0..=1.0` fraction, like [`percent`]). A count, not a rendered bar,
+/// because the caller colours the two runs separately.
+///
+/// **Both gauge glyphs must stay single-cell** — the caller lays out the line
+/// assuming the bar is exactly `width` cells, and a two-cell glyph would shear
+/// everything to its right.
+pub fn gauge_cells(fraction: f64, width: usize) -> usize {
+    let fraction = clamp_fraction(fraction);
+    ((fraction * width as f64).round() as usize).min(width)
 }
 
 /// A share ratio as `2.14`, or [`INFINITY`] when it is not a finite number.

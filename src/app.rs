@@ -27,7 +27,7 @@ use crate::api::download_station::DS_TASK_API;
 use crate::delete::{DeleteOptions, DeletePlan};
 use crate::error::Result;
 use crate::event::{AppEvent, ItemReport, OpKind, TaskOp, TaskRef};
-use crate::model::{Task, TaskList};
+use crate::model::{Task, TaskList, VolumeUsage};
 use crate::ui::{dialog, table};
 use crate::view::{self, View};
 
@@ -188,6 +188,9 @@ pub struct App {
     /// as a warning and, crucially, cleared automatically by the next
     /// successful refresh: the UI recovers on its own.
     pub error: Option<String>,
+    /// How full each volume is, as of the last successful storage read.
+    /// Empty means "none has succeeded yet" — the band's whole existence test.
+    pub storage: Vec<VolumeUsage>,
     /// How far `PageUp`/`PageDown` jump: the height of the table body, as of
     /// the last frame. See [`DEFAULT_PAGE_SIZE`].
     page_size: usize,
@@ -268,6 +271,7 @@ impl Default for App {
             connection: None,
             loaded: false,
             error: None,
+            storage: Vec::new(),
             page_size: DEFAULT_PAGE_SIZE,
             refresh_requested: false,
             search_backup: None,
@@ -397,6 +401,14 @@ impl App {
         match event {
             AppEvent::Tasks(tasks) => self.apply_tasks(tasks),
             AppEvent::Error(message) => self.set_error(message),
+            // Applied even in `Mode::Confirm` (unlike `Tasks`): storage is not
+            // part of the frozen delete snapshot. An empty read never retracts
+            // a band already drawn — a last known figure beats a hole.
+            AppEvent::Storage(volumes) => {
+                if !volumes.is_empty() {
+                    self.storage = volumes;
+                }
+            }
             AppEvent::OpProgress {
                 op,
                 done,

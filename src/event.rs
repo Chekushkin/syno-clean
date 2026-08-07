@@ -5,12 +5,15 @@
 //! network: a poll that takes ten seconds, or fails outright, costs a frame of
 //! staleness and a banner, never a frozen terminal.
 //!
-//! Two rules hold here:
+//! Three rules hold here:
 //!
-//! * **The poller is non-fatal.** A failed tick sends [`AppEvent::Error`] and
-//!   the loop keeps ticking; the next successful tick clears the banner. A poll
-//!   failure must never end the poller or the UI — a NAS that goes away for a
-//!   minute is ordinary.
+//! * **The poller is non-fatal.** A failed *task* tick sends [`AppEvent::Error`]
+//!   and the loop keeps ticking; the next successful tick clears the banner. A
+//!   poll failure must never end the poller or the UI — a NAS that goes away for
+//!   a minute is ordinary.
+//! * **The storage half of a tick reports nothing when it fails** — not even an
+//!   [`AppEvent::Error`]; only the task half owns the banner. See
+//!   [`poll_storage_once`].
 //! * **There is no `Tick` event.** The poller drives *data*; redraws are driven
 //!   by whatever arrives, so an idle program with an idle NAS still redraws
 //!   once per refresh interval and no more.
@@ -69,8 +72,8 @@ use crate::api::client::SynoClient;
 use crate::api::download_station;
 use crate::api::file_station::{self, PathInfo};
 use crate::delete::{self, DeleteItem, DeleteOptions, DeletePlan, ExpectedKind, Op, PayloadState};
-use crate::error::{Error, Result};
-use crate::model::Task;
+use crate::error::{Error, PERMISSION_DENIED_CODE, Result};
+use crate::model::{Task, VolumeUsage};
 
 /// How many events may queue before a sender has to wait.
 ///
@@ -129,6 +132,9 @@ pub enum AppEvent {
         /// see [`ItemReport`].
         item: ItemReport,
     },
+    /// How full the NAS's volumes are, for the storage band. Display only; a
+    /// failed read sends nothing at all — see [`poll_storage_once`].
+    Storage(Vec<VolumeUsage>),
     /// A whole operation finished — see [`spawn_delete`] and [`spawn_task_op`].
     OpDone {
         op: OpKind,
@@ -177,12 +183,84 @@ impl RefreshHandle {
     }
 }
 
+/// How often the poller may ask the NAS how full its volumes are. A much
+/// slower clock than the task list's — free space moves on the scale of a
+/// finished download, and per-tick reads would double the request rate.
+/// An explicit refresh (`r`) is not throttled by it.
+pub const STORAGE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The storage read's own clock, and its off switch.
+struct StorageSchedule {
+    /// When a read was last **attempted** — successful or not. `None` until
+    /// the first, so the poller's first tick fills the band in.
+    last_attempt: Option<Instant>,
+    /// Consecutive permission-shaped refusals.
+    refusals: u8,
+    given_up: bool,
+}
+
+/// Refusals it takes to stop asking for the rest of the run. Not one:
+/// [`file_station::volume_usage`] bypasses the re-login retry, so a 105 from a
+/// momentarily dead sid looks identical to a real refusal, and latching on the
+/// first would lose the band until restart for a session that had healed.
+const STORAGE_REFUSALS_BEFORE_GIVING_UP: u8 = 2;
+
+impl StorageSchedule {
+    fn new() -> Self {
+        StorageSchedule {
+            last_attempt: None,
+            refusals: 0,
+            given_up: false,
+        }
+    }
+
+    /// Whether this tick should read storage. `forced` (an explicit `r`) skips
+    /// the throttle but not the give-up latch.
+    fn due(&self, forced: bool) -> bool {
+        !self.given_up
+            && (forced
+                || self
+                    .last_attempt
+                    .is_none_or(|at| at.elapsed() >= STORAGE_INTERVAL))
+    }
+
+    /// Stamp the throttle — on every attempt, before its result is known.
+    fn attempted(&mut self) {
+        self.last_attempt = Some(Instant::now());
+    }
+
+    /// Record a permission-shaped refusal, and report whether that was the one
+    /// that stops the storage read for the rest of this run.
+    fn refused(&mut self) -> bool {
+        self.refusals = self.refusals.saturating_add(1);
+        self.given_up = self.refusals >= STORAGE_REFUSALS_BEFORE_GIVING_UP;
+        self.given_up
+    }
+
+    /// Stop asking outright — for a failure no retry can repair
+    /// ([`is_unavailable`]).
+    fn give_up(&mut self) {
+        self.given_up = true;
+    }
+
+    /// Any answer that is not a refusal resets the count — "consecutive" is
+    /// literal, so `105 → transport error → 105` does not latch.
+    fn not_refused(&mut self) {
+        self.refusals = 0;
+    }
+}
+
 /// Refresh the task list forever, reporting each result down `tx`.
 ///
 /// Ticks on `interval` — the first tick is immediate, so the table fills in as
 /// soon as the TUI starts — and in between whenever [`RefreshHandle::request`]
 /// is called. The task ends only when the receiver is dropped (the UI quit) or
 /// the handle is aborted; **a failed poll never ends it**.
+///
+/// The storage read rides on the same loop, on its own slower clock
+/// ([`STORAGE_INTERVAL`]) and after the task poll. An explicit refresh (`r`)
+/// reads storage too, throttle or not — it's the key pressed right after a
+/// delete, when the free-space figure is the point.
 pub fn spawn_poller(
     client: Arc<SynoClient>,
     interval: Duration,
@@ -194,18 +272,26 @@ pub fn spawn_poller(
         // A tick missed because a poll ran long should not be repaid with a
         // burst of back-to-back polls; the NAS only ever needs the newest list.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut storage = StorageSchedule::new();
 
         loop {
+            let mut forced = false;
             tokio::select! {
                 _ = ticker.tick() => {}
                 () = refresh.requested() => {
                     // Manual refresh restarts the clock, so `r` does not leave
                     // a scheduled tick a fraction of a second behind it.
                     ticker.reset();
+                    forced = true;
                 }
             }
 
             if !poll_once(&client, &tx).await {
+                tracing::debug!("the event channel closed; the poller is stopping");
+                return;
+            }
+
+            if storage.due(forced) && !poll_storage_once(&client, &tx, &mut storage).await {
                 tracing::debug!("the event channel closed; the poller is stopping");
                 return;
             }
@@ -226,6 +312,76 @@ async fn poll_once(client: &SynoClient, tx: &Sender) -> bool {
         }
     };
     tx.send(event).await.is_ok()
+}
+
+/// One storage read. Returns whether the channel is still open, like
+/// [`poll_once`] — but **reports nothing when it fails**: a cosmetic read must
+/// never raise the "NAS unreachable" banner or stamp on a real refresh error.
+///
+/// The throttle is stamped before the call, so a refusing NAS costs one request
+/// a minute, not one per tick. Permission refusals give up after
+/// [`STORAGE_REFUSALS_BEFORE_GIVING_UP`] in a row; a missing File Station gives
+/// up immediately; everything else is retried next [`STORAGE_INTERVAL`].
+async fn poll_storage_once(
+    client: &SynoClient,
+    tx: &Sender,
+    schedule: &mut StorageSchedule,
+) -> bool {
+    schedule.attempted();
+
+    match file_station::volume_usage(client).await {
+        Ok(volumes) => {
+            schedule.not_refused();
+            tx.send(AppEvent::Storage(volumes)).await.is_ok()
+        }
+        Err(err) => {
+            if is_unavailable(&err) {
+                schedule.give_up();
+                tracing::info!(
+                    %err,
+                    "this NAS does not offer the storage read; the storage band is disabled for this session"
+                );
+            } else if is_permission_refusal(&err) {
+                if schedule.refused() {
+                    // info!, because the log level is fixed at INFO.
+                    tracing::info!(
+                        %err,
+                        "the NAS refused the storage read again; the storage band is disabled for this session"
+                    );
+                } else {
+                    tracing::info!(
+                        %err,
+                        "the NAS refused the storage read; trying once more before giving up"
+                    );
+                }
+            } else {
+                schedule.not_refused();
+                tracing::warn!(%err, "reading the volumes' free space failed");
+            }
+            true
+        }
+    }
+}
+
+/// Whether a storage failure is a standing permission refusal.
+///
+/// ⚠️ The `api` is matched, not ignored: the DSM 400-range is API-specific, and
+/// testing the number alone would read an Auth 2FA 403 as a refusal and latch
+/// the band off for the session.
+fn is_permission_refusal(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Dsm { code, api }
+            if api == file_station::FS_LIST_API
+                && (*code == PERMISSION_DENIED_CODE
+                    || *code == file_station::FS_PERMISSION_DENIED)
+    )
+}
+
+/// Whether a storage failure can never succeed in this process: discovery runs
+/// once at startup, so a missing `SYNO.FileStation.List` stays missing.
+fn is_unavailable(err: &Error) -> bool {
+    matches!(err, Error::ApiUnavailable { .. })
 }
 
 // ---------------------------------------------------------------------------
