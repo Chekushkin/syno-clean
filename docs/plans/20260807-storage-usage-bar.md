@@ -431,22 +431,27 @@ above 90%. The line is emitted as a `Line` of spans, composed once.
 - Modify: `src/ui/mod.rs`
 - Modify: `src/main.rs`
 
-- [ ] **first**, confirm `Constraint::Length(0)` yields exactly zero rows in
+- [x] **first**, confirm `Constraint::Length(0)` yields exactly zero rows in
       ratatui 0.30's solver before building on it — the existing `ui::tests` are
       this feature's only regression net and they all run with an empty
       `App::storage`. Check `rendering_survives_a_terminal_too_small_for_the_layout`
       (`src/ui/mod.rs:1148`) in particular: it renders at 1x1, 1x3, 3x1 and 2x2,
       now with four constraints
-- [ ] add `STORAGE_GAUGE_WIDTH` (20) const
-- [ ] add pure `storage_line(volumes: &[VolumeUsage], width: usize) -> Line`
+      — **verified** with a throwaway probe (written, run, removed): on a 40x8
+      area the four constraints give `height 1 / 0 / 6 / 1`, against `1 / 1 / 5 /
+      1` for `Length(1)`, so the body absorbs the row exactly. At 1x1, 3x1 and
+      2x2 the solver hands back zero-height bands and does not panic; the
+      existing small-terminal test passes untouched
+- [x] add `STORAGE_GAUGE_WIDTH` (20) const
+- [x] add pure `storage_line(volumes: &[VolumeUsage], width: usize) -> Line`
       implementing the three-step degradation, measuring with
       `format::display_width` only
-- [ ] colour the filled run green / yellow / red at the 75% and 90% thresholds
-- [ ] widen `render`'s `Layout::vertical` to four bands — title `Length(1)`,
+- [x] colour the filled run green / yellow / red at the 75% and 90% thresholds
+- [x] widen `render`'s `Layout::vertical` to four bands — title `Length(1)`,
       storage `Length(u16::from(!app.storage.is_empty()))`, body `Min(1)`, footer
       `Length(1)` — render the band only when it has height, and update the
       "Three bands" doc comment
-- [ ] ⚠️ **thread the band's height into the page size.** `CHROME_ROWS = 3`
+- [x] ⚠️ **thread the band's height into the page size.** `CHROME_ROWS = 3`
       (`src/ui/mod.rs:77`) and `table_page_size` (`:143`) hardcode "title + table
       header + footer", and `main.rs:364` feeds `terminal.page_size()` into
       `App::set_page_size` after every draw with no access to `App::storage`.
@@ -454,9 +459,26 @@ above 90%. The line is emitted as a `Line` of spans, composed once.
       visible. Give `table_page_size` an `extra_chrome: u16` parameter (or an
       equivalent), pass `u16::from(!app.storage.is_empty())` from the call site,
       and update `CHROME_ROWS`' doc comment
-- [ ] confirm the modals still draw over `frame.area()` and are unaffected
-- [ ] full gate — the existing `ui::tests` must pass **unchanged**; if any fails,
+- [x] confirm the modals still draw over `frame.area()` and are unaffected
+- [x] full gate — the existing `ui::tests` must pass **unchanged**; if any fails,
       the band is taking a row it should not
+- ➕ the band's existence is a single named predicate, `ui::storage_band_height`,
+      read by **both** `render` (as the layout constraint) and
+      `TerminalGuard::page_size` (as chrome to subtract), so the frame and the
+      page size cannot disagree about whether the row is there. That is what
+      made `page_size` take `&App` rather than deriving from the terminal alone
+- ➕ the three-rung ladder is driven off **one** definition of the segment text
+      (`storage_spans`, measured by `spans_width`), so the width being measured
+      is by construction the width being drawn. Rung 3 drops the colour with it:
+      re-deriving where a truncation lands inside a styled bar is arithmetic
+      this feature has no tests for, and at that width the colour is the least
+      of what is missing. Documented at the function
+- ➕ the band's separator is a named const (`STORAGE_SEPARATOR`, three spaces)
+      rather than a `·`: the segments already contain brackets and spaces, and a
+      separator glyph beside a bar reads as part of the bar
+- ➕ `render` asks the *area's* height rather than the app a second time before
+      drawing into the band — on a terminal too short for the layout ratatui
+      hands back a zero-height band even when `App::storage` is populated
 
 ### Task 7: Verify acceptance criteria
 
