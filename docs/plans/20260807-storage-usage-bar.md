@@ -312,12 +312,12 @@ above 90%. The line is emitted as a `Line` of spans, composed once.
 **Files:**
 - Modify: `src/model.rs`
 
-- [ ] change `de_u64` from private to `pub(crate)`. **Leave `de_u32` and
+- [x] change `de_u64` from private to `pub(crate)`. **Leave `de_u32` and
       `de_i64_opt` alone** — widening a function with no consumer is a
       gratuitous diff
-- [ ] add a one-line doc note that this is the crate-wide answer to DSM sending
+- [x] add a one-line doc note that this is the crate-wide answer to DSM sending
       a number as a string, and is deliberately `pub(crate)` rather than `pub`
-- [ ] full gate. It passes as-is: `de_u64` already has callers inside `model.rs`,
+- [x] full gate. It passes as-is: `de_u64` already has callers inside `model.rs`,
       so widening it produces no `dead_code` warning
 
 ### Task 2: `list_share` call and the pure volume reader
