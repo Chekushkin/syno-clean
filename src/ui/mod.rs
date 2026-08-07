@@ -36,6 +36,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 
+use crate::api::file_station::VolumeUsage;
 use crate::app::{App, Mode};
 use crate::format;
 use crate::view::{StatusFilter, View};
@@ -72,9 +73,26 @@ pub const SEARCH_PROMPT: &str = "/";
 /// shown and hidden per mode.
 pub const SEARCH_CARET: &str = "█";
 
-/// Rows the frame spends on chrome: the title bar, the table header and the
-/// footer.
+/// Rows the frame spends on chrome that is **always** there: the title bar, the
+/// table header and the footer.
+///
+/// The storage band is deliberately *not* in this number — it exists only once a
+/// storage read has succeeded, so it is passed to [`table_page_size`] as
+/// `extra_chrome` by whoever can see [`App::storage`].
 const CHROME_ROWS: u16 = 3;
+
+/// Cells the storage bar's `████░░░░` body occupies, brackets excluded.
+///
+/// Wide enough that one segment step is about five percent — finer than that is
+/// detail the digits beside it already carry — and narrow enough that two or
+/// three volumes still fit on an eighty-column terminal.
+const STORAGE_GAUGE_WIDTH: usize = 20;
+
+/// Occupancy at which the filled run turns yellow: the volume is filling up.
+const STORAGE_WARN_FRACTION: f64 = 0.75;
+
+/// Occupancy at which the filled run turns red: a large download may not fit.
+const STORAGE_CRITICAL_FRACTION: f64 = 0.90;
 
 /// Owns the terminal for as long as the TUI is running.
 ///
@@ -131,17 +149,44 @@ impl TerminalGuard {
     /// The event loop feeds this to [`App::set_page_size`] after each draw, so
     /// a page is a screenful of the table rather than a fixed guess — and the
     /// app stays free of any dependency on the terminal.
-    pub fn page_size(&self) -> io::Result<usize> {
-        Ok(table_page_size(self.terminal.size()?.height))
+    ///
+    /// It takes the `App` because the storage band's height is *state*, not a
+    /// property of the terminal: the same window is one body row shorter once a
+    /// storage read has come back. Deriving the page size from the height alone
+    /// made every `PageDown` over-jump by exactly one row whenever the band was
+    /// visible, which is the kind of off-by-one nobody reports and everybody
+    /// notices.
+    pub fn page_size(&self, app: &App) -> io::Result<usize> {
+        Ok(table_page_size(
+            self.terminal.size()?.height,
+            storage_band_height(app),
+        ))
     }
 }
 
-/// Height of the table body inside a terminal `terminal_height` rows tall.
+/// Rows the storage band occupies: one when there is something to draw in it,
+/// zero otherwise.
+///
+/// The single definition of the band's existence, read by both [`render`] (as a
+/// layout constraint) and [`TerminalGuard::page_size`] (as chrome to subtract),
+/// so the frame and the page size cannot disagree about whether the row is
+/// there.
+pub fn storage_band_height(app: &App) -> u16 {
+    u16::from(!app.storage.is_empty())
+}
+
+/// Height of the table body inside a terminal `terminal_height` rows tall,
+/// given `extra_chrome` rows of optional bands above it.
 ///
 /// At least one row: a terminal too short for the chrome still has to let the
 /// user move.
-pub fn table_page_size(terminal_height: u16) -> usize {
-    usize::from(terminal_height.saturating_sub(CHROME_ROWS)).max(1)
+pub fn table_page_size(terminal_height: u16, extra_chrome: u16) -> usize {
+    usize::from(
+        terminal_height
+            .saturating_sub(CHROME_ROWS)
+            .saturating_sub(extra_chrome),
+    )
+    .max(1)
 }
 
 impl Drop for TerminalGuard {
@@ -189,17 +234,25 @@ pub fn install_panic_hook() {
 
 /// Draw the whole frame. A pure function of `&App`.
 ///
-/// Three bands: a one-line title bar, the body, and a one-line footer. The body
-/// is the task table, or a message when there is nothing to put in it — the
-/// table draws its own header row, so an empty table would be a header over
-/// blank space with no explanation.
+/// Four bands: a one-line title bar, the **storage band**, the body, and a
+/// one-line footer. The body is the task table, or a message when there is
+/// nothing to put in it — the table draws its own header row, so an empty table
+/// would be a header over blank space with no explanation.
 ///
-/// A modal is drawn **last, over everything**, so the table it describes is
+/// The storage band is `Length(0)` — genuinely zero rows, not a blank one —
+/// until a storage read has succeeded ([`storage_band_height`]). A NAS whose
+/// account cannot list shares, and `--fixture`, which has no client at all,
+/// therefore render exactly the frame they did before the band existed: no
+/// empty gutter, and no layout shift to explain.
+///
+/// A modal is drawn **last, over `frame.area()`**, so the table it describes is
 /// still visible around it but nothing can be mistaken for the dialog's own
-/// content.
+/// content. The modals are unaffected by the band for that reason — they are
+/// centred in the whole frame rather than in the body band.
 pub fn render(frame: &mut Frame, app: &App) {
-    let [header, body, footer] = Layout::vertical([
+    let [header, storage, body, footer] = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(storage_band_height(app)),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
@@ -210,6 +263,15 @@ pub fn render(frame: &mut Frame, app: &App) {
     // ask the same question.
     let visible = app.visible();
     render_title_bar(frame, app, header, visible.len());
+    // Asking the *area* rather than the app again: on a terminal too short for
+    // the layout ratatui hands back a zero-height band even when the app has
+    // storage to show, and drawing into it would be a wasted widget.
+    if storage.height > 0 {
+        frame.render_widget(
+            Paragraph::new(storage_line(&app.storage, usize::from(storage.width))),
+            storage,
+        );
+    }
     if visible.is_empty() {
         frame.render_widget(empty_state(app), body);
     } else {
@@ -282,6 +344,116 @@ fn render_title_bar(
             .right_aligned(),
         right,
     );
+}
+
+/// What separates one volume's segment from the next.
+///
+/// Three spaces rather than a `·`: the segments already contain spaces and
+/// brackets, and a separator glyph beside a bar reads as part of the bar.
+const STORAGE_SEPARATOR: &str = "   ";
+
+/// The storage band's contents: one segment per volume. **Pure.**
+///
+/// Split out from the drawing for the same reason
+/// [`dialog::build_confirmation`] is: the width arithmetic and the degradation
+/// ladder are the part that can be wrong, and keeping them in a function that
+/// takes a width and returns a [`Line`] leaves [`render`] a pure function of
+/// `&App` with nothing to assert about.
+///
+/// A segment reads `volume1 [████░░░░] 78.0%  3.1 TiB free of 14.0 TiB`. The
+/// line is one row and never wraps, so on a narrow terminal it degrades in
+/// exactly **three** steps — deliberately short, because this arithmetic ships
+/// without tests and every rung is another thing to get wrong:
+///
+/// 1. the full form;
+/// 2. every segment loses its ` free of {total}` tail, keeping the name, the
+///    bar and the percentage — the part that answers "am I nearly full?"
+///    without reading digits, which is the whole point of the band;
+/// 3. the whole line through [`format::truncate_ellipsis`], so it is visibly
+///    incomplete rather than silently sheared.
+///
+/// Step 3 drops the colour with it: composing a truncation across styled spans
+/// means re-deriving where the cut lands inside the bar, and at a width that
+/// cannot hold `name [bar] pct` the colour is the least of what is missing.
+///
+/// Every measurement here is [`format::display_width`] — never `str::len` —
+/// because a volume name is a share name and DSM lets those be CJK.
+pub fn storage_line(volumes: &[VolumeUsage], width: usize) -> Line<'static> {
+    // The ladder, rung by rung. Both rungs are built from one definition of
+    // the segment text, so the width being measured is the width being drawn.
+    for with_tail in [true, false] {
+        let spans = storage_spans(volumes, with_tail);
+        if spans_width(&spans) <= width {
+            return Line::from(spans);
+        }
+    }
+
+    let spans = storage_spans(volumes, false);
+    let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+    Line::from(format::truncate_ellipsis(&text, width))
+}
+
+/// The band as styled spans, with or without each segment's size tail.
+///
+/// The bar arrives from [`format::gauge`] as one string and is split into its
+/// filled and free runs here, so **only the occupied part carries colour**. A
+/// fully coloured bar would say "red" about a volume that is mostly free.
+fn storage_spans(volumes: &[VolumeUsage], with_tail: bool) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for volume in volumes {
+        if !spans.is_empty() {
+            spans.push(Span::raw(STORAGE_SEPARATOR));
+        }
+
+        let fraction = volume.fraction();
+        let bar = format::gauge(fraction, STORAGE_GAUGE_WIDTH);
+        // The filled run is a prefix of the bar by construction, so its byte
+        // length is where the two runs part. `len_utf8` rather than a character
+        // count: this is a byte index into `bar`, not a width.
+        let filled_bytes: usize = bar
+            .chars()
+            .take_while(|glyph| *glyph == format::GAUGE_FILLED)
+            .map(char::len_utf8)
+            .sum();
+        let (filled, free) = bar.split_at(filled_bytes);
+
+        spans.push(Span::raw(format!("{} [", volume.name)));
+        spans.push(Span::styled(
+            filled.to_string(),
+            Style::default().fg(storage_colour(fraction)),
+        ));
+        spans.push(Span::raw(free.to_string()));
+        spans.push(Span::raw(format!("] {}", format::percent(fraction))));
+
+        if with_tail {
+            spans.push(Span::raw(format!(
+                "  {} free of {}",
+                format::bytes(volume.free),
+                format::bytes(volume.total)
+            )));
+        }
+    }
+    spans
+}
+
+/// Terminal cells a run of spans will occupy once drawn.
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|span| format::display_width(span.content.as_ref()))
+        .sum()
+}
+
+/// The filled run's colour, so "almost full" is legible without reading digits
+/// — which is the reason the band exists at all rather than a line of numbers.
+fn storage_colour(fraction: f64) -> Color {
+    if fraction >= STORAGE_CRITICAL_FRACTION {
+        Color::Red
+    } else if fraction >= STORAGE_WARN_FRACTION {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
 }
 
 /// The body when the table has no rows to show.
@@ -672,7 +844,7 @@ mod tests {
         //
         // Twelve rows is nine body rows for fourteen tasks.
         let mut app = App::new(fixture_tasks());
-        let height = table_page_size(12);
+        let height = table_page_size(12, storage_band_height(&app));
         assert_eq!(height, 9);
         app.set_page_size(height);
 
