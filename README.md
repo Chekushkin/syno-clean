@@ -36,7 +36,8 @@ Nothing is installed on the NAS: it is a plain HTTP client for the documented DS
 > (`tests/fixtures/task_list.json`) into an in-memory buffer, with the top two rows
 > selected — the same `ratatui` `TestBackend` path the layout tests use. Colour and the
 > cursor highlight are lost in plain text; everything else is exactly what the terminal
-> gets, footer hints and all.
+> gets, footer hints and all. The storage bar is missing for the same reason it is
+> missing under `--fixture`: there is no NAS to ask, so the band takes no rows at all.
 >
 > ⚠️ **A real terminal screenshot (or an asciinema recording) against a live NAS is
 > still outstanding and must be added before v0.1.0 is published.** The fixture behind
@@ -52,6 +53,9 @@ Nothing is installed on the NAS: it is a plain HTTP client for the documented DS
   about to go, with the total it will free — then deletes the files *and* the task.
 - Sort by eight keys, filter by status, live substring search over titles.
 - Live auto-refresh in the background; the UI never blocks on the network.
+- A one-line storage bar above the table showing how full each volume is, so you can
+  see whether reclaiming space worked. It refreshes on its own slower clock and is
+  simply absent — no gap, no error — on a NAS or account that will not report it.
 - Pause (`p`) and resume (`u`) the selection.
 - Correct column alignment for CJK and emoji titles (display width, not character
   count).

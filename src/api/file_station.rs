@@ -67,6 +67,12 @@ pub const FS_LIST_API: &str = "SYNO.FileStation.List";
 /// somehow lacks it into a clear `ApiUnavailable` at startup instead of a 502
 /// mid-delete. DSM 7 always ships v2, which is the only DSM this tool targets.
 ///
+/// [`build_list_share_params`] then *strengthens* the same pin rather than
+/// merely riding on it: `list_share`'s `additional` is a JSON array on v2 and a
+/// comma-separated list on v1, so the storage read is a second call on this API
+/// whose encoding v1 would also misread. Two callers now depend on v2, and the
+/// pin has two reasons to stay where it is.
+///
 /// Note this is the opposite situation to
 /// [`crate::api::download_station::DS_TASK_SUPPORTED`], which is genuinely
 /// pinned *down* to v1 because v2/v3 change the response shape `model.rs`

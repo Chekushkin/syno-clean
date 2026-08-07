@@ -814,6 +814,96 @@ deleted.
 - Cursor movement **clamps and never wraps** — a `j` held at the bottom of a long
   list wrapping to the top is how the wrong row gets deleted.
 
+### The storage band (`ui::storage_line`, `event::poll_storage_once`)
+
+A one-row band between the title bar and the table, one segment per volume:
+`volume1 [████░░░░] 78.0%  3.1 TiB free of 14.0 TiB`. It is display-only — this
+tool exists to reclaim space and had no way to show whether that worked.
+
+- **The numbers come from `SYNO.FileStation.List` `list_share`, not
+  `SYNO.Core.Storage.Volume`.** `SYNO.Core.Storage.*` is admin-gated on a normal
+  DSM setup, and the account this tool is pointed at is frequently a restricted
+  download-only user, which would get a permission error and no bar. `list_share`
+  is also an API the program **already discovers and already version-pins**, so
+  it adds no startup surface and no second version negotiation. `volume_status`
+  reports the free/total pair per *share*; `real_path`'s first component is the
+  mount point, and deduping on it is the only thing that stops one volume being
+  drawn once per share (`file_station::collect_volume_usage`). A share with no
+  `real_path` that looks like a mount is **skipped**, never given a synthetic
+  key — merging two genuine volumes under a name DSM never sent is worse than
+  showing nothing.
+- ⚠️ **The storage read deliberately bypasses `SynoClient::call`, and must never
+  be "simplified" back onto it.** `call` treats DSM 105 as a possibly-stale
+  session: it discards the sid, re-logs-in, and if 105 survives the fresh session
+  it latches `permission_is_real` **client-wide, not per API** — which then
+  disables the 105 retry for `SYNO.DownloadStation.Task` too. A download-only
+  account is exactly the kind that answers 105 to `list_share`, so routing this
+  cosmetic read through `call` would force a re-login on the first storage poll
+  and then leave a genuinely stale Download Station session unrepairable,
+  reinstating the failure commit `5507247` exists to fix (every poll failing
+  until `session.json` is deleted by hand). `file_station::volume_usage`
+  therefore uses the no-retry escape hatch — `client.endpoint` + `client.send` +
+  `parse_envelope`. The cost is that a storage read against an expired session
+  just fails; the *task* poller repairs the session and the next storage read
+  succeeds.
+- **Its clock is separate from `refresh_secs`.** `event::STORAGE_INTERVAL` is
+  60 s against a 3 s default task poll: free space moves on the scale of a
+  finished download, and nobody is waiting on it the way they wait on a task's
+  progress. The throttle is stamped on **every attempt, before the result is
+  known**, so a failure costs the same as a success — stamping only on success
+  would give a refusing NAS one request and one `warn!` line every three seconds
+  for the whole session, a request storm and a flooded log in the name of a
+  feature whose justification is that it is cheap. A permission-shaped refusal
+  (105 or 403, `event::is_permission_refusal`) **latches the read off for the
+  rest of the run** with one `info!` line: that answer is not going to change.
+  The read runs inline in the poller loop *after* `poll_once`, so a slow
+  `list_share` can delay the next task tick by up to the request timeout, at
+  worst once a minute — accepted, because a detached task per read is more
+  machinery than a cosmetic number deserves and the symptom is a visibly stale
+  table rather than anything silent.
+- **A failed storage read is silent — it sends nothing, and must never send
+  `AppEvent::Error`.** That banner means "the NAS is unreachable", it is cleared
+  by the next successful *task* poll, and letting a display read raise it would
+  both lie and stamp on a real refresh error the user needs to see. The band
+  stays as it was, or absent.
+- **`App::storage` being empty is the band's entire existence test**, and the
+  band is `Constraint::Length(0)` — genuinely zero rows, not a blank one — while
+  it is. A NAS that refuses the call, a NAS not yet asked, and `--fixture` (no
+  client at all, so no poller) therefore render exactly the frame they did before
+  the band existed: no empty gutter and no layout shift to explain, which is also
+  what lets the existing `ui::tests` stand unchanged. There is deliberately no
+  companion "asked and failed" flag — a silent failure has nothing to say, and a
+  second existence test could contradict the first. `AppEvent::Storage` is
+  applied even in `Mode::Confirm`, unlike `AppEvent::Tasks`: it is not part of
+  the frozen delete snapshot and cannot make it stale.
+- ⚠️ **The band's height is threaded into the page size.** `CHROME_ROWS` counts
+  only the *always* present chrome (title, table header, footer);
+  `ui::storage_band_height(&App)` is the single definition of the optional row,
+  read by both `render` (as the layout constraint) and `TerminalGuard::page_size`
+  (as chrome to subtract, which is why it takes `&App` rather than deriving from
+  the terminal alone). Fold the band back into `CHROME_ROWS`, or drop the
+  argument to `table_page_size`, and every `PageDown` over-jumps by exactly one
+  row whenever the band is visible.
+- `ui::storage_line` is **pure** — same split as `dialog::build_confirmation` vs
+  `render_confirm` — and degrades in exactly **three** rungs: full form, then
+  every segment loses its ` free of {total}` tail, then the whole line through
+  `format::truncate_ellipsis`. Short on purpose: this width arithmetic ships
+  without tests, and every rung is another thing to get wrong. Both rungs are
+  built from one definition of the segment text (`storage_spans`, measured by
+  `spans_width`), so the width measured is by construction the width drawn. Rung
+  3 drops the colour with it — re-deriving where a cut lands inside a styled bar
+  is arithmetic with no test behind it. Colour is on the **filled run only**
+  (green / yellow at 75% / red at 90%), because a fully coloured bar says "red"
+  about a mostly-empty volume.
+- `format::gauge`'s two glyphs are named consts (`format::GAUGE_FILLED` /
+  `GAUGE_EMPTY`) so the rule that they are **single-cell** has one documented
+  home rather than being a literal buried in the function. It is the same
+  property `table::SELECTED_MARKER` has and for the same reason — a two-cell
+  glyph makes the bar wider than the width it was asked for and shears
+  everything to its right — but unlike that marker nothing *asserts* it here,
+  because this feature ships without tests. Substituting a glyph is therefore a
+  change to make on the strength of the doc comment, not of a green suite.
+
 ### The delete confirmation (`ui::dialog`, `App::begin_delete`)
 
 - **`d` never deletes.** It snapshots (`DeletePlan::snapshot`) the target and
@@ -1062,6 +1152,17 @@ Real, deliberate, and none of them a regression:
   remains unexercised is listed under Post-Completion in the plan.
 - ⚠️ **The README's terminal frame is a `TestBackend` rendering of the fixture,
   not a screenshot.** A real capture is still owed before publishing.
+- ⚠️ **The storage band ships without tests, by explicit request**, and its wire
+  shape is **unverified against a real NAS**: `list_share`'s `volume_status`
+  block (`freespace` / `totalspace` / `readonly`) and the `real_path` spelling
+  come from the documented API, not from a capture, and nothing in the fixture
+  covers them. Everything downstream is written to skip rather than guess — a
+  share with no `volume_status`, a zero `totalspace`, or a `real_path` that does
+  not name a mount is dropped by `collect_volume_usage`, so a wrong field name
+  costs the band and nothing else. The waiver is defensible only because the
+  feature is read-only display; the rule it must never be allowed to weaken is
+  the `SynoClient::call` bypass above, which is the one way a cosmetic read could
+  reach the delete path. Re-read that rule before changing anything here.
 - **The repository is `https://github.com/Chekushkin/syno-clean`** — settled, no
   longer a placeholder. It appears in `Cargo.toml`, `README.md`,
   `CONTRIBUTING.md` and `CHANGELOG.md`; keep those four in step.

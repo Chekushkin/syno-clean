@@ -482,39 +482,97 @@ above 90%. The line is emitted as a `Line` of spans, composed once.
 
 ### Task 7: Verify acceptance criteria
 
-- [ ] band is absent with an empty `App::storage` (default, `--fixture`, and a
-      NAS whose account cannot list shares)
-- [ ] `git diff` shows **no change** to `src/api/client.rs`, `src/delete.rs`, or
-      any op ordering, and `volume_usage` does not call `client.call`
-- [ ] a failed storage read never raises the error banner and never clears a
-      real one
-- [ ] with the band visible, `PageDown` then `PageUp` returns the cursor to the
-      row it started on
-- [ ] no `str::len` or `chars().count()` used for any width in the new code
-- [ ] no new dependency in `Cargo.toml`; no direct `crossterm`
-- [ ] full gate one final time
+- [x] band is absent with an empty `App::storage` (default, `--fixture`, and a
+      NAS whose account cannot list shares) — **verified by throwaway probe**
+      (written, run, removed; the file is byte-identical to the previous commit
+      afterwards). With `App::storage` empty the rendered frame contains neither
+      `GAUGE_FILLED` nor `GAUGE_EMPTY` anywhere and the table header sits on row
+      1 directly under the title bar; populating it moves rows 2..18 down by
+      exactly one with the footer still pinned to the last row — a shift, never a
+      loss. `--fixture` is covered structurally as well: `main::run_fixture`
+      spawns no poller at all (`run_tui(..., None, None)`), so no `Storage` event
+      can reach it. A refusing NAS is covered by `poll_storage_once`'s `Err` arm,
+      which sends nothing
+- [x] `git diff` shows **no change** to `src/api/client.rs`, `src/delete.rs`, or
+      any op ordering, and `volume_usage` does not call `client.call` —
+      `git diff --stat main...HEAD` lists neither file. In `src/event.rs` every
+      hunk ends by line ~365, well above `spawn_delete` (471),
+      `decide_file_phase` (784), `decide_confirm_phase` (1193),
+      `pause_and_confirm` (1292) and `spawn_task_op` (1400), so the ordering is
+      untouched. `volume_usage` is `client.endpoint(…)` + `client.send(…,
+      client.sid())` + `parse_envelope`, with no `client.call` anywhere in the
+      new code — the `permission_is_real` latch is unreachable from it
+- [x] a failed storage read never raises the error banner and never clears a
+      real one — **verified statically.** `App::error` is written in exactly two
+      places, `set_error` and `clear_error`; `set_error`'s only non-test caller is
+      the `AppEvent::Error` arm and `clear_error`'s only non-test caller is the
+      tail of `apply_tasks`. `poll_storage_once` emits `AppEvent::Storage` on
+      success and *nothing at all* on failure, and the `AppEvent::Storage` arm is
+      `self.storage = volumes` and touches neither field. So a failed storage read
+      cannot raise the banner (it sends no event) and cannot clear one (the only
+      event it can ever send does not clear it)
+- [x] with the band visible, `PageDown` then `PageUp` returns the cursor to the
+      row it started on — **verified by throwaway probe**, from every start row of
+      the fixture list at a 12-row terminal (`table_page_size(12, 1) == 8`), the
+      bottom-clamp rows excepted, which cannot round-trip by design and do so
+      identically with the band absent. A second probe pinned the underlying
+      cause: at terminal heights 8, 12, 20 and 24 with the band visible,
+      `table_page_size(height, storage_band_height(&app))` equals the row count
+      the table body actually draws, exactly. `CHROME_ROWS` (3) + the band is the
+      same arithmetic the layout performs, and `storage_band_height` is the one
+      definition both read
+- [x] no `str::len` or `chars().count()` used for any width in the new code —
+      grepping every added line for `.len()` and `chars().count()` returns
+      nothing. The only length-like call is `char::len_utf8`, used to find the
+      **byte** index where the bar's filled run ends so it can be split into two
+      spans, and to size a `String::with_capacity`; neither is a width. All width
+      measurement goes through `format::display_width` / `truncate_ellipsis`
+- [x] no new dependency in `Cargo.toml`; no direct `crossterm` — `Cargo.toml` and
+      `Cargo.lock` have **no diff at all** against `main`, and no added line
+      anywhere in `src/` mentions `crossterm`
+- [x] full gate one final time — `cargo fmt --all && cargo build && cargo clippy
+      --all-targets -- -D warnings && cargo test` all clean: **636 tests pass**
+      (629 lib + 7 bin), and the branch adds **zero** `#[test]` items, so the
+      existing suite is passing untouched as the waiver requires
+- ➕ one further probe, beyond the listed criteria, because the degradation
+      ladder is the untested width arithmetic this feature leans on:
+      `storage_line` was exercised at **every** width from 0 to 200 for one, two
+      and three volumes (including a CJK volume name) and never once exceeded the
+      width it was given. Also removed with the rest of the probes
 
 ### Task 8: [Final] Update documentation
 
-- [ ] add a short subsection to `CLAUDE.md` under UI conventions covering: why
+- [x] add a short subsection to `CLAUDE.md` under UI conventions covering: why
       `list_share` over `SYNO.Core.Storage.Volume` (no admin needed); **why the
       storage read bypasses `SynoClient::call`** (the client-wide
       `permission_is_real` latch, and the DSM-105 regression that reinstating it
       would cause); why the cadence is separate from `refresh_secs` and throttles
       failures too; why a storage failure is silent rather than an
       `AppEvent::Error`; and why the band has zero height when empty
-- [ ] extend the `FS_LIST_SUPPORTED` doc comment: `list_share`'s `additional` is
+- [x] extend the `FS_LIST_SUPPORTED` doc comment: `list_share`'s `additional` is
       a JSON array on v2 and comma-separated on v1, so the new call *strengthens*
       the existing v2 pin rather than merely borrowing it — the comment is
       currently phrased entirely in terms of `build_fs_path_params`
-- [ ] note in `CLAUDE.md`'s known-gaps section that the `list_share`
+- [x] note in `CLAUDE.md`'s known-gaps section that the `list_share`
       `volume_status` shape is **unverified against a real NAS** until the manual
       pass below confirms it, and that this feature ships without tests by
       explicit request
-- [ ] update `README.md` if it describes the screen layout (its terminal frame is
+- [x] update `README.md` if it describes the screen layout (its terminal frame is
       a `TestBackend` rendering of the fixture, which has no storage, so the frame
-      itself needs no change — check before editing)
-- [ ] move this plan to `docs/plans/completed/`
+      itself needs no change — check before editing) — the frame is indeed
+      unchanged; what was added is one Features bullet and one clause on the
+      frame's caveat block, which claims "everything else is exactly what the
+      terminal gets" and would otherwise leave a reader wondering where the band
+      went
+- [x] deferred — plan stays in place until the /planning:exec review phases finish
+- ➕ the new `CLAUDE.md` subsection is `### The storage band` under **UI and
+      state conventions**, placed after the task table and before the delete
+      confirmation. The contents list at the top of `CLAUDE.md` indexes only `##`
+      headings, so it needed no entry
+- ➕ the known-gaps entry deliberately records *both* halves — the unverified
+      wire shape **and** the no-tests waiver — in one bullet, ending by pointing
+      back at the `SynoClient::call` bypass as the one rule that makes the waiver
+      safe. Splitting them into two bullets separated that dependency
 
 ## Post-Completion
 
