@@ -1,18 +1,13 @@
+<!-- claudish-to-english:rewritten -->
+
 # syno-clean
 
-A terminal UI for reviewing and cleaning up **Synology Download Station** tasks — one
-that deletes the downloaded **files** along with the DSM task.
+A terminal tool to view and clean up **Synology Download Station** tasks. It deletes the downloaded **files** and the DSM task at the same time.
 
-DSM's web Download Station is slow to load and awkward for bulk work, and deleting a
-task there leaves the payload sitting on the volume. Reclaiming the space means a
-second trip through File Station to hunt down each directory by hand. `syno-clean`
-lists every task in a sortable, filterable table, lets you multi-select with the
-keyboard, and removes both halves in one confirmed step.
-
-Nothing is installed on the NAS: it is a plain HTTP client for the documented DSM API.
+In DSM's web UI, deleting a task leaves the files on your drive. You have to go to File Station to delete them manually. `syno-clean` shows all tasks in a table. You can sort, filter, and select many tasks at once. It removes both the files and the task in one step. It does not install anything on your NAS. It just talks to the DSM API using HTTP.
 
 ```text
- syno-clean 0.1.0 · eduard@nas.local:5001                                                               14 / 14 tasks
+ syno-clean 0.1.0 · demo@nas.local:5001                                                                 14 / 14 tasks
   Name▲        Status            Size  Progress      ↓ Speed      ↑ Speed  Ratio Seeds/Peers      ETA Destination
 ✓ Absolute.De… finished     256.0 MiB    100.0%            —            —   1.00           —        ∞ /volume1/downlo…
 ✓ archlinux-2… finished       1.1 GiB    100.0%            —            —   0.50           —        ∞ downloads
@@ -31,480 +26,84 @@ Nothing is installed on the NAS: it is a plain HTTP client for the documented DS
  2 selected · 1.3 GiB · sort Name▲ · d delete · p/u pause/resume · r refresh · q quit · ? help
 ```
 
-> This is **not a photograph of a live session**. It is the program's own renderer
-> drawing one 118x19 frame from the checked-in test fixture
-> (`tests/fixtures/task_list.json`) into an in-memory buffer, with the top two rows
-> selected — the same `ratatui` `TestBackend` path the layout tests use. Colour and the
-> cursor highlight are lost in plain text; everything else is exactly what the terminal
-> gets, footer hints and all. The storage bar is missing for the same reason it is
-> missing under `--fixture`: there is no NAS to ask, so the band takes no rows at all.
->
-> ⚠️ **A real terminal screenshot (or an asciinema recording) against a live NAS is
-> still outstanding and must be added before v0.1.0 is published.** The fixture behind
-> this frame takes its wire shape from a real DSM 7 capture and its titles from
-> nowhere — see [Contributing](CONTRIBUTING.md).
+> This is not a screenshot. The program draws this frame itself using a test file (`tests/fixtures/task_list.json`). Colors and the cursor highlight are not shown in plain text, but everything else is exactly what the terminal sees.
 
 ## Features
 
-- Every Download Station task in one table: name, status, size, progress, download and
-  upload speed, ratio, seeds/peers, ETA and destination.
-- Arrow/vim navigation, `Space` multi-select, `a` select-all-visible.
-- `d` → a confirmation listing exactly which tasks and which resolved on-disk paths are
-  about to go, with the total it will free — then deletes the files *and* the task.
-- Sort by eight keys, filter by status, live substring search over titles.
-- Live auto-refresh in the background; the UI never blocks on the network.
-- A one-line storage bar above the table showing how full each volume is, so you can
-  see whether reclaiming space worked. It refreshes on its own slower clock and is
-  simply absent — no gap, no error — on a NAS or account that will not report it.
-- Pause (`p`) and resume (`u`) the selection.
-- Correct column alignment for CJK and emoji titles (display width, not character
-  count).
+- Shows every task in one table: name, status, size, progress, speeds, ratio, seeds/peers, ETA, and destination. It aligns columns correctly for CJK characters and emojis.
+- Use arrow keys or Vim keys to move. Use `Space` to select many tasks. Use `a` to select all visible tasks. There are eight sort keys, status filters, and a search tool.
+- Press `d` to see a list of tasks and file paths that will be deleted. It shows how much space you will save. Then it deletes the files and the task.
+- Pause (`p`) and resume (`u`) tasks. The UI updates in the background. It shows a storage bar for each volume so you can see saved space.
 
-## ⚠️ `d` deletes files, and it is irreversible
+## ⚠️ `d` deletes files, and you cannot undo it
 
-Pressing `d` and confirming removes the task's directory **recursively** from the NAS
-volume through File Station, and then removes the Download Station task. There is no
-undo in this program and no prompt beyond the one confirmation dialog.
+When you confirm a delete, the program removes the task's folder and everything inside it via File Station. Then it removes the Download Station task. You cannot undo this.
 
-Two things to know before the first real run:
-
-- **Try `--dry-run` first.** It walks the same flow and shows the same list of tasks
-  and resolved paths, but the dialog is labelled as a dry run — `DRY RUN · ` in the
-  title, a yellow border instead of a red one, and "Dry run: nothing is deleted"
-  instead of "This cannot be undone" — and it issues no destructive call at all, not
-  even the existence check.
-- **If the share has the DSM Recycle Bin enabled, deleted data may land in `#recycle`
-  and free no space.** That is a DSM setting this program does not control. Check the
-  share's settings if a delete does not reclaim what you expected.
-
-The safety model is described in [Delete safety model](#delete-safety-model) below.
+- **Try `--dry-run` first.** It shows the same dialog (labeled `DRY RUN`) but does not actually delete anything.
+- If your DSM share has the **DSM Recycle Bin** turned on, deleted files might go to the `#recycle` folder. This means they won't free up space. This is a DSM setting that this program cannot change.
 
 ## Requirements
 
-- **DSM 7.** DSM 6 is not supported.
-- **Download Station** installed and enabled, and a DSM account with permission to use
-  it. The program uses the documented v1 `SYNO.DownloadStation.Task` API for all four
-  operations (list, delete, pause, resume).
-- **File Station** installed, and the same account permitted to browse and delete in
-  the download share — this is what actually removes the files
-  (`SYNO.FileStation.List` and `SYNO.FileStation.Delete`). Without it the tasks are
-  still listed, but a delete will fail at the file phase and deliberately leave the
-  task in place rather than orphan the data.
-- API versions are negotiated, not assumed: `SYNO.API.Info` is queried at startup and
-  each call uses the newest version inside the range both the NAS and this client
-  support. The one deliberate pin is `SYNO.DownloadStation.Task`, held at **v1**
-  because the newer `DownloadStation2` shape is undocumented and encodes statuses
-  differently.
+**DSM 7** is required (DSM 6 does not work). You must have **Download Station** and **File Station** installed. Your DSM account must be allowed to use both. If you don't have File Station, you can see the tasks, but deleting will fail. The program will leave the task alone instead of leaving the files behind. It checks the API version when it starts.
 
 ## Install
 
-### From source
-
-Requires the Rust toolchain pinned in `rust-toolchain.toml` (rustup installs it
-automatically):
+You can find prebuilt files for macOS and Linux (x86_64 and aarch64) in the [releases](https://github.com/Chekushkin/syno-clean/releases). Use the `SHA256SUMS` file to check them. Unpack the file and put `syno-clean` in your `PATH`. Or build it yourself:
 
 ```sh
 git clone https://github.com/Chekushkin/syno-clean
 cd syno-clean
 cargo build --release
-# the binary is at target/release/syno-clean
 install -m 0755 target/release/syno-clean ~/.local/bin/
 ```
-
-### From a release binary
-
-Prebuilt archives are attached to each tagged release for
-`x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu` and
-`aarch64-unknown-linux-gnu`:
-
-```sh
-VERSION=0.1.0
-TARGET=aarch64-apple-darwin
-curl -fsSLO "https://github.com/Chekushkin/syno-clean/releases/download/v${VERSION}/syno-clean-${VERSION}-${TARGET}.tar.gz"
-tar xzf "syno-clean-${VERSION}-${TARGET}.tar.gz"
-install -m 0755 "syno-clean-${VERSION}-${TARGET}/syno-clean" ~/.local/bin/
-```
-
-Each archive unpacks into a directory of its own name holding the binary plus
-`README.md`, `LICENSE` and `CHANGELOG.md`.
-
-A single `SHA256SUMS` file covering every archive is attached to the same release, and
-its contents are repeated in the release notes.
 
 ## Quick start
 
 ```sh
-# no config file needed — flags are enough
-syno-clean --host nas.local --user eduard
-
-# look before you leap
-syno-clean --host nas.local --user eduard --dry-run
+syno-clean --host nas.local --user demo            # no config file needed
+syno-clean --host nas.local --user demo --dry-run  # check before you delete
 ```
 
-The password is **never** stored in the config file. It comes from
-`SYNO_CLEAN_PASSWORD`, or is prompted for on the terminal before the alternate screen
-is entered. If the account uses 2-step verification, DSM asks for a code and the
-program prompts for it (or reads `SYNO_CLEAN_OTP`).
-
-On the first run with nothing configured, `syno-clean` writes a commented config
-template to `~/.config/syno-clean/config.toml`, explains what is missing, and exits
-without entering the TUI. An existing config file is never overwritten.
+The password is **never** saved in the config file. It comes from `SYNO_CLEAN_PASSWORD` or a prompt in the terminal. If you use 2FA, use `SYNO_CLEAN_OTP` or a prompt. On the first run, it creates a template at `~/.config/syno-clean/config.toml` and tells you what is missing.
 
 ## Configuration
 
-**Precedence: CLI flags > `SYNO_CLEAN_*` environment variables > config file >
-built-in defaults.** `host` and `username` must be resolved by *something*; everything
-else has a default.
-
-Paths use **XDG semantics on every platform, macOS included**:
-
-| What | Path |
-|---|---|
-| Config | `$XDG_CONFIG_HOME/syno-clean/config.toml` (default `~/.config/syno-clean/config.toml`) |
-| Log file | `$XDG_CACHE_HOME/syno-clean/syno-clean.log` (default `~/.cache/syno-clean/syno-clean.log`), mode `0600` |
-| Session cache | `$XDG_CACHE_HOME/syno-clean/session.json` (default `~/.cache/syno-clean/session.json`), mode `0600` |
-
-The cache directory itself is `0700`: both files in it can carry the session `sid`, which
-is a bearer credential.
-
-Logs never go to stdout — the TUI owns the terminal — so the log file is the place to
-look when something misbehaves, and the right thing to attach to a bug report.
-
-The session `sid` is cached, keyed by `{host}:{port}/{username}` so several NASes or
-accounts never evict each other. **Quitting normally does not log out**, which is what
-makes the next start fast; use `--logout` to invalidate the cached session
-deliberately.
-
-### Config file
-
-Unknown keys are logged as a warning and ignored, never a hard error — an older binary
-must tolerate a newer config file.
+The order of priority is: **CLI flags > `SYNO_CLEAN_*` env vars > config file > defaults**. You only need `host` and `username`. Paths follow XDG rules on all platforms, including macOS. Config is at `~/.config/syno-clean/config.toml`. Logs and cache are at `~/.cache/syno-clean/`.
 
 ```toml
 host         = "nas.local"
 port         = 5001      # default: 5001 with https, 5000 without
 https        = true      # default: true
 insecure     = false     # accept a self-signed / invalid TLS certificate
-username     = "eduard"
-refresh_secs = 3         # must be > 0; the task list only, not the storage bar
+username     = "demo"
+refresh_secs = 3         # must be > 0
 delete_files = true      # false = remove the DSM task only, leave the files
 ```
 
-### Environment variables
+Each setting has a matching `SYNO_CLEAN_*` env var and a CLI flag (see `--help`). The `delete_files` setting has **no** env var to prevent accidental mistakes. Use `--no-delete-files` or the config file instead. Quitting normally does not log you out. Use `--logout` to clear the session.
 
-| Variable | Effect |
-|---|---|
-| `SYNO_CLEAN_HOST` | DSM hostname or IP |
-| `SYNO_CLEAN_PORT` | DSM port |
-| `SYNO_CLEAN_HTTPS` | `true`/`false` — use HTTPS |
-| `SYNO_CLEAN_INSECURE` | `true`/`false` — accept an invalid certificate |
-| `SYNO_CLEAN_USERNAME` | DSM account name |
-| `SYNO_CLEAN_PASSWORD` | password (otherwise prompted for) |
-| `SYNO_CLEAN_OTP` | 2-step verification code (otherwise prompted for when DSM asks) |
-| `SYNO_CLEAN_REFRESH_SECS` | seconds between automatic task-list refreshes (the storage bar has its own slower clock) |
+## Keys
 
-There is deliberately **no** `SYNO_CLEAN_DELETE_FILES`: an environment variable that
-silently disables the program's main function is a footgun. Use `--no-delete-files` or
-the config key.
-
-### Command-line flags
-
-| Flag | Effect |
-|---|---|
-| `--config <PATH>` | Config file to read instead of the default path |
-| `--host <HOST>` | DSM hostname or IP address |
-| `--user <NAME>` | DSM account name |
-| `--port <PORT>` | DSM port (default 5001 for HTTPS, 5000 for HTTP) |
-| `--insecure` | Accept a self-signed or otherwise invalid TLS certificate |
-| `--refresh-secs <SECS>` | Seconds between automatic task-list refreshes |
-| `--no-delete-files` | Remove the DSM task only, leave a finished task's files |
-| `--log-file <PATH>` | Write logs here instead of the default cache path |
-| `--dry-run` | Report what would happen; issue no destructive call |
-| `--logout` | Invalidate the cached session and exit |
-| `--help`, `--version` | The usual |
-
-Boolean flags are **one-way switches**: `--insecure` and `--dry-run` can only turn a
-setting on and `--no-delete-files` only off, so an unset flag falls through to the
-environment or the config file instead of overriding it with `false`.
-
-## Keybindings
-
-`?` shows the same list inside the program, and that overlay — not this table — is the
-authoritative one.
-
-### Navigation
-
-| Key | Action |
-|---|---|
-| `↑` `k` | move up |
-| `↓` `j` | move down |
-| `PgUp` `PgDn` | move a screenful |
-| `Home` `g` | first row |
-| `End` `G` | last row |
-
-### Selection
-
-| Key | Action |
-|---|---|
-| `Space` | toggle this row |
-| `a` | (de)select every **visible** row — a filtered-out task is never touched |
-| `Esc` | clear the selection, hidden rows included |
-
-### Actions
-
-| Key | Action |
-|---|---|
-| `d` | delete — opens the confirmation |
-| `p` | pause the selection, or the row under the cursor |
-| `u` | resume the selection, or the row under the cursor |
-| `r` | refresh now — the task list *and* the storage bar, which otherwise updates once a minute |
-| `v` | the last batch's results, with the reason for every skip and failure |
-
-`d`, `p` and `u` act on the selection when there is one, and on the row under the
-cursor when there is not.
-
-The results modal opens by itself whenever a batch finishes with something to report,
-and `v` brings it back after it has been dismissed. The footer is one line and the
-reasons are long sentences, so it — not the footer — is where a failed delete is read.
-
-### Sort, filter, search
-
-| Key | Action |
-|---|---|
-| `s` | next sort column |
-| `S` | reverse the sort direction |
-| `f` | next status filter |
-| `/` | search titles |
-
-Sort keys: Name, Status, Size, Progress, ↓ Speed, ↑ Speed, Ratio, Added. That is eight
-keys against the table's ten headed columns (the table has eleven in all; the first is
-the headerless selection marker) — Seeds/Peers, ETA and Destination are **not**
-sortable, and `Added` sorts by a value that has no column of its own. Post-v1 if it is
-missed.
-
-Status filters: **All**, **Downloading**, **Seeding**, **Finished**, **Paused**,
-**Error**. `Downloading` means "in progress" and covers `downloading`, `waiting`,
-`finishing`, `hash_checking`, `extracting` and `filehosting_waiting`, so those rows are
-never invisible to someone who is filtering. A task with a status this client does not
-recognize is shown only under `All` — it cannot be classified without guessing.
-
-### Search box
-
-| Key | Action |
-|---|---|
-| `Enter` | commit and close the box |
-| `Esc` | cancel, restoring the previous query |
-| `Backspace` | delete a character |
-
-Matching is **live**, on every keystroke, so `Enter` commits the query rather than
-applying it. Every other printable key is text — `q` types a `q`.
-
-### Results modal
-
-| Key | Action |
-|---|---|
-| `Esc` `q` `Enter` `Space` `v` | close |
-| `↑` `↓` `k` `j` | scroll a line |
-| `PgUp` `PgDn` | scroll a page |
-| `Home` `End` | jump to the first / last line |
-
-Unlike the help overlay it does **not** close on any key — it scrolls, so `j` has to
-mean "next line". It changes nothing, and the task list keeps refreshing underneath it.
-
-### Confirmation dialog
-
-| Key | Action |
-|---|---|
-| `y` | delete |
-| `n` `Esc` `q` | cancel |
-| `Enter` | press the **focused** button |
-| `Tab` `←` `→` `h` `l` | switch button |
-| `↑` `↓` `k` `j` | scroll the list a line |
-| `PgUp` `PgDn` | scroll the list a page |
-| `Home` `End` | jump to the first / last line |
-
-**Cancel has the focus when the dialog opens**, so a reflexive `Enter` cancels. `y` is
-the deliberate one-key confirm. `q` closes the dialog rather than the program.
-
-### General
-
-| Key | Action |
-|---|---|
-| `?` | help overlay (any key closes it, and does nothing else) |
-| `q` | quit |
-| `Ctrl-C` | quit from anywhere |
+Press `?` to see the full list of keys. Short version: `↑`/`↓` or `j`/`k` to move, `Space` to select, `a` to select all visible rows, `d` to delete, `p`/`u` to pause/resume, `s`/`S` to sort, `f` to filter by status, `/` to search, `r` to refresh, `v` to see the last results (and why some failed), `q` to quit. In the delete window, **Cancel has the focus**. Press `Enter` to cancel or `y` to confirm.
 
 ## Delete safety model
 
-Deriving "which directory holds this torrent" from the DSM API is the one place this
-tool could destroy the wrong data, so it is built to **refuse rather than guess**.
+The tool must find the right folder to delete. To avoid deleting the wrong data, it follows these rules:
 
-### 1. The path comes from the task, and the file list checks it
-
-1. **The on-disk name is the task's title.** Download Station names what it writes
-   after the task: a container directory for a multi-file torrent, and for a
-   single-file torrent the title *is* the filename. That is also what the BitTorrent
-   spec says — `info.name` is the directory for a multi-file torrent and the file name
-   for a single-file one.
-2. **The file list says what shape to expect there**, and is checked against what is
-   actually on the volume (see [4](#4-existence-check-before-deleting)):
-   one entry with no separator means a **file**; anything else non-empty means the
-   **directory** Download Station created.
-3. The file list is absent or empty **on a task type that has none** (HTTP, FTP, NZB,
-   eMule) → nothing says which shape to expect, so either is accepted.
-4. The file list is absent or empty **on a BitTorrent task** → **the task is skipped**.
-   A torrent always has a file list, so one arriving without it means this program does
-   not understand the record — and nothing corroborates the shape. (`--no-delete-files`
-   still removes such a row.)
-
-> Earlier versions took the on-disk name from the file list's common top-level
-> component instead, and refused any task whose entries shared none. Measured against a
-> real DSM 7 NAS: that refused 15 of 41 tasks outright, and for two Blu-ray torrents
-> (file list `BDMV/…`) it aimed at `/video/BDMV` when the payload was really
-> `/video/{title}/BDMV/…`. The current rule resolved all 40 tasks that had a
-> destination to a path that exists, with the expected kind.
-
-### 2. The destination is normalized, and an empty one is refused
-
-1. The destination is normalized (a leading volume mount stripped — `/volume1`,
-   `/volume`, `/volumeUSB1/usbshare1-2`, `/volumeSATA1/…` — and surrounding slashes
-   trimmed) and joined as `/{destination}/{name}`. A *relative* destination is never
-   touched, and an absolute first component that is not a mount point (`/downloads`)
-   is already share-rooted and left alone. A mount point is matched by **shape** —
-   `volume`, `volume<N>`, `volumeUSB<N>`, `volumeSATA<N>` — so a share that merely
-   starts with the word (`/volumes/movies`, `/volume-media/tv`) keeps its first
-   component instead of having the delete re-rooted into a different share.
-2. The normalized destination is **empty** → **the task is refused**. With no
-   destination there is no share to root the path at, and `/{name}` would name a share
-   rather than a directory inside one.
-
-### 3. Syntactic guards
-
-A resolved path is refused — leaving the task completely untouched — if it is empty,
-`/`, has fewer than two components (never delete a share root), lacks a leading `/`,
-contains a `.` or `..` component, has an empty or whitespace-only component, or
-contains a control character. The on-disk name is separately required to be a single
-component, so a title fallback cannot smuggle in a `/` and aim one level deeper than
-the task's own directory.
-
-### 4. Existence check before deleting
-
-Before any recursive delete, `SYNO.FileStation.List` `getinfo` is called on the
-resolved path:
-
-- **not found**, for a task that never finished → the file phase is *skipped*
-  (Download Station cleans up its own partial data) and only the DSM task is deleted,
-  which is the harmless half;
-- **not found**, for a task that **finished, is seeding or is extracting — or whose
-  counters say it downloaded its whole payload, whatever its status** → the payload
-  demonstrably existed, so nothing being there says the resolved location is wrong far
-  more often than it says the files are gone. The item fails and the task stays,
-  because deleting it would leave that payload with nothing pointing at it. (A path
-  this same run already deleted is exempt — the absence is explained.) This is judged
-  from what the pause phase read, not from what was frozen when the dialog opened,
-  which can be minutes old by the twentieth item of a batch — the status from just
-  *before* the pause was issued (so the program's own pause cannot mask a seeding task)
-  and the transfer counters from the last read of all (so a task that completes while
-  the pause takes effect is not judged as half-written);
-- **not found**, for a path named from the **title** rather than the file list → the
-  item fails whatever the status: a guess that found nothing is at least as likely to
-  have missed as to have been tidied up;
-- **found, but the wrong kind of object** → the item fails. A multi-file torrent wrote
-  a *directory* and a single-file one wrote a *file*; if `isdir` disagrees with what
-  the task resolved to, the path is some other object and `recursive=true` would remove
-  it. (A title-named path expects neither kind, so both are accepted and the kind found
-  is logged: there was no file list to say. A file list that *is* there and describes no
-  shape — the same flat name listed twice — is the opposite case, and the item fails
-  rather than having a malformed answer authorize the delete.)
-- **found**, of the expected kind → proceed;
-- **an error** (a permission problem, say) → that is not absence: the item fails and
-  the task is left alone rather than being deleted while its files stay behind.
-
-After the delete reports itself finished the path is looked up once more. Still there,
-an error code, or a lookup that fails outright all keep the task: only an answer that
-actually says "gone" completes the item.
-
-### 5. Three phases, ordered for recoverability
-
-| Task status | Ordering |
-|---|---|
-| Downloading, Seeding, Waiting, Finishing, Hash checking, Extracting, File-hosting waiting, unknown | pause → confirm the pause → delete the files → delete the task |
-| Paused, Finished, Error | delete the files → delete the task |
-
-The pause keeps Download Station from holding file handles or re-creating directories
-underneath the delete, and it is **confirmed by re-reading the task**, because DSM
-accepting a `pause` only means the request was queued.
-
-**Any phase failing skips every later phase.** If the files cannot be deleted, the task
-is not deleted either — it survives still pointing at its data, so nothing is ever
-orphaned.
-
-### 6. What you see is what goes
-
-```text
-  Absolute.Dest… fi┌ Delete 2 tasks ────────────────────────────────────────────────────────────────┐ ∞ /volume1/downlo…
-✓ archlinux-202… fi│ Removes the Download Station task and its files on the NAS. This cannot be     │ ∞ downloads
-  Big.Buck.Bunn… se│ undone.                                                                        │ ∞ video/movies
-✓ Broken.Releas… er│                                                                                │ ∞ downloads
-  empty-placeho… wa│ • archlinux-2026.07.01-x86_64.iso                                              │ ∞ downloads
-  Hosted.Archiv… ho│     1.1 GiB  /downloads/archlinux-2026.07.01-x86_64.iso                        │ ∞ —
-  LibreOffice.2… pa│ • Broken.Release.2019.720p                                                     │ ∞ software
-  Mixed.Root.Re… se│     700.0 MiB  /downloads/Broken.Release.2019.720p                             │ ∞ video/tv
-  Mystery.Task.… ca│                                                                                │ ∞ —
-  Sintel.2010.2… fi│ 2 tasks · 1.8 GiB to free                                                      │1s downloads/incom…
-  Some.Show.S01… ch│                        [ Cancel (Esc) ]   [ Delete (y) ]                       │ ∞ video/tv
-  syno-clean-0.… wa└────────────────────────────────────────────────────────────────────────────────┘ ∞ downloads
-```
-
-Every resolved path is on screen before anything is sent. The confirmation dialog is an
-owned **snapshot** taken the moment it opens: background
-refreshes are suspended while it is up, and the path guards are re-run immediately
-before each File Station call. Refused items are listed as `SKIPPED` with the reason
-and excluded from the total, so a skipped task can never be mistaken for a cleaned-up
-one.
-
-### Escape hatches
-
-- **`--dry-run`** — the whole flow runs, the dialog says `DRY RUN`, every item is
-  reported as *skipped* and **no call is issued at all**, not even the read-only
-  existence check. Pause and resume are suppressed too: a flag promising the NAS is
-  untouched must mean it.
-- **`--no-delete-files`** (or `delete_files = false`) — removes the Download Station
-  task only and leaves a **finished** task's files on the volume. The dialog says so,
-  and the totals line reads "left on disk" instead of "to free". ⚠️ A task that has
-  *not* finished is different: DSM deletes its partial data along with the task
-  (`force_complete=false`, which is deliberate — the alternative marks the task
-  complete and keeps a half-downloaded file). The dialog says that too, per row and in
-  the totals, so those bytes are never counted as staying. This is also the way to remove a task
-  whose on-disk location cannot be worked out — no destination, or a torrent that
-  reports no file list at all. Those rows are `SKIPPED` in the normal flow, because
-  a recursive delete that cannot be aimed must not be followed by removing the only
-  pointer to the data; with the files out of scope there is nothing left to be unsure
-  about, so they are listed as ordinary deletable rows.
+- It finds the path by looking at the destination and the task's file list.
+- It refuses the path if it looks unsafe (like `..` or control characters) or if the task has no destination or file list.
+- Before deleting, it checks if the path exists on the volume. If the path is the wrong type, has a permission error, or is missing, the program skips it and keeps the task.
+- It pauses active tasks first and waits for the NAS to confirm the pause.
+- **If any step fails, the rest of the steps are skipped.** If files cannot be deleted, the task is not deleted either.
+- The confirmation window shows exactly what will happen. It shows a snapshot of all paths. If a row is skipped, it shows `SKIPPED` and the reason. These skipped rows are not included in the total space saved. Use `--no-delete-files` to remove only the tasks.
 
 ## Troubleshooting
 
-- **"needs an interactive TTY"** — the TUI cannot run with stdout redirected. Nothing
-  is written to the terminal and no terminal state is changed in that case.
-- **Self-signed certificate** — `--insecure`, or `insecure = true`.
-- **A connection or login failure exits non-zero with a diagnostic** naming the host and
-  port tried, what DSM said in words rather than as a bare error code, and one thing to
-  try. It never enters the TUI, because an empty table is exactly what a NAS with no
-  downloads looks like.
-- **A failure *during* a session is non-fatal**: a red banner appears in the footer and
-  clears itself on the next successful refresh.
-- The log file (see [Configuration](#configuration)) has the details for everything
-  above. **It is written at `INFO` and above, and that level is fixed** — there is no
-  `--verbose` flag and `RUST_LOG` is ignored, so debug-level lines never appear. If the
-  log does not explain what happened, the only way to get more is a local build with
-  the level raised in `config::init_logging`.
+If a connection or login fails, the program stops and shows an error message. It will not open the UI. If a failure happens while using the program, a red banner appears at the bottom. It will go away on the next refresh. You can find more details in the log file (`~/.cache/syno-clean/syno-clean.log`). Please include this log if you report a bug.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). In short: `cargo fmt --all -- --check`, `cargo
-clippy --all-targets -- -D warnings` and `cargo test --all` must all be clean — the
-three commands CI runs — and the UI can be exercised offline against a captured
-response with no NAS in reach.
+See [CONTRIBUTING.md](CONTRIBUTING.md). You must run `cargo fmt`, `cargo clippy -- -D warnings`, and `cargo test` successfully. You can test the UI offline using `--fixture`.
 
 ## License
 
