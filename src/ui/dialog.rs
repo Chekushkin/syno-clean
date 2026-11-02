@@ -1407,17 +1407,19 @@ mod tests {
         // The other half of the same rule, so the qualification cannot creep
         // onto rows whose payload really does survive. No fixture row is both
         // refused *and* complete, so build one: a torrent reporting no file
-        // list is refused, and one that has finished downloading has a payload
-        // on the volume that outlives a task-only delete.
+        // list while still loaded is refused, and one that has finished
+        // downloading has a payload on the volume that outlives a task-only
+        // delete.
         let options = DeleteOptions {
             delete_files: false,
             dry_run: false,
         };
         let finished_but_refused = Task {
             title: "Refused.But.Complete".to_string(),
-            // A torrent with no file list is rule 4's refusal…
+            // A seeding torrent with no file list is rule 4's refusal…
             task_type: crate::model::TaskType::BitTorrent,
-            // …and `bare_task` is already Finished with downloaded == size.
+            status: crate::model::TaskStatus::Seeding,
+            // …and `bare_task` already has downloaded == size.
             ..crate::testutil::bare_task()
         };
         assert!(

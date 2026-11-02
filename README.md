@@ -91,7 +91,7 @@ Press `?` to see the full list of keys. Short version: `↑`/`↓` or `j`/`k` to
 The tool must find the right folder to delete. To avoid deleting the wrong data, it follows these rules:
 
 - It finds the path by looking at the destination and the task's file list.
-- It refuses the path if it looks unsafe (like `..` or control characters) or if the task has no destination or file list.
+- It refuses the path if it looks unsafe (like `..` or control characters) or if the task has no destination or file list. The exception is a `finished` torrent: DSM drops its file list once it stops seeding, so its path comes from its title alone.
 - Before deleting, it checks if the path exists on the volume. If the path is the wrong type, has a permission error, or is missing, the program skips it and keeps the task.
 - It pauses active tasks first and waits for the NAS to confirm the pause.
 - **If any step fails, the rest of the steps are skipped.** If files cannot be deleted, the task is not deleted either.

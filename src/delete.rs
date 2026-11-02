@@ -33,7 +33,8 @@
 //! | one entry, no separator | [`ExpectedKind::File`] | a single-file torrent; the title is that filename |
 //! | anything else non-empty | [`ExpectedKind::Dir`] | a multi-file torrent, which Download Station gave a container |
 //! | empty, on HTTP/FTP/NZB/eMule | [`ExpectedKind::AnyFromTitle`] | nothing said which; accept either |
-//! | empty, on **BitTorrent** | **REFUSE** | a torrent always has a list, so its absence means this client does not understand the record — and nothing corroborates the shape. `--no-delete-files` still removes the task. See [`crate::model::TaskType::file_list_is_mandatory`]. |
+//! | empty, on a **`finished`** torrent | [`ExpectedKind::AnyFromTitle`] | DSM unloads a torrent once it stops seeding and lists it with no `file` block at all — seen on every `finished` BT task of a real DSM 7 library. The title is still `info.name`. |
+//! | empty, on any other **BitTorrent** task | **REFUSE** | a loaded torrent always has a list, so its absence means this client does not understand the record — and nothing corroborates the shape. `--no-delete-files` still removes the task. See [`crate::model::TaskType::file_list_is_mandatory`]. |
 //!
 //! ⚠️ **This used to derive the name from the file list's common top-level
 //! component, and that was wrong in a way that could delete the wrong
@@ -393,7 +394,7 @@ pub struct ResolvedTarget {
 /// caller — and it answers with an error far more readily than with a path. See
 /// the module docs for the resolution order; the short version is that the name
 /// is the task's title, the file list says what shape to expect there, and a
-/// torrent that reports no file list at all is refused.
+/// torrent that reports no file list at all is refused unless it is `finished`.
 ///
 /// The returned path has already been through [`validate_path`]. It is
 /// re-validated immediately before the File Station call anyway — the check is
@@ -441,12 +442,19 @@ pub fn resolve_delete_target(task: &Task) -> Result<ResolvedTarget> {
 /// recursively deleted instead. The old rule agreed with this one on 38 of 40
 /// only because a single-file torrent's title *is* its filename.
 fn resolve_name(task: &Task) -> Result<(String, ExpectedKind)> {
-    // A torrent always has a file list, so one arriving without it is an
+    // A loaded torrent always has a file list, so one arriving without it is an
     // anomaly. The path would still be `{destination}/{title}`, but nothing
     // corroborates the shape and nothing shows DSM had the metadata at all, so
     // refuse rather than aim a recursive delete using a task record this client
     // evidently does not understand. `--no-delete-files` still removes the task.
-    if task.files.is_empty() && task.task_type.file_list_is_mandatory() {
+    //
+    // A `finished` torrent is the exception: DSM unloads it once seeding stops
+    // and lists it with no `file` block, so it resolves like an HTTP download —
+    // by title, with the existence check accepting either kind.
+    if task.files.is_empty()
+        && task.task_type.file_list_is_mandatory()
+        && task.status != TaskStatus::Finished
+    {
         return Err(Error::unsafe_path(
             &task.title,
             format!(
@@ -2245,6 +2253,32 @@ mod tests {
                 Some("/downloads/Some.Release"),
                 "{task_type}"
             );
+        }
+    }
+
+    #[test]
+    fn a_finished_bt_task_with_no_file_list_falls_back_to_its_title() {
+        // DSM unloads a torrent once it stops seeding and then lists it with no
+        // `file` block — every `finished` BT task on a real DSM 7 NAS did. The
+        // title is still `info.name`, so the path is the same one a listed
+        // torrent would get; only the shape goes unconfirmed.
+        let task = Task {
+            task_type: TaskType::BitTorrent,
+            status: TaskStatus::Finished,
+            files: Vec::new(),
+            ..bare()
+        };
+        let target = resolve_delete_target(&task).unwrap();
+        assert_eq!(target.path, "/downloads/Some.Release");
+        assert_eq!(target.expected_kind, ExpectedKind::AnyFromTitle);
+
+        // Every other status still has the torrent loaded, so the refusal holds.
+        for status in [TaskStatus::Seeding, TaskStatus::Paused] {
+            let task = Task {
+                status: status.clone(),
+                ..task.clone()
+            };
+            assert!(resolve_delete_target(&task).is_err(), "{status:?}");
         }
     }
 
